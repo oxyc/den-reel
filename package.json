@@ -1,0 +1,13 @@
+{
+  "name": "den-trailer-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "yt-dlp + ffmpeg trailer proxy: YouTube id → cached faststart MP4 for inline tvOS playback",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
