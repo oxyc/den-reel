@@ -70,6 +70,10 @@ const MANIFEST = {
 const YT_TTL_MS = 24 * 60 * 60 * 1000;
 const YT_NEG_TTL_MS = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
 const ytCache = new Map(); // `${imdbId}:${lang}` -> { id: string, exp: number }
+// Direct googlevideo URLs stay valid ~6h. Caching them lets a /play that follows a recent probe/
+// resolve skip the ~2s yt-dlp signature solve and go straight to ffmpeg. TTL kept under 6h.
+const URL_TTL_MS = 5 * 60 * 60 * 1000;
+const urlCache = new Map(); // vid -> { urls: string[], exp: number }
 
 // Indirection so tests can hold time still without Date.now() flakiness.
 let cacheClock = () => Date.now();
@@ -167,15 +171,11 @@ async function firstPlayable(candidates) {
 // inFlight dedupes the later real /play. Swapped to a no-op in tests via _setPrewarm.
 let prewarm = (id) => { if (id && inFlight.size < PREWARM_MAX) fetchTrailer(id).catch(() => {}); };
 
-/** Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
- *  --simulate, no download. Swapped out in tests via _setProber. */
+/** Probe a candidate: `yt-dlp -g` validates it's extractable HERE (right region, decodable formats)
+ *  AND returns the direct URLs — which cachedUrls stashes, so the follow-up /play skips the resolve.
+ *  Playable iff it yields URLs. Swapped out in tests via _setProber. */
 function probeExtractable(ytId) {
-  return new Promise((resolve) => {
-    const proc = spawn(YTDLP, ['-q', '--simulate', '--no-warnings', '--cache-dir', YTDLP_CACHE,
-      '-f', YTDLP_FORMAT, `https://www.youtube.com/watch?v=${ytId}`], { stdio: 'ignore' });
-    proc.on('error', () => resolve(false));
-    proc.on('close', (code) => resolve(code === 0));
-  });
+  return cachedUrls(ytId).then((urls) => urls.length > 0).catch(() => false);
 }
 let prober = probeExtractable;
 
@@ -307,9 +307,9 @@ function fetchTrailer(vid) {
   return p;
 }
 
-/** Resolve the direct googlevideo URL(s) without downloading (yt-dlp -g): [video] or
- *  [video, audio]. IP-bound URLs — only usable from THIS host, which is why we proxy. */
-function ytdlpUrls(vid) {
+/** Resolve the direct googlevideo URL(s) via `yt-dlp -g` (validates geo + format): [video] or
+ *  [video, audio]. IP-bound URLs — only usable from THIS host, which is why we proxy. Throws typed. */
+function ytdlpResolveUrls(vid) {
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP, ['-q', '--no-warnings', '--cache-dir', YTDLP_CACHE,
       '-f', YTDLP_FORMAT, '-g', `https://www.youtube.com/watch?v=${vid}`],
@@ -324,6 +324,16 @@ function ytdlpUrls(vid) {
       else reject(classifyYtdlpError(code, err));
     });
   });
+}
+
+/** URLs with a short (≈5h) cache. A probe at /meta warms this, so a cold /play that missed prewarm
+ *  reuses the URLs and skips the ~2s resolve — straight to ffmpeg. */
+async function cachedUrls(vid) {
+  const hit = urlCache.get(vid);
+  if (hit && hit.exp > cacheClock()) return hit.urls;
+  const urls = await ytdlpResolveUrls(vid);
+  urlCache.set(vid, { urls, exp: cacheClock() + URL_TTL_MS });
+  return urls;
 }
 
 /** Remux a fragmented stream capture into a faststart MP4 for the cache, so replays/seeks use
@@ -345,7 +355,7 @@ function remuxFaststart(src, vid) {
  *  finish, remuxes to a faststart cache file for future ranged serves. Resolves once bytes are
  *  flowing (headers sent); REJECTS before any output so the caller can fall back to buffered. */
 async function streamPlay(req, res, vid) {
-  const urls = await ytdlpUrls(vid);                 // may throw → caller falls back
+  const urls = await cachedUrls(vid);                // cache hit → skips the ~2s resolve; may throw → caller falls back
   const inputs = urls.flatMap((u) => ['-i', u]);
   const tmp = path.join(CACHE_DIR, `.${vid}.${process.pid}.stream.mp4`);
   const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs,
@@ -461,5 +471,5 @@ module.exports = {
   _setClock: (fn) => { cacheClock = fn; },
   _setProber: (fn) => { prober = fn; },
   _setPrewarm: (fn) => { prewarm = fn; },
-  _clearYtCache: () => ytCache.clear(),
+  _clearYtCache: () => { ytCache.clear(); urlCache.clear(); },
 };
