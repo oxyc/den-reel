@@ -70,10 +70,6 @@ const MANIFEST = {
 const YT_TTL_MS = 24 * 60 * 60 * 1000;
 const YT_NEG_TTL_MS = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
 const ytCache = new Map(); // `${imdbId}:${lang}` -> { id: string, exp: number }
-// Direct googlevideo URLs stay valid ~6h. Caching them lets a /play that follows a recent probe/
-// resolve skip the ~2s yt-dlp signature solve and go straight to ffmpeg. TTL kept under 6h.
-const URL_TTL_MS = 5 * 60 * 60 * 1000;
-const urlCache = new Map(); // vid -> { urls: string[], exp: number }
 
 // Indirection so tests can hold time still without Date.now() flakiness.
 let cacheClock = () => Date.now();
@@ -171,11 +167,15 @@ async function firstPlayable(candidates) {
 // inFlight dedupes the later real /play. Swapped to a no-op in tests via _setPrewarm.
 let prewarm = (id) => { if (id && inFlight.size < PREWARM_MAX) fetchTrailer(id).catch(() => {}); };
 
-/** Probe a candidate: `yt-dlp -g` validates it's extractable HERE (right region, decodable formats)
- *  AND returns the direct URLs — which cachedUrls stashes, so the follow-up /play skips the resolve.
- *  Playable iff it yields URLs. Swapped out in tests via _setProber. */
+/** Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
+ *  --simulate, no download. Swapped out in tests via _setProber. */
 function probeExtractable(ytId) {
-  return cachedUrls(ytId).then((urls) => urls.length > 0).catch(() => false);
+  return new Promise((resolve) => {
+    const proc = spawn(YTDLP, ['-q', '--simulate', '--no-warnings', '--cache-dir', YTDLP_CACHE,
+      '-f', YTDLP_FORMAT, `https://www.youtube.com/watch?v=${ytId}`], { stdio: 'ignore' });
+    proc.on('error', () => resolve(false));
+    proc.on('close', (code) => resolve(code === 0));
+  });
 }
 let prober = probeExtractable;
 
@@ -307,82 +307,6 @@ function fetchTrailer(vid) {
   return p;
 }
 
-/** Resolve the direct googlevideo URL(s) via `yt-dlp -g` (validates geo + format): [video] or
- *  [video, audio]. IP-bound URLs — only usable from THIS host, which is why we proxy. Throws typed. */
-function ytdlpResolveUrls(vid) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(YTDLP, ['-q', '--no-warnings', '--cache-dir', YTDLP_CACHE,
-      '-f', YTDLP_FORMAT, '-g', `https://www.youtube.com/watch?v=${vid}`],
-      { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    proc.stdout.on('data', (d) => { out += d; });
-    proc.stderr.on('data', (d) => { err += d; });
-    proc.on('error', reject);
-    proc.on('close', (code) => {
-      const urls = out.trim().split('\n').filter(Boolean);
-      if (code === 0 && urls.length) resolve(urls);
-      else reject(classifyYtdlpError(code, err));
-    });
-  });
-}
-
-/** URLs with a short (≈5h) cache. A probe at /meta warms this, so a cold /play that missed prewarm
- *  reuses the URLs and skips the ~2s resolve — straight to ffmpeg. */
-async function cachedUrls(vid) {
-  const hit = urlCache.get(vid);
-  if (hit && hit.exp > cacheClock()) return hit.urls;
-  const urls = await ytdlpResolveUrls(vid);
-  urlCache.set(vid, { urls, exp: cacheClock() + URL_TTL_MS });
-  return urls;
-}
-
-/** Remux a fragmented stream capture into a faststart MP4 for the cache, so replays/seeks use
- *  the fast ranged path. Local copy-mux, no re-encode. */
-function remuxFaststart(src, vid) {
-  const dst = cachePath(vid);
-  const ff = spawn('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', '-i', src,
-    '-c', 'copy', '-movflags', '+faststart', dst], { stdio: 'ignore' });
-  ff.on('close', (code) => {
-    fs.unlink(src, () => {});
-    if (code === 0) { try { evictIfNeeded(); } catch { /* ignore */ } }
-    else { fs.unlink(dst, () => {}); }
-  });
-  ff.on('error', () => fs.unlink(src, () => {}));
-}
-
-/** Stream a trailer to the client AS ffmpeg live-muxes YouTube's video+audio into fragmented
- *  MP4 — first frame in seconds instead of after a full download. Tees to disk; on a clean
- *  finish, remuxes to a faststart cache file for future ranged serves. Resolves once bytes are
- *  flowing (headers sent); REJECTS before any output so the caller can fall back to buffered. */
-async function streamPlay(req, res, vid) {
-  const urls = await cachedUrls(vid);                // cache hit → skips the ~2s resolve; may throw → caller falls back
-  const inputs = urls.flatMap((u) => ['-i', u]);
-  const tmp = path.join(CACHE_DIR, `.${vid}.${process.pid}.stream.mp4`);
-  const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs,
-    '-c', 'copy', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  const cache = fs.createWriteStream(tmp);
-  let started = false, aborted = false;
-  const stop = () => { if (!aborted) { aborted = true; ff.kill('SIGKILL'); } };
-  req.on('close', () => { if (!res.writableEnded) stop(); });
-  res.on('error', stop);
-
-  await new Promise((resolve, reject) => {
-    ff.stdout.on('data', (chunk) => {
-      if (!started) { started = true; res.writeHead(200, { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store' }); resolve(); }
-      cache.write(chunk);
-      if (!res.write(chunk)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } // backpressure
-    });
-    ff.on('error', (e) => { if (!started) reject(e); else stop(); });
-    ff.on('close', (code) => {
-      cache.end();
-      if (!started) { fs.unlink(tmp, () => {}); reject(new Error('stream produced no output')); return; }
-      if (!res.writableEnded) res.end();
-      if (code === 0 && !aborted) remuxFaststart(tmp, vid); else fs.unlink(tmp, () => {});
-    });
-  });
-}
-
 /** Serve a file with HTTP range support (so the player can scrub). */
 function serveFile(req, res, fp) {
   const { size } = fs.statSync(fp);
@@ -425,23 +349,16 @@ async function handleRequest(req, res) {
 
   if (!vid || !VID_RE.test(vid)) { res.writeHead(400); return res.end('bad video id'); }
 
-  const fp = cachePath(vid);
-  if (fs.existsSync(fp) && fs.statSync(fp).size > 0) {           // cached → ranged serve (seeks)
-    fs.utimes(fp, new Date(), fs.statSync(fp).mtime, () => {});  // LRU bump
-    return serveFile(req, res, fp);
-  }
-  // A seek before we've cached the file can't be served from a live stream → buffer, then serve.
-  const rm = req.headers.range && /bytes=(\d+)/.exec(req.headers.range);
-  const seeking = rm && parseInt(rm[1], 10) > 0;
   try {
-    if (seeking) return serveFile(req, res, await fetchTrailer(vid));
-    await streamPlay(req, res, vid);          // cold play → stream as it muxes (fast first frame)
+    // Always serve a COMPLETE file via serveFile — it answers Content-Length + Accept-Ranges (+206
+    // on Range), which tvOS AVPlayer REQUIRES for progressive MP4 (a chunked/streamed body has no
+    // length/ranges and AVPlayer refuses it). fetchTrailer returns the cached faststart file
+    // instantly when prewarm/prefetch already fetched it, or downloads to completion first. Speed
+    // comes from warming the cache ahead of play, not from streaming a live mux.
+    serveFile(req, res, await fetchTrailer(vid));
   } catch (e) {
     console.error(`[${vid}] ${e.message}`);
-    if (!res.headersSent) {                    // couldn't start streaming → buffered, else typed error
-      try { return serveFile(req, res, await fetchTrailer(vid)); }
-      catch (e2) { return playError(res, vid, e2); }
-    }
+    playError(res, vid, e);
   }
 }
 
@@ -471,5 +388,5 @@ module.exports = {
   _setClock: (fn) => { cacheClock = fn; },
   _setProber: (fn) => { prober = fn; },
   _setPrewarm: (fn) => { prewarm = fn; },
-  _clearYtCache: () => { ytCache.clear(); urlCache.clear(); },
+  _clearYtCache: () => ytCache.clear(),
 };
