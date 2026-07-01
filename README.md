@@ -40,6 +40,13 @@ GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabl
 GET /health                               →  200 ok
 ```
 
+Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
+following `/play` is warm. Two knobs:
+- `?prewarm=0` — resolve + validate only, don't pull bytes yet (for a browse-time prefetch that
+  isn't sure the user will watch). Prewarm on the real detail view.
+- A **successful** `/meta` sends `Cache-Control: public, max-age=604800` (7d) so clients cache the
+  resolution; an empty result (no trailer / geo-blocked / transient) is left uncached to re-check.
+
 `/meta` returns the first **playable** trailer: it probes TMDB's candidates (official first,
 then KinoCheck) with yt-dlp and skips ones that are geo-blocked / removed / undecodable *here*,
 so the URL it hands back actually plays. `links: []` means "nothing playable in this region"

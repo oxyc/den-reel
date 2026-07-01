@@ -146,8 +146,7 @@ async function resolveYouTubeId(imdbId, type, lang) {
   const candidates = [...new Set([...tmdb, ...(kc ? [kc] : [])])].slice(0, MAX_PROBE);
   const id = await firstPlayable(candidates);
   ytCache.set(cacheKey, { id, exp: cacheClock() + (id ? YT_TTL_MS : YT_NEG_TTL_MS) });
-  prewarm(id); // start the download now (bounded) so Den's /play moments later hits a warm cache
-  return id;
+  return id; // prewarm is the caller's decision (handleMeta) — a resolve-only path shouldn't download
 }
 
 /** First candidate yt-dlp can actually extract here, preserving rank order. Common case (top
@@ -223,15 +222,23 @@ async function handleMeta(req, res, type, rawId) {
   const rawLang = url.searchParams.get('lang') ?? 'en';
   const lang = /^[a-z]{2}$/i.test(rawLang) ? rawLang : 'en';
   const ytId = await resolveYouTubeId(imdbId, type, lang);
-  return sendJson(res, buildMeta(type, imdbId, selfBase(req), ytId));
+  // Prewarm the download UNLESS the caller opted out (?prewarm=0) — e.g. a browse-time
+  // poster-focus prefetch that only wants to resolve+validate, not pull bytes yet.
+  if (ytId && url.searchParams.get('prewarm') !== '0') prewarm(ytId);
+  const payload = buildMeta(type, imdbId, selfBase(req), ytId);
+  // Only cache a SUCCESSFUL resolution (a real trailer). Empty results (no trailer, geo-blocked,
+  // transient) stay uncached so the client re-checks — they may resolve later.
+  const headers = payload.meta.links.length ? { 'cache-control': 'public, max-age=604800' } : {};
+  return sendJson(res, payload, 200, headers);
 }
 
-function sendJson(res, body, status = 200) {
+function sendJson(res, body, status = 200, headers = {}) {
   const s = JSON.stringify(body);
   res.writeHead(status, {
     'content-type': 'application/json',
     'access-control-allow-origin': '*',
     'content-length': Buffer.byteLength(s),
+    ...headers,
   });
   res.end(s);
 }

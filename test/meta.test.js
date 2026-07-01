@@ -98,6 +98,42 @@ test('GET /meta resolves a real imdb id to a play URL on the request host', asyn
   assert.equal(body.meta.links[0].trailers, 'https://trailers.example.com/play/vidKey12345.mp4');
 });
 
+test('GET /meta caches a successful resolution (Cache-Control), but not an empty one', async () => {
+  stubTmdb([{ site: 'YouTube', type: 'Trailer', official: true, key: 'vidKey12345' }]);
+  const ok = await requestRes('/meta/movie/tt0111161.json');
+  assert.match(ok.headers['cache-control'] || '', /max-age=604800/);
+
+  app._clearYtCache();
+  stubTmdb([]); // no trailer → empty links → must NOT be cached
+  const empty = await requestRes('/meta/movie/tt0111161.json');
+  assert.deepEqual(empty.body.meta.links, []);
+  assert.equal(empty.headers['cache-control'], undefined);
+});
+
+test('?prewarm=0 resolves without prewarming; default prewarms', async () => {
+  stubTmdb([{ site: 'YouTube', type: 'Trailer', official: true, key: 'vidKey12345' }]);
+  const warmed = [];
+  app._setPrewarm((id) => warmed.push(id));
+  await requestRes('/meta/movie/tt0111161.json?prewarm=0');
+  assert.deepEqual(warmed, [], 'prewarm should be skipped');
+  await requestRes('/meta/movie/tt0111161.json');
+  assert.deepEqual(warmed, ['vidKey12345'], 'default should prewarm the resolved id');
+});
+
+/** Like request() but returns { status, headers, body }. */
+function requestRes(path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const srv = app.server.listen(0, () => {
+      const { port } = srv.address();
+      http.get({ port, path, headers }, (res) => {
+        let d = ''; res.on('data', (c) => (d += c));
+        res.on('end', () => { srv.close(); let body; try { body = JSON.parse(d); } catch { body = d; }
+          resolve({ status: res.statusCode, headers: res.headers, body }); });
+      }).on('error', reject);
+    });
+  });
+}
+
 /** Fire a request at the in-process server and return the parsed JSON body. */
 function request(path, headers = {}) {
   return new Promise((resolve, reject) => {
