@@ -32,10 +32,13 @@ const MAX_HEIGHT = process.env.MAX_HEIGHT || '1080';
 const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES || String(8 * 1024 * 1024 * 1024), 10); // 8 GB
 const VID_RE = /^[A-Za-z0-9_-]{6,15}$/;
 const MAX_PROBE = 6; // cap how many trailer candidates we validate per movie
-// The yt-dlp format we serve: H.264(avc1) + AAC(mp4a), ≤MAX_HEIGHT, faststart-muxable.
-// Shared by the extract path AND the resolve-time probe, so a probe validates exactly what
-// playback will need (a candidate that can't produce this — geo-blocked, removed, wrong
-// codecs — is skipped in favour of the next trailer).
+// The yt-dlp format we serve: H.264(avc1) + AAC(mp4a), ≤MAX_HEIGHT (avc1's ceiling on YT),
+// faststart-muxable. We force this so trailers play on AVPlayer's HARDWARE decode path —
+// lighter/faster than routing a short clip through the app's Aether Engine, which *can*
+// software-decode YouTube's VP9/AV1+Opus "best" but at a CPU/heat cost not worth it here.
+// Keep it avc1. Shared by the extract path AND the resolve-time probe, so a probe validates
+// exactly what playback needs (a candidate that can't produce it — geo-blocked, removed,
+// VP9/AV1-only — is skipped in favour of the next trailer).
 const YTDLP_FORMAT =
   `bv*[height<=${MAX_HEIGHT}][vcodec^=avc1]+ba[acodec^=mp4a]/`
   + `b[height<=${MAX_HEIGHT}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]`;
@@ -247,8 +250,8 @@ function fetchTrailer(vid) {
   const p = new Promise((resolve, reject) => {
     const args = [
       '-q', '--no-playlist', '--no-warnings',
-      // MUST be AVPlayer-decodable: H.264 (avc1) + AAC (mp4a). YouTube's "best" is VP9/AV1 +
-      // Opus, none of which Apple TV decodes. Same string the resolve-time probe validates.
+      // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — see YTDLP_FORMAT for why.
+      // Same string the resolve-time probe validates.
       '-f', YTDLP_FORMAT,
       '--merge-output-format', 'mp4',
       '--postprocessor-args', 'ffmpeg:-movflags +faststart', // moov up front → progressive play
