@@ -14,6 +14,7 @@
 
 mod addon;
 mod config;
+mod crop;
 mod httputil;
 mod play;
 mod state;
@@ -66,6 +67,13 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
                 let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
                 return addon::handle_meta(&state, &parts.headers, seg, &raw, query).await;
             }
+        }
+    }
+
+    // crop hint: /crop/<id>.json → detected content rect so the app can trim baked-in letterbox.
+    if let Some(id) = path.strip_prefix("/crop/").and_then(|r| r.strip_suffix(".json")) {
+        if is_valid_vid(id) {
+            return crop::handle_crop(state, id.to_string()).await;
         }
     }
 

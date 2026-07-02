@@ -70,6 +70,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         ytdlp_cache: cache_dir.join("yt-dlp"),
         cache_dir,
         ytdlp: "yt-dlp".into(),
+        ffmpeg: "ffmpeg".into(),
         max_height: "1080".into(),
         cache_max_bytes: 8 * 1024 * 1024 * 1024,
         tmdb_key: Some("test-key".into()),
@@ -94,6 +95,7 @@ fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn,
         yt_cache: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
+        crop_cache: Mutex::new(HashMap::new()),
         upstream,
         prober,
         prewarm,
@@ -306,6 +308,37 @@ async fn play_with_range_is_206() {
     assert_eq!(r.headers().get("content-range").unwrap(), &format!("bytes 0-99/{size}"));
     assert_eq!(r.headers().get("content-length").unwrap(), "100");
     assert_eq!(r.headers().get("accept-ranges").unwrap(), "bytes");
+}
+
+// --- cropdetect parsing ---
+
+#[test]
+fn parse_crop_takes_the_last_accumulated_box() {
+    // cropdetect (reset=0) prints progressively wider boxes; the last is the conservative union.
+    let stderr = "\
+[Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:140 y2:939 crop=1920:800:0:140\n\
+[Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:132 y2:947 crop=1920:816:0:132\n";
+    assert_eq!(
+        crate::crop::parse_crop(stderr),
+        Some(crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 })
+    );
+}
+
+#[test]
+fn parse_source_dims_reads_the_video_stream_line() {
+    let stderr = "  Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 24 fps";
+    assert_eq!(crate::crop::parse_source_dims(stderr), Some((1920, 1080)));
+}
+
+#[test]
+fn report_flags_letterbox_but_not_pixel_noise() {
+    // 1080 → 816 content = 264px bars (~24%) → letterboxed, ~2.35 aspect.
+    let boxed = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 });
+    assert!(boxed.letterboxed);
+    assert_eq!(boxed.aspect, Some(2.35));
+    // 1080 → 1072 content = 8px (<2%) → treated as noise, not letterboxed.
+    let noise = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 1072, x: 0, y: 4 });
+    assert!(!noise.letterboxed);
 }
 
 #[test]

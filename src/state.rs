@@ -39,6 +39,8 @@ pub struct AppState {
     pub in_flight: Mutex<HashMap<String, (u64, SharedDownload)>>,
     /// Monotonic id handed to each created download (map tag + unique temp-file suffix).
     pub dl_gen: AtomicU64,
+    /// vid -> detected content rectangle (from ffmpeg cropdetect), so /crop is computed once.
+    pub crop_cache: Mutex<HashMap<String, crate::crop::CropReport>>,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     pub prewarm: PrewarmFn,
@@ -60,6 +62,7 @@ impl AppState {
             yt_cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),
+            crop_cache: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg),
             prewarm: default_prewarm(),

@@ -40,6 +40,7 @@ fetches from us, not from YouTube.
 GET /manifest.json                       →  addon manifest (add this URL to Den)
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
+GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
 GET /health                               →  200 ok
 ```
 
@@ -54,6 +55,21 @@ following `/play` is warm. Two knobs:
 then KinoCheck) with yt-dlp and skips ones that are geo-blocked / removed / undecodable *here*,
 so the URL it hands back actually plays. `links: []` means "nothing playable in this region"
 (or no trailer, or `TMDB_KEY` unset) — never an error.
+
+`/crop` lets the app trim baked-in **letterbox bars** with no re-encode: it runs ffmpeg
+`cropdetect` (keyframe-sampled, so cheap) over the cached MP4 and returns the non-black content
+rectangle; the app aspect-fills that rect instead of the full frame.
+
+```
+{ "id":"…", "source":{"w":1920,"h":1080}, "content":{"x":0,"y":132,"w":1920,"h":816},
+  "letterboxed":true, "aspect":2.35 }
+```
+
+`letterboxed:false` (or a missing `content`) means "play the full frame". It's **logo-safe by
+construction**: cropdetect reports the bounding box of everything non-black, so a logo / laurel /
+"in theaters" card sitting in a bar counts as content — that bar is left in place and the logo is
+never cropped away (worst case a trailer just keeps its bars). `/crop` shares the download with
+`/play` (call it at play time) and caches the result; the `/play` download+serve path is untouched.
 
 `/play` failures return a real status + JSON so the caller can say *why*:
 
@@ -93,6 +109,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `PORT` | `8092` | |
 | `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
+| `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
 | `CACHE_MAX_BYTES` | `8589934592` (8 GB) | LRU eviction threshold |
 

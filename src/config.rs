@@ -10,6 +10,8 @@ pub struct Config {
     pub port: u16,
     pub cache_dir: PathBuf,
     pub ytdlp: String,
+    /// ffmpeg binary (same one yt-dlp merges with) — used for the /crop cropdetect pass.
+    pub ffmpeg: String,
     pub max_height: String,
     pub cache_max_bytes: u64,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
@@ -56,6 +58,7 @@ impl Config {
             port,
             cache_dir,
             ytdlp: env_opt("YTDLP_PATH").unwrap_or_else(|| "yt-dlp".to_string()),
+            ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
             max_height,
             cache_max_bytes,
             ytdlp_cache,
