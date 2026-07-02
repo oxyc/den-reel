@@ -54,6 +54,19 @@ pub fn is_valid_vid(id: &str) -> bool {
 /// Consecutive hard upstream faults before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
 
+/// Build the /health JSON body (ADDON-02). Pure so the branch logic is unit-testable without app
+/// state: `degraded` when no TMDB key is configured, or when the upstreams (TMDB/KinoCheck) have
+/// been failing (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`.
+fn health_body(tmdb_key_present: bool, recent_failures: u32) -> serde_json::Value {
+    if !tmdb_key_present {
+        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
+    } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
+        serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
+    } else {
+        serde_json::json!({"status": "ok"})
+    }
+}
+
 pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
@@ -62,13 +75,7 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
     if path == "/health" {
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
         // no TMDB key configured, or the upstreams (TMDB/KinoCheck) have been failing.
-        let body = if state.cfg.tmdb_key.is_none() {
-            serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
-        } else if state.upstream.recent_failures() >= HEALTH_FAIL_THRESHOLD {
-            serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
-        } else {
-            serde_json::json!({"status": "ok"})
-        };
+        let body = health_body(state.cfg.tmdb_key.is_some(), state.upstream.recent_failures());
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {

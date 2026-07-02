@@ -171,6 +171,30 @@ fn classify_defaults_to_502() {
     assert_eq!(classify(Some(1), "some other failure").status, 502);
 }
 
+// --- /health (ADDON-02) ------------------------------------------------------
+
+#[test]
+fn health_reports_degraded_and_ok_states() {
+    // No TMDB key configured → trailers can't work → degraded.
+    assert_eq!(
+        crate::health_body(false, 0),
+        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
+    );
+    // A missing key wins even if upstreams are also failing.
+    assert_eq!(crate::health_body(false, 99)["reason"], "tmdb_key_missing");
+
+    // Key present but upstreams have been failing (>= threshold) → degraded.
+    assert_eq!(
+        crate::health_body(true, 3),
+        json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
+    );
+    assert_eq!(crate::health_body(true, 4)["reason"], "upstream_unavailable");
+
+    // Key present, failures below the threshold → ok.
+    assert_eq!(crate::health_body(true, 0), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 2), json!({"status": "ok"}));
+}
+
 // --- resolve logic ----------------------------------------------------------
 
 #[tokio::test]
