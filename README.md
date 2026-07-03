@@ -69,12 +69,15 @@ rectangle; the app aspect-fills that rect instead of the full frame.
 `reset=1` (a fresh box per keyframe), and we crop to the **typical (median) box** snapped to a
 standard cinematic aspect. So a **transient** logo / laurel / "in theaters" card in a bar — present
 on only a minority of keyframes — is **cropped away** rather than holding the bar open; a logo that
-persists for the whole trailer still keeps its bar. Two guards keep it safe: a trailer that genuinely
-**uses the full frame** on more than a stray keyframe (mixed framing — e.g. a mostly-letterboxed
-animated trailer with full-frame hero shots) is left **uncropped entirely**, since slicing those
-shots is worse than keeping bars; and a minimum-content floor catches dark trailers whose frames
-momentarily read as mostly black. `/crop` shares the download with `/play` (call it at play time) and
-caches the result; the `/play` download+serve path is untouched.
+persists for the whole trailer still keeps its bar. We only ever trim a **full-width, landscape
+top/bottom letterbox** that keeps enough height; everything else plays the full frame. Guards: a
+trailer that genuinely **uses the full frame** on more than a stray keyframe (mixed framing — e.g. a
+mostly-letterboxed animated trailer with full-frame hero shots) is left uncropped, since slicing
+those shots is worse than keeping bars; a **portrait** source (or a landscape clip padded into a tall
+frame) is never letterbox-cropped (its huge top/bottom padding isn't a cinematic bar); and a
+minimum-content floor catches dark trailers whose frames momentarily read as mostly black. `/crop`
+shares the download with `/play` (call it at play time) and caches the result; the `/play`
+download+serve path is untouched.
 
 **Baked `clap`.** When a letterbox is detected, den-reel also writes a `clap` (clean aperture) box
 into the cached MP4 (via MP4Box — ~13 ms, +40 bytes, no re-encode, faststart preserved). Apple's

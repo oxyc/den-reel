@@ -497,6 +497,27 @@ fn full_frame_guard_spares_mixed_framing_trailers() {
 }
 
 #[test]
+fn refine_plays_full_frame_for_portrait_and_pillarbox() {
+    use crate::crop::{refine_report, report_from, RawCrop};
+
+    // Portrait source (landscape clip padded into a 720x1280 frame): the huge top/bottom padding is NOT
+    // a cinematic letterbox — cropping it to a thin strip is what broke the billboard. Must play full.
+    let portrait = refine_report(report_from("x", Some((720, 1280)), RawCrop { w: 640, h: 404, x: 40, y: 438 }));
+    assert!(!portrait.letterboxed, "a portrait source must not be letterbox-cropped");
+    assert_eq!(portrait.content.as_ref().map(|c| (c.w, c.h)), Some((720, 1280)));
+
+    // Pillarbox (side bars, not top/bottom) → not our job → full frame.
+    let pillar = refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1200, h: 1080, x: 360, y: 0 }));
+    assert!(!pillar.letterboxed);
+    assert_eq!(pillar.content.as_ref().map(|c| c.w), Some(1920));
+
+    // Kept letterboxes are always emitted centred + full-width, so the baked clap is symmetric/valid.
+    let kept = refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1918, h: 804, x: 1, y: 138 }));
+    assert_eq!(kept.content.as_ref().map(|c| (c.x, c.w)), Some((0, 1920)), "normalised to full width");
+    assert_eq!(kept.content.as_ref().map(|c| c.y), Some((1080 - 804) / 2), "centred vertically");
+}
+
+#[test]
 fn parse_source_dims_reads_the_video_stream_line() {
     let stderr = "  Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 24 fps";
     assert_eq!(crate::crop::parse_source_dims(stderr), Some((1920, 1080)));
@@ -607,6 +628,32 @@ async fn detect_does_not_crop_mixed_framing_end_to_end() {
     assert_eq!(report.content.as_ref().unwrap().h, 1080, "full frame kept, not sliced to the letterbox");
     // And nothing is baked, so an AVPlayer sees the full frame.
     assert!(!crate::crop::bake_clap(&cfg, &fp, &report).await, "no clap baked for a full-frame report");
+}
+
+// A PORTRAIT trailer (landscape clip padded into a tall frame) must NOT be letterbox-cropped — that
+// baked a clap that broke the billboard. detect() should report full-frame and bake nothing. Needs
+// ffmpeg + MP4Box; run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn detect_does_not_crop_portrait_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("portrait0001.mp4");
+    // A 720x404 landscape testsrc padded into a 720x1280 portrait frame (huge top/bottom padding).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-f", "lavfi", "-i", "testsrc=size=720x404:rate=24:d=3",
+            "-vf", "pad=720:1280:0:438:color=black",
+            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the portrait fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "portrait0001", &fp).await.expect("detect returned a report");
+    assert!(!report.letterboxed, "a portrait source must not be letterbox-cropped");
+    assert_eq!(report.content.as_ref().unwrap().h, 1280, "full portrait frame kept, not a thin strip");
+    assert!(!crate::crop::bake_clap(&cfg, &fp, &report).await, "no clap baked for a portrait trailer");
 }
 
 #[tokio::test]

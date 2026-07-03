@@ -227,11 +227,16 @@ fn nearest_std_aspect(a: f64) -> Option<f64> {
         .filter(|best| (best - a).abs() / best <= SNAP_TOL)
 }
 
-/// Refine a typical-box report for the common (near) full-width top/bottom letterbox: snap the crop to
-/// a standard cinematic aspect (centred, full-width) so a transient logo/laurel card that inflated the
-/// box gets clapped away cleanly, and guard against dark-frame over-crop. Pillarbox / off-width /
-/// already-clean boxes pass through unchanged.
-pub fn refine_report(mut r: CropReport) -> CropReport {
+/// Turn a typical-box report into what we actually serve. We only ever trim a top/bottom letterbox
+/// from a full-width, landscape content region that keeps enough height — the one case that makes sense
+/// for the landscape billboard. Everything else plays the full frame (no crop, no clap): a portrait
+/// source (huge top/bottom padding isn't a cinematic letterbox — cropping it to a thin strip breaks the
+/// billboard), a pillarbox or both-bar crop (not our job), or an over-aggressive vertical crop below
+/// `MIN_CONTENT_FRAC` height (likely a dark-frame artifact — keeping bars beats shaving real content).
+/// When we do keep a letterbox we snap the height to a standard cinematic aspect (dropping a transient
+/// logo that inflated the box) and always emit a centred, full-width box, so the baked clap is
+/// symmetric and geometrically valid every time.
+pub fn refine_report(r: CropReport) -> CropReport {
     if !r.letterboxed {
         return r;
     }
@@ -240,34 +245,31 @@ pub fn refine_report(mut r: CropReport) -> CropReport {
     };
     let bar_v = src.h.saturating_sub(c.h);
     let bar_h = src.w.saturating_sub(c.w);
-    // Only the (near) full-width top/bottom letterbox is refined; anything else keeps the measured box.
-    if bar_v <= bar_h || c.w * 20 < src.w * 19 {
-        return r;
+    let full_width = c.w * 20 >= src.w * 19; // content spans ≥95% width (no real side bars)
+    let landscape = c.w >= c.h; // the resulting region is itself landscape
+    let enough_height = c.h as f64 >= src.h as f64 * MIN_CONTENT_FRAC;
+    if !(bar_v > bar_h && full_width && landscape && enough_height) {
+        return full_frame_report(&r.id, src.w, src.h);
     }
-    match nearest_std_aspect(c.w as f64 / c.h as f64) {
-        Some(snapped) => {
-            let target_h = (src.w as f64 / snapped).round() as u32;
-            // Snap only when it stays on-frame, keeps enough content, and actually moves the box.
-            if target_h <= src.h
-                && target_h as f64 >= src.h as f64 * MIN_CONTENT_FRAC
-                && target_h.abs_diff(c.h) > SNAP_KEEP_PX
-            {
-                let y = (src.h - target_h) / 2;
-                r.aspect = Some(round2(src.w as f64 / target_h as f64));
-                r.letterboxed = src.h.saturating_sub(target_h) * 50 > src.h;
-                r.content = Some(Rect { x: 0, y, w: src.w, h: target_h });
-            }
-            r
+    // Snap the height to a standard aspect when it's close and would move the box meaningfully (e.g. a
+    // logo inflated it); otherwise keep the measured height.
+    let mut h = c.h;
+    if let Some(snapped) = nearest_std_aspect(src.w as f64 / c.h as f64) {
+        let target_h = (src.w as f64 / snapped).round() as u32;
+        if target_h <= src.h
+            && target_h as f64 >= src.h as f64 * MIN_CONTENT_FRAC
+            && target_h.abs_diff(c.h) > SNAP_KEEP_PX
+        {
+            h = target_h;
         }
-        // No standard match + an aggressive vertical crop → most likely a dark-frame artifact. Don't
-        // crop (play the full frame) rather than risk shaving real content off a valid trailer.
-        None if (c.h as f64) < src.h as f64 * MIN_CONTENT_FRAC => {
-            r.letterboxed = false;
-            r.aspect = Some(round2(src.w as f64 / src.h as f64));
-            r.content = Some(Rect { x: 0, y: 0, w: src.w, h: src.h });
-            r
-        }
-        None => r,
+    }
+    let y = (src.h - h) / 2;
+    CropReport {
+        id: r.id,
+        source: Some(src.clone()),
+        content: Some(Rect { x: 0, y, w: src.w, h }),
+        letterboxed: src.h.saturating_sub(h) * 50 > src.h,
+        aspect: Some(round2(src.w as f64 / h as f64)),
     }
 }
 
