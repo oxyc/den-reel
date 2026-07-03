@@ -15,7 +15,9 @@ use crate::{MAX_PROBE, YT_CACHE_MAX, YT_NEG_TTL_MS, YT_TTL_MS};
 pub fn manifest() -> Value {
     json!({
         "id": "fi.oxy.den-reel",
-        "version": "0.2.0",
+        // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
+        // manifest can't drift from Cargo.toml, nor the tag from either.
+        "version": env!("CARGO_PKG_VERSION"),
         "name": "Den Reel",
         "description": "Direct-URL trailers (TMDB/KinoCheck → yt-dlp service) for inline playback.",
         "resources": ["meta"],
