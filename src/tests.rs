@@ -47,11 +47,11 @@ impl FakeUpstream {
 
 #[async_trait]
 impl Upstream for FakeUpstream {
-    async fn tmdb_candidates(&self, _imdb: &str, _ty: &str, _lang: &str) -> Vec<String> {
+    async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> Vec<String> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
         self.0.tmdb.lock().unwrap().clone()
     }
-    async fn kinocheck_youtube_id(&self, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
+    async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
         self.0.kc.lock().unwrap().clone()
     }
 }
@@ -77,6 +77,8 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         cache_max_bytes: 8 * 1024 * 1024 * 1024,
         tmdb_key: Some("test-key".into()),
         kinocheck_key: None,
+        config_key: String::new(),
+        config_keys_prev: String::new(),
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         tmdb_base: "http://unused".into(),
@@ -92,8 +94,16 @@ fn noop_prewarm() -> PrewarmFn {
 }
 
 fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
+    build_state_cfg(test_cfg(cache_dir), upstream, prober, prewarm)
+}
+
+/// Like `build_state` but with an explicit `Config` — lets a test enable the sealed-config keyring
+/// (via `config_key`) exactly the way production does.
+fn build_state_cfg(cfg: Config, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
+    let config_keyring = crate::seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
     Arc::new(AppState {
-        cfg: Arc::new(test_cfg(cache_dir)),
+        cfg: Arc::new(cfg),
+        config_keyring,
         yt_cache: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
@@ -175,10 +185,10 @@ fn classify_defaults_to_502() {
 
 #[test]
 fn health_reports_degraded_and_ok_states() {
-    // No TMDB key configured → trailers can't work → degraded.
+    // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
     assert_eq!(
         crate::health_body(false, 0),
-        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
+        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     );
     // A missing key wins even if upstreams are also failing.
     assert_eq!(crate::health_body(false, 99)["reason"], "tmdb_key_missing");
@@ -202,9 +212,9 @@ async fn resolve_returns_first_playable_and_caches() {
     let fake = FakeUpstream::new(&["firstGood11"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "tt0111161", "movie", "en").await, "firstGood11");
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "firstGood11");
     let after = fake.calls();
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "tt0111161", "movie", "en").await, "firstGood11");
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "firstGood11");
     assert_eq!(fake.calls(), after, "second lookup is a cache hit (no new upstream calls)");
 }
 
@@ -213,7 +223,7 @@ async fn resolve_skips_geoblocked_and_falls_back() {
     let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
     let prober: ProbeFn = Box::new(|id| Box::pin(async move { id != "blockedUS01" }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "tt0111161", "movie", "en").await, "worldwide22");
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "worldwide22");
 }
 
 #[tokio::test]
@@ -221,7 +231,7 @@ async fn resolve_returns_empty_when_none_playable() {
     let fake = FakeUpstream::new(&["blockedUS01"], None);
     let prober: ProbeFn = Box::new(|_id| Box::pin(async { false }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "tt0111161", "movie", "en").await, "");
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "");
 }
 
 // --- HTTP contract ----------------------------------------------------------
@@ -298,6 +308,81 @@ async fn prewarm_default_but_not_when_opted_out() {
 
     client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
     assert_eq!(*warmed.lock().unwrap(), vec!["vidKey12345".to_string()], "default should prewarm");
+}
+
+// --- sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md) -----------------
+
+// The fixed vector key + a PyNaCl-sealed {tmdbKey,kinocheckKey} segment (same key the seal/userconfig
+// unit tests use), driven through the real router so the config-scoped routes are proven end-to-end.
+const VEC_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+const VEC_PUB: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=";
+const SEALED_SEG: &str = "Abo-qmntVxuOmeVa0Q5pPWju0VrZDS4aRoAP-0JHNtk7nmMcduhttWlvldwvUdXPafUGUegc4ul5J3gFVo8nEGOd8htc7he_3BihPsWtiuA5_2Du-FL5NpaNzfvqhDAHM_LAjw";
+
+/// Build a state with the sealed-config keyring enabled and NO env TMDB key — so a resolved trailer
+/// can only come from the per-install (sealed) config path.
+fn sealed_state(fake: FakeUpstream) -> Arc<AppState> {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_key = None; // prove the URL config supplies the key, not the env
+    cfg.config_key = VEC_PRIV.into();
+    build_state_cfg(cfg, Box::new(fake), always_playable(), noop_prewarm())
+}
+
+#[tokio::test]
+async fn config_key_serves_pubkey_when_keyring_set() {
+    let base = spawn_server(sealed_state(FakeUpstream::new(&[], None))).await;
+    let r = reqwest::get(format!("{base}/config-key")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["key"], VEC_PUB);
+}
+
+#[tokio::test]
+async fn config_key_404s_when_sealing_disabled() {
+    // Default test state has no REEL_CONFIG_KEY → sealing disabled.
+    let state = build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    assert_eq!(reqwest::get(format!("{base}/config-key")).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn sealed_config_url_resolves_manifest_and_meta() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let base = spawn_server(sealed_state(fake)).await;
+    let client = reqwest::Client::new();
+
+    // The pasted install URL.
+    let manifest = client.get(format!("{base}/{SEALED_SEG}/manifest.json")).send().await.unwrap();
+    assert_eq!(manifest.status(), 200);
+
+    // Stremio then derives /<config>/meta/... — resolves the trailer using the sealed BYOK TMDB key.
+    let body: Value = client
+        .get(format!("{base}/{SEALED_SEG}/meta/movie/tt0111161.json"))
+        .header("x-forwarded-host", "trailers.example.com")
+        .header("x-forwarded-proto", "https")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
+}
+
+#[tokio::test]
+async fn a_bad_config_segment_fails_closed() {
+    let base = spawn_server(sealed_state(FakeUpstream::new(&["x"], None))).await;
+    let client = reqwest::Client::new();
+    // Garbage where a config belongs → 400, never a silent env-key fallback under a config-shaped URL.
+    let bad = client.get(format!("{base}/not-a-valid-config/manifest.json")).send().await.unwrap();
+    assert_eq!(bad.status(), 400);
+    let body: Value = bad.json().await.unwrap();
+    assert_eq!(body["error"], "bad_config");
+}
+
+#[tokio::test]
+async fn legacy_plaintext_config_resolves_with_a_keyring_present() {
+    use base64::Engine;
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let base = spawn_server(sealed_state(fake)).await;
+    let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"tmdbKey":"legacy"}"#);
+    let body: Value = reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json"))
+        .await.unwrap().json().await.unwrap();
+    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 1, "legacy plaintext config must still resolve");
 }
 
 // --- /play serve contract (seed a cached file so fetch_trailer never spawns yt-dlp) ---

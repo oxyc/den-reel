@@ -18,8 +18,10 @@ const MAX_UPSTREAM_BODY: usize = 4 * 1024 * 1024;
 /// error to the caller) — same as the Node version's try/catch-to-`[]`.
 #[async_trait]
 pub trait Upstream: Send + Sync {
-    async fn tmdb_candidates(&self, imdb: &str, ty: &str, lang: &str) -> Vec<String>;
-    async fn kinocheck_youtube_id(&self, imdb: &str, ty: &str, lang: &str) -> Option<String>;
+    /// `tmdb_key` / `kinocheck_key` are the per-request BYOK credentials (from the URL config, or the
+    /// env fallback during migration) — resolved by the caller so the upstream holds no key of its own.
+    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, lang: &str) -> Vec<String>;
+    async fn kinocheck_youtube_id(&self, kinocheck_key: Option<&str>, imdb: &str, ty: &str, lang: &str) -> Option<String>;
     /// Consecutive hard upstream faults, for /health (ADDON-02). Non-HTTP upstreams report 0.
     fn recent_failures(&self) -> u32 {
         0
@@ -121,11 +123,11 @@ fn redact(url: &str) -> &str {
 #[async_trait]
 impl Upstream for HttpUpstream {
     /// imdb → TMDB id (via /find) → /videos → ordered YouTube trailer candidates ([] on miss).
-    async fn tmdb_candidates(&self, imdb: &str, ty: &str, lang: &str) -> Vec<String> {
-        let key = match &self.cfg.tmdb_key {
-            Some(k) => k,
-            None => return Vec::new(),
-        };
+    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, lang: &str) -> Vec<String> {
+        if tmdb_key.is_empty() {
+            return Vec::new();
+        }
+        let key = tmdb_key;
         let tmdb_type = if ty == "series" { "tv" } else { "movie" };
         let find_url = format!(
             "{}/find/{imdb}?external_source=imdb_id&api_key={key}",
@@ -158,7 +160,7 @@ impl Upstream for HttpUpstream {
     }
 
     /// KinoCheck discovery fallback: imdb → official trailer's YouTube id (or None).
-    async fn kinocheck_youtube_id(&self, imdb: &str, ty: &str, lang: &str) -> Option<String> {
+    async fn kinocheck_youtube_id(&self, kinocheck_key: Option<&str>, imdb: &str, ty: &str, lang: &str) -> Option<String> {
         let endpoint = if ty == "series" { "shows" } else { "movies" };
         let language = if lang.starts_with("de") { "de" } else { "en" };
         let url = format!(
@@ -166,7 +168,7 @@ impl Upstream for HttpUpstream {
             self.cfg.kinocheck_base
         );
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
-        if let Some(k) = &self.cfg.kinocheck_key {
+        if let Some(k) = kinocheck_key {
             headers.push(("X-Api-Key", k));
             headers.push(("X-Api-Host", "api.kinocheck.com"));
         }

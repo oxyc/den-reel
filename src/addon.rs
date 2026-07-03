@@ -22,6 +22,9 @@ pub fn manifest() -> Value {
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
         "catalogs": [],
+        // A BYOK TMDB key is entered (and sealed) at /configure — advertise it so a Stremio client shows
+        // the Configure button. The Den app builds the sealed URL directly, so this is just for parity.
+        "behaviorHints": { "configurable": true },
     })
 }
 
@@ -111,8 +114,17 @@ async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String 
 }
 
 /// Resolve (and cache) the first PLAYABLE trailer ytId for an imdb id. "" = looked up, nothing
-/// playable (cached shorter, in case it's transient).
-pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lang: &str) -> String {
+/// playable (cached shorter, in case it's transient). `tmdb_key`/`kinocheck_key` are the effective
+/// per-request BYOK credentials (URL config, or env fallback). The cache is keyed by `imdb:lang` only —
+/// the resolved trailer is public and key-independent, so installs with different keys share one entry.
+pub async fn resolve_youtube_id(
+    state: &Arc<AppState>,
+    tmdb_key: &str,
+    kinocheck_key: Option<&str>,
+    imdb: &str,
+    ty: &str,
+    lang: &str,
+) -> String {
     let cache_key = format!("{imdb}:{lang}");
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -125,8 +137,8 @@ pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lan
     // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
     // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
     let (tmdb, kc) = tokio::join!(
-        state.upstream.tmdb_candidates(imdb, ty, lang),
-        state.upstream.kinocheck_youtube_id(imdb, ty, lang),
+        state.upstream.tmdb_candidates(tmdb_key, imdb, ty, lang),
+        state.upstream.kinocheck_youtube_id(kinocheck_key, imdb, ty, lang),
     );
     let mut seen = HashSet::new();
     let mut candidates: Vec<String> = Vec::new();
@@ -154,6 +166,7 @@ pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lan
 pub async fn handle_meta(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    cfg: Option<&crate::userconfig::UserConfig>,
     ty: &str,
     raw_id: &str,
     query: &str,
@@ -165,9 +178,18 @@ pub async fn handle_meta(
     if !is_imdb(imdb) {
         return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, ""), &[]);
     }
+    // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
+    // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).
+    let tmdb_key = cfg
+        .map(|c| c.tmdb_key.as_str())
+        .or(state.cfg.tmdb_key.as_deref())
+        .unwrap_or("");
+    let kinocheck_key = cfg
+        .and_then(|c| c.kinocheck_key.as_deref())
+        .or(state.cfg.kinocheck_key.as_deref());
     let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
     let lang = if valid_lang(&raw_lang) { raw_lang } else { "en".to_string() };
-    let yt_id = resolve_youtube_id(state, imdb, ty, &lang).await;
+    let yt_id = resolve_youtube_id(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
     // Prewarm the download UNLESS the caller opted out (?prewarm=0).
     if !yt_id.is_empty() && query_param(query, "prewarm").as_deref() != Some("0") {
         (state.prewarm)(state.clone(), yt_id.clone());

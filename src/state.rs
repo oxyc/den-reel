@@ -14,6 +14,7 @@ use futures_util::future::Shared;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
+use crate::seal::Keyring;
 use crate::upstream::{HttpUpstream, Upstream};
 use crate::ytdlp::{self, PlayError};
 
@@ -32,6 +33,9 @@ pub struct YtEntry {
 
 pub struct AppState {
     pub cfg: Arc<Config>,
+    /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
+    /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
+    pub config_keyring: Option<Keyring>,
     /// Cache the STABLE ytId (the expensive lookup); playback is just our /play proxy for it.
     /// In-memory (24h TTL) — cheap to rebuild on restart, no external store needed. "" = "no trailer".
     pub yt_cache: Mutex<HashMap<String, YtEntry>>,
@@ -63,8 +67,17 @@ impl AppState {
             .expect("reqwest client");
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http));
         let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
+        // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.
+        let config_keyring = match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
+            Ok(kr) => kr,
+            Err(e) => {
+                eprintln!("warning: REEL_CONFIG_KEY invalid ({e}) — sealed configs disabled");
+                None
+            }
+        };
         Arc::new(AppState {
             cfg: cfg.clone(),
+            config_keyring,
             yt_cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),

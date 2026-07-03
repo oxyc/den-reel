@@ -1,7 +1,10 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES (playback);
-//!      TMDB_KEY (required for the addon), KINOCHECK_KEY (optional), PUBLIC_BASE_URL (optional).
+//!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL).
+//!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
+//!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
+//!      sealed in the URL (den-scout/docs/SEALED-CONFIG.md). Drop the env keys once installs migrate.
 
 use std::env;
 use std::path::PathBuf;
@@ -22,8 +25,14 @@ pub struct Config {
     pub cache_max_bytes: u64,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,
+    /// Legacy server-side discovery keys — a MIGRATION FALLBACK used only when a request carries no
+    /// per-install config. New installs seal a BYOK TMDB (+ optional KinoCheck) key into the URL.
     pub tmdb_key: Option<String>,
     pub kinocheck_key: Option<String>,
+    /// Sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md). `config_key` = current X25519 private key
+    /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
+    pub config_key: String,
+    pub config_keys_prev: String,
     pub public_base_url: Option<String>,
     /// The yt-dlp format string we serve — H.264(avc1) + AAC(mp4a), ≤max_height (avc1's ceiling on
     /// YouTube), faststart-muxable. Forced so trailers play on AVPlayer's HARDWARE decode path
@@ -72,6 +81,8 @@ impl Config {
             ytdlp_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),
+            config_key: env_opt("REEL_CONFIG_KEY").unwrap_or_default(),
+            config_keys_prev: env_opt("REEL_CONFIG_KEYS_PREV").unwrap_or_default(),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             tmdb_base: "https://api.themoviedb.org/3".to_string(),

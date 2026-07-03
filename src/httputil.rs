@@ -39,6 +39,18 @@ pub fn json(
     b.body(full(s)).unwrap()
 }
 
+/// HTML response (the embedded /configure page), plus any extra headers (e.g. Cache-Control).
+pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> Response<Body> {
+    let mut b = Response::builder()
+        .status(status)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", body.len());
+    for (k, v) in extra {
+        b = b.header(*k, *v);
+    }
+    b.body(full(body)).unwrap()
+}
+
 /// A typed error body `{ "error": <code>, "message": <msg> }` (no-store applied via `json`).
 pub fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": code, "message": message }), &[])

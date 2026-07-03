@@ -17,8 +17,10 @@ mod config;
 mod crop;
 mod httputil;
 mod play;
+mod seal;
 mod state;
 mod upstream;
+mod userconfig;
 mod ytdlp;
 
 #[cfg(test)]
@@ -45,6 +47,9 @@ pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the sam
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
 
+/// The /configure page, embedded so the binary is self-contained (seals a BYOK TMDB key into the URL).
+const CONFIGURE_PAGE: &str = include_str!("configure.html");
+
 /// A YouTube id as it appears in a /play path or `?v=`: `[A-Za-z0-9_-]{6,15}`.
 pub fn is_valid_vid(id: &str) -> bool {
     (6..=15).contains(&id.len())
@@ -55,11 +60,13 @@ pub fn is_valid_vid(id: &str) -> bool {
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
 
 /// Build the /health JSON body (ADDON-02). Pure so the branch logic is unit-testable without app
-/// state: `degraded` when no TMDB key is configured, or when the upstreams (TMDB/KinoCheck) have
-/// been failing (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`.
-fn health_body(tmdb_key_present: bool, recent_failures: u32) -> serde_json::Value {
-    if !tmdb_key_present {
-        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
+/// state: `degraded` when trailers can't work at all (no server TMDB key AND no sealed-config keyring,
+/// so no install can supply one), or when the upstreams (TMDB/KinoCheck) have been failing
+/// (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`. `/health` is addon-level (no
+/// per-install config), so a keyring being present is enough to consider trailers workable.
+fn health_body(tmdb_available: bool, recent_failures: u32) -> serde_json::Value {
+    if !tmdb_available {
+        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
         serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
     } else {
@@ -67,28 +74,74 @@ fn health_body(tmdb_key_present: bool, recent_failures: u32) -> serde_json::Valu
     }
 }
 
-pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
+// Generic over the request body: this handler routes on path/query only and discards the body, so tests
+// can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
+pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
 
     if path == "/health" {
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
-        // no TMDB key configured, or the upstreams (TMDB/KinoCheck) have been failing.
-        let body = health_body(state.cfg.tmdb_key.is_some(), state.upstream.recent_failures());
+        // no server TMDB key AND no sealed-config keyring, or the upstreams (TMDB/KinoCheck) failing.
+        let tmdb_available = state.cfg.tmdb_key.is_some() || state.config_keyring.is_some();
+        let body = health_body(tmdb_available, state.upstream.recent_failures());
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {
         return httputil::json(StatusCode::OK, &addon::manifest(), &[]);
     }
+    // The /configure UI seals a BYOK TMDB key into the install URL (den-scout/docs/SEALED-CONFIG.md).
+    if path == "/" || path == "/configure" || path == "/configure/" {
+        return httputil::html(StatusCode::OK, CONFIGURE_PAGE, &[("cache-control", "public, max-age=3600")]);
+    }
+    // The current X25519 public key (base64) so /configure can seal the config to it; 404 when sealed
+    // configs are disabled (no key) — the page then keeps plaintext.
+    if path == "/config-key" {
+        return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
+            Some(k) if !k.is_empty() => httputil::json(
+                StatusCode::OK,
+                &serde_json::json!({"key": k}),
+                &[("cache-control", "public, max-age=3600")],
+            ),
+            _ => httputil::json(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": "no_key"}),
+                &[("cache-control", "no-store")],
+            ),
+        };
+    }
 
-    // /meta/(movie|series)/(.+).json
+    // Legacy config-less discovery: /meta/(movie|series)/(.+).json — resolves with the env TMDB key.
     if let Some(rest) = path.strip_prefix("/meta/") {
-        if let Some((seg, tail)) = rest.split_once('/') {
-            if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
-                let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
-                return addon::handle_meta(&state, &parts.headers, seg, &raw, query).await;
+        if let Some(resp) = meta_from_rest(&state, &parts.headers, None, rest, query).await {
+            return resp;
+        }
+    }
+
+    // Config-scoped discovery: /<config>/manifest.json and /<config>/meta/(movie|series)/(.+).json,
+    // where <config> carries a BYOK TMDB key (sealed or legacy plaintext). The app pastes the manifest
+    // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
+    if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
+        if rest == "manifest.json" || rest.starts_with("meta/") {
+            let cfg = match userconfig::decode(state.config_keyring.as_ref(), cfg_seg) {
+                Some(c) => c,
+                None => {
+                    return httputil::json(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({"error": "bad_config"}),
+                        &[("cache-control", "no-store")],
+                    )
+                }
+            };
+            if rest == "manifest.json" {
+                return httputil::json(StatusCode::OK, &addon::manifest(), &[]);
             }
+            let meta_rest = &rest["meta/".len()..];
+            if let Some(resp) = meta_from_rest(&state, &parts.headers, Some(&cfg), meta_rest, query).await {
+                return resp;
+            }
+            return httputil::text(StatusCode::NOT_FOUND, "not found");
         }
     }
 
@@ -115,6 +168,24 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
         _ => return httputil::text(StatusCode::BAD_REQUEST, "bad video id"),
     };
     play::handle_play(state, &parts.headers, vid).await
+}
+
+/// Parse `<movie|series>/<imdbId>.json` (the part after `meta/`) and dispatch to the meta handler.
+/// `None` if the shape doesn't match, so the caller can fall through to the next route. `cfg` carries
+/// the per-install BYOK keys (`None` = legacy config-less, resolve with the env key).
+async fn meta_from_rest(
+    state: &Arc<AppState>,
+    headers: &hyper::HeaderMap,
+    cfg: Option<&userconfig::UserConfig>,
+    rest: &str,
+    query: &str,
+) -> Option<Response<Body>> {
+    let (seg, tail) = rest.split_once('/')?;
+    if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
+        let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
+        return Some(addon::handle_meta(state, headers, cfg, seg, &raw, query).await);
+    }
+    None
 }
 
 async fn run(cfg: Config) -> std::io::Result<()> {

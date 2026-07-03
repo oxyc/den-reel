@@ -110,8 +110,10 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 
 | Var | Default | Notes |
 |---|---|---|
-| `TMDB_KEY` | — | **required for the addon** (`/meta`); playback works without it |
-| `KINOCHECK_KEY` | — | optional discovery fallback when TMDB has no trailer |
+| `REEL_CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key. Set it and `/configure` seals a BYOK TMDB key into the install URL (`crypto_box_seal`) so no discovery key lives on the server. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
+| `REEL_CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting) |
+| `TMDB_KEY` | — | **migration fallback** only: the legacy server-side discovery key, used when a request carries no per-install config. New installs seal their own key; drop this once migrated. |
+| `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
 | `PORT` | `8092` | |
 | `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume |
