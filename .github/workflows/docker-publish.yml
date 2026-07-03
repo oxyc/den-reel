@@ -7,6 +7,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -24,8 +26,30 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
 
+  # On a PR (e.g. an automated yt-dlp bump) — build the image WITHOUT pushing. This is the merge gate:
+  # it runs the SHA-verified yt-dlp download + full image assembly, so a bad checksum or broken build
+  # fails the check. Single-arch (amd64) for speed; the arm64 SHA is verified by the publish build below
+  # on merge. Note: this proves the image builds, NOT that YouTube extraction still works (that canary
+  # can't run on datacenter IPs) — extraction breakage is caught operationally via /health.
+  build-pr:
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   build:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,0 +1,103 @@
+name: ytdlp-update
+
+# Daily check for a newer yt-dlp release. If one exists and is >=2 days old (supply-chain COOLDOWN — a
+# poisoned release that gets yanked within 48h is never pulled), bump YTDLP_VERSION + the pinned SHA256s
+# in the Dockerfile and open an auto-merging PR. The PR's CI (docker-publish.yml on pull_request: clippy,
+# cargo test, and a real image build that runs the SHA-verified yt-dlp download) is the merge gate.
+#
+# CI proves the image builds and the binary's checksum matches — it does NOT prove YouTube extraction
+# still works (that canary can't run on datacenter IPs). Extraction breakage is caught operationally:
+# /health reports `degraded` on the homelab and the bump can be reverted.
+#
+# One-time repo setup required for auto-merge to actually work:
+#   1. Settings → General → Pull Requests → "Allow auto-merge" ON.
+#   2. A branch-protection rule on `main` requiring the `test` and `build-pr` status checks.
+#   3. Secret YTDLP_PR_TOKEN = a PAT (repo scope). The PR is opened with THIS token, not the default
+#      GITHUB_TOKEN, on purpose: GitHub suppresses workflow runs on PRs opened by GITHUB_TOKEN, which
+#      would leave auto-merge waiting forever with no checks to satisfy.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve latest eligible yt-dlp release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COOLDOWN_DAYS: "2"
+        run: |
+          set -euo pipefail
+          rel=$(gh api repos/yt-dlp/yt-dlp/releases/latest)
+          tag=$(jq -r .tag_name <<<"$rel")
+          published=$(jq -r .published_at <<<"$rel")
+          current=$(grep -oP '^ARG YTDLP_VERSION=\K\S+' Dockerfile)
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$published" +%s) ) / 86400 ))
+          echo "current=$current latest=$tag age_days=$age_days"
+          if [ "$tag" = "$current" ]; then
+            echo "::notice::already on the latest yt-dlp ($tag)"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$age_days" -lt "$COOLDOWN_DAYS" ]; then
+            echo "::notice::yt-dlp $tag is only ${age_days}d old (<${COOLDOWN_DAYS}d cooldown) — skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${tag}/SHA2-256SUMS" -o sums.txt
+          amd64=$(awk '$2=="yt-dlp_linux"{print $1}' sums.txt)
+          arm64=$(awk '$2=="yt-dlp_linux_aarch64"{print $1}' sums.txt)
+          rm -f sums.txt
+          if [ -z "$amd64" ] || [ -z "$arm64" ]; then
+            echo "::error::could not read both SHA256 sums for $tag"; exit 1
+          fi
+          {
+            echo "proceed=true"
+            echo "tag=$tag"
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Patch Dockerfile
+        if: steps.rel.outputs.proceed == 'true'
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          AMD64: ${{ steps.rel.outputs.amd64 }}
+          ARM64: ${{ steps.rel.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^ARG YTDLP_VERSION=.*|ARG YTDLP_VERSION=${TAG}|" Dockerfile
+          sed -i -E "s|^ARG YTDLP_SHA256_AMD64=.*|ARG YTDLP_SHA256_AMD64=${AMD64}|" Dockerfile
+          sed -i -E "s|^ARG YTDLP_SHA256_ARM64=.*|ARG YTDLP_SHA256_ARM64=${ARM64}|" Dockerfile
+          git diff -- Dockerfile
+
+      - name: Open auto-merging PR
+        id: cpr
+        if: steps.rel.outputs.proceed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.YTDLP_PR_TOKEN }}
+          branch: ytdlp-bump/${{ steps.rel.outputs.tag }}
+          title: "yt-dlp → ${{ steps.rel.outputs.tag }}"
+          commit-message: "Bump yt-dlp to ${{ steps.rel.outputs.tag }} (+ pinned SHA256)"
+          labels: dependencies
+          body: |
+            Automated bump of the pinned yt-dlp to `${{ steps.rel.outputs.tag }}` — release is ≥2 days old (supply-chain cooldown).
+
+            SHA256 pins refreshed from the release's `SHA2-256SUMS`; the PR image build verifies the amd64 checksum, and the publish build verifies arm64 on merge.
+
+            Auto-merges once CI is green. CI proves the image builds and the checksum matches — it does **not** prove YouTube extraction still works (that canary can't run on datacenter IPs). If a bump breaks extraction, `/health` reports `degraded` on the homelab and this can be reverted.
+
+      - name: Enable auto-merge
+        if: steps.rel.outputs.proceed == 'true' && steps.cpr.outputs.pull-request-number
+        continue-on-error: true # if "Allow auto-merge" isn't enabled yet, leave the PR for manual merge
+        env:
+          GH_TOKEN: ${{ secrets.YTDLP_PR_TOKEN }}
+        run: gh pr merge --auto --squash "${{ steps.cpr.outputs.pull-request-number }}"

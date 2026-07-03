@@ -49,14 +49,20 @@ RUN set -eux; \
 # needed). Bump YTDLP_VERSION to update (YouTube changes often — that's the whole maintenance
 # burden, and it's yt-dlp's, not ours).
 ARG YTDLP_VERSION=2026.06.09
+# SHA256 of each release asset, from the release's SHA2-256SUMS. Verifying the download is the
+# supply-chain guard — there's no advisory DB for a standalone binary, so integrity is the whole game.
+# Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml (which refreshes both).
+ARG YTDLP_SHA256_AMD64=bf8aac79b72287a6d2043074415132558b43743a8f9461a22b0141e90f16ce66
+ARG YTDLP_SHA256_ARM64=cabd246445bdfde0eda0dfe68bbe90354be83f3fdbbf077df11a2ea55f41cdbd
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) asset=yt-dlp_linux ;; \
-      arm64) asset=yt-dlp_linux_aarch64 ;; \
+      amd64) asset=yt-dlp_linux; sha=$YTDLP_SHA256_AMD64 ;; \
+      arm64) asset=yt-dlp_linux_aarch64; sha=$YTDLP_SHA256_ARM64 ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${asset}" \
       -o /usr/local/bin/yt-dlp; \
+    echo "${sha}  /usr/local/bin/yt-dlp" | sha256sum -c -; \
     chmod +x /usr/local/bin/yt-dlp
 
 # ---- runtime --------------------------------------------------------------
