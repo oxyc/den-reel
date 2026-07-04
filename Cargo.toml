@@ -1,6 +1,6 @@
 [package]
 name = "den-reel"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Den trailers, one container: addon (imdb→ytId via TMDB) + yt-dlp/ffmpeg proxy (ytId→faststart MP4) for inline tvOS playback"
 publish = false
