@@ -26,6 +26,16 @@ pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
 pub type SharedDownload = Shared<BoxFuture<Result<PathBuf, PlayError>>>;
+/// One in-flight HLS remux shared across waiters; resolves at READINESS (init + first segment on
+/// disk), not completion — the detached driver keeps muxing the rest. `Ok(())` = ready to serve.
+pub type SharedHls = Shared<BoxFuture<Result<(), PlayError>>>;
+
+/// Cached direct googlevideo URL(s) for the HLS path (1 progressive / 2 DASH). `exp` is ms since
+/// epoch — kept BELOW the ~6h googlevideo signature lifetime so we never hand ffmpeg a dead URL.
+pub struct UrlEntry {
+    pub urls: Vec<String>,
+    pub exp: u64,
+}
 
 /// Resolved (or negatively-cached) trailer ytIds — best-playable first, then unprobed alternates the
 /// client falls back to on a playback failure. Empty = "no trailer". `exp` is ms since epoch.
@@ -47,6 +57,14 @@ pub struct AppState {
     pub in_flight: Mutex<HashMap<String, (u64, SharedDownload)>>,
     /// Monotonic id handed to each created download (map tag + unique temp-file suffix).
     pub dl_gen: AtomicU64,
+    /// vid -> briefly-cached direct googlevideo URL(s) for the HLS remux path, so a re-play within the
+    /// signature lifetime skips a fresh yt-dlp extraction. Empty when STREAM_REMUX is off.
+    pub url_cache: Mutex<HashMap<String, UrlEntry>>,
+    /// vid -> (generation, in-flight HLS remux) — de-dupe so concurrent /hls requests share one ffmpeg
+    /// driver; the generation lets the driver clear only its own entry.
+    pub hls_jobs: Mutex<HashMap<String, (u64, SharedHls)>>,
+    /// Monotonic id per HLS remux job (same role as `dl_gen` for downloads).
+    pub hls_gen: AtomicU64,
     /// vid -> detected content rectangle (from ffmpeg cropdetect), so /crop is computed once.
     pub crop_cache: Mutex<HashMap<String, crate::crop::CropReport>>,
     pub upstream: Box<dyn Upstream>,
@@ -92,6 +110,9 @@ impl AppState {
             yt_cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),
+            url_cache: Mutex::new(HashMap::new()),
+            hls_jobs: Mutex::new(HashMap::new()),
+            hls_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
@@ -139,10 +160,19 @@ pub fn default_prewarm() -> PrewarmFn {
         if id.is_empty() {
             return;
         }
-        let busy = state.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len();
+        // Warm whichever path /meta will hand back: the HLS remux (STREAM_REMUX) or the MP4 download.
+        let busy = if state.cfg.stream_remux {
+            state.hls_jobs.lock().unwrap_or_else(|e| e.into_inner()).len()
+        } else {
+            state.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len()
+        };
         if busy < crate::PREWARM_MAX {
             tokio::spawn(async move {
-                let _ = crate::play::fetch_trailer(state, id).await;
+                if state.cfg.stream_remux {
+                    let _ = crate::hls::ensure_hls(state, id).await;
+                } else {
+                    let _ = crate::play::fetch_trailer(state, id).await;
+                }
             });
         }
     })

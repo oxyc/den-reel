@@ -15,6 +15,7 @@
 mod addon;
 mod config;
 mod crop;
+mod hls;
 mod httputil;
 mod play;
 mod seal;
@@ -44,6 +45,7 @@ pub const PREWARM_MAX: usize = 3; // cap concurrent prewarm downloads (bounds a 
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
 pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
+pub const URL_CACHE_TTL_MS: u64 = 5 * 60 * 60 * 1000; // HLS googlevideo URLs cached <6h signature life
 pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the same way
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
@@ -167,6 +169,20 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         if is_valid_vid(id) {
             return crop::handle_crop(state, id.to_string()).await;
         }
+    }
+
+    // HLS stream-remux (EXPERIMENTAL, STREAM_REMUX): /hls/<vid>/<index.m3u8|init.mp4|seg_NNN.m4s>.
+    // Only live when the flag is on; a single path segment for the file (no `/`) guards traversal, and
+    // hls::handle_hls further restricts to the exact three filenames.
+    if let Some(rest) = path.strip_prefix("/hls/") {
+        if state.cfg.stream_remux {
+            if let Some((vid, file)) = rest.split_once('/') {
+                if is_valid_vid(vid) && !file.is_empty() && !file.contains('/') {
+                    return hls::handle_hls(state, vid.to_string(), file.to_string()).await;
+                }
+            }
+        }
+        return httputil::text(StatusCode::NOT_FOUND, "not found");
     }
 
     // playback: id from /play/<id>.mp4 (overrides ?v=), else ?v= on the bare /play path.

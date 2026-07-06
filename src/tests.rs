@@ -81,6 +81,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         ffmpeg: "ffmpeg".into(),
         mp4box: "MP4Box".into(),
         bake_clap: true,
+        stream_remux: false,
         max_height: "1080".into(),
         cache_max_bytes: 8 * 1024 * 1024 * 1024,
         tmdb_key: Some("test-key".into()),
@@ -132,6 +133,9 @@ fn build_state_full(
         yt_cache: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
+        url_cache: Mutex::new(HashMap::new()),
+        hls_jobs: Mutex::new(HashMap::new()),
+        hls_gen: std::sync::atomic::AtomicU64::new(0),
         crop_cache: Mutex::new(HashMap::new()),
         upstream,
         prober,
@@ -186,11 +190,51 @@ fn pick_candidates_orders_and_dedupes() {
 
 #[test]
 fn build_meta_produces_same_host_play_url() {
-    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", &["abc123DEF".to_string()]);
+    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", &["abc123DEF".to_string()], false);
     assert_eq!(
         out["meta"]["links"][0]["trailers"],
         "https://trailers.example.com/play/abc123DEF.mp4"
     );
+}
+
+#[test]
+fn build_meta_stream_remux_points_at_hls_playlist() {
+    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", &["abc123DEF".to_string()], true);
+    assert_eq!(
+        out["meta"]["links"][0]["trailers"],
+        "https://trailers.example.com/hls/abc123DEF/index.m3u8"
+    );
+}
+
+#[test]
+fn parse_get_url_keeps_only_http_lines() {
+    // 2 DASH streams + a stray blank line yt-dlp sometimes emits.
+    let urls = crate::ytdlp::parse_get_url("https://a.googlevideo.com/v\n\nhttps://a.googlevideo.com/a\n");
+    assert_eq!(urls, vec!["https://a.googlevideo.com/v", "https://a.googlevideo.com/a"]);
+    // A single progressive URL.
+    assert_eq!(crate::ytdlp::parse_get_url("http://x/one\n").len(), 1);
+    // No URL at all (an error dump on stdout) → empty.
+    assert!(crate::ytdlp::parse_get_url("ERROR: nope\n").is_empty());
+}
+
+#[test]
+fn hls_segment_name_matcher_is_strict() {
+    assert!(crate::hls::is_segment("seg_000.m4s"));
+    assert!(crate::hls::is_segment("seg_017.m4s"));
+    assert!(!crate::hls::is_segment("seg_0.m4s")); // wrong digit count
+    assert!(!crate::hls::is_segment("seg_abc.m4s")); // non-digit
+    assert!(!crate::hls::is_segment("../etc.m4s")); // traversal
+    assert!(!crate::hls::is_segment("init.mp4"));
+}
+
+#[test]
+fn hls_sentinel_roundtrips_status_reason_message() {
+    let e = crate::hls::parse_sentinel("451\ngeo_blocked\nNot in your region.");
+    assert_eq!(e.status, 451);
+    assert_eq!(e.reason, "geo_blocked");
+    assert_eq!(e.message, "Not in your region.");
+    // Malformed sentinel → safe 502 default.
+    assert_eq!(crate::hls::parse_sentinel("garbage").status, 502);
 }
 
 #[test]

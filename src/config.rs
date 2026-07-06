@@ -21,6 +21,13 @@ pub struct Config {
     /// Bake a `clap` box into the cached MP4 when a letterbox is detected. On by default; set
     /// `CLAP=0` to disable (escape hatch if a trailer ever crops wrong in prod).
     pub bake_clap: bool,
+    /// EXPERIMENTAL: serve trailers as **HLS** (ffmpeg stream-copy remux of the two DASH streams into
+    /// fMP4 segments) so the client plays the first segment while the rest is still muxing — instead of
+    /// the download-whole-file-then-serve `/play` path. Set `STREAM_REMUX=1` to opt in; `/meta` then
+    /// points `trailers` at `/hls/<id>/index.m3u8`. Off = the proven `/play/<id>.mp4` path. den-reel
+    /// still proxies the bytes (googlevideo URLs are IP-locked to this server), so this is a latency
+    /// win, not a bandwidth one. Letterbox is handled client-side (resizeAspectFill), not clap-baked.
+    pub stream_remux: bool,
     pub max_height: String,
     pub cache_max_bytes: u64,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
@@ -96,6 +103,7 @@ impl Config {
             ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
             mp4box: env_opt("MP4BOX_PATH").unwrap_or_else(|| "MP4Box".to_string()),
             bake_clap: env_opt("CLAP").as_deref() != Some("0"),
+            stream_remux: env_opt("STREAM_REMUX").as_deref() == Some("1"),
             max_height,
             cache_max_bytes,
             ytdlp_cache,

@@ -68,15 +68,22 @@ fn is_sane_host(h: &str) -> bool {
 
 /// Build the Fusion `meta` payload — one `links[]` entry per resolved trailer, best-first, so the client
 /// can fall back to the next on a playback failure. Empty ids → no links.
-pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String]) -> Value {
+pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String], stream: bool) -> Value {
     let base = base.trim_end_matches('/');
     let links: Vec<Value> = yt_ids
         .iter()
         .map(|id| {
+            // STREAM_REMUX on → an HLS playlist the client streams (plays segment 0 while the rest
+            // muxes); off → the proven download-then-serve MP4 proxy. Both are best-first candidates.
+            let trailer = if stream {
+                format!("{base}/hls/{id}/index.m3u8")
+            } else {
+                format!("{base}/play/{id}.mp4")
+            };
             json!({
                 "name": "Trailer",
                 "category": "Trailer",
-                "trailers": format!("{base}/play/{id}.mp4"),
+                "trailers": trailer,
                 "provider": "Den Reel",
             })
         })
@@ -170,7 +177,7 @@ pub async fn handle_meta(
     // Only imdb ids reach the upstreams (and our URLs) — reject anything else so a crafted id
     // can't be interpolated into a TMDB/KinoCheck request.
     if !is_imdb(imdb) {
-        return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, &[]), &[]);
+        return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, &[], state.cfg.stream_remux), &[]);
     }
     // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
     // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).
@@ -191,7 +198,7 @@ pub async fn handle_meta(
             (state.prewarm)(state.clone(), primary.clone());
         }
     }
-    let payload = build_meta(ty, imdb, &base, &yt_ids);
+    let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.stream_remux);
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
