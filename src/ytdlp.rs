@@ -25,15 +25,15 @@ pub struct PlayError {
 }
 
 impl PlayError {
-    pub fn spawn(e: std::io::Error) -> PlayError {
+    fn spawn(e: std::io::Error) -> PlayError {
         PlayError {
             status: 502,
             reason: "extraction_failed".into(),
             message: "Could not fetch this trailer.".into(),
-            detail: format!("spawn subprocess: {e}"),
+            detail: format!("spawn yt-dlp: {e}"),
         }
     }
-    pub fn timed_out() -> PlayError {
+    fn timed_out() -> PlayError {
         PlayError {
             status: 504,
             reason: "timeout".into(),
@@ -242,56 +242,6 @@ pub fn parse_landscape(s: &str) -> bool {
     ) {
         (Some(w), Some(h)) => w >= h,
         _ => true,
-    }
-}
-
-/// Keep only the http(s) lines from a `--get-url` dump (yt-dlp may print a stray blank line). One line
-/// = a progressive/muxed format (single input); two = separate DASH video+audio streams (two inputs).
-pub fn parse_get_url(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
-        .map(str::to_string)
-        .collect()
-}
-
-/// EXTRACT-ONLY (no download): resolve the direct googlevideo URL(s) for the selected format, for the
-/// HLS stream-remux path. Returns 1 URL (a progressive/muxed format) or 2 (DASH video+audio) — the
-/// same `-f` selector `/play` downloads, so we get identical quality. These URLs are IP-locked to THIS
-/// server and expire (~6h), so the caller caches them briefly and den-reel (not the device) fetches
-/// them. Classified [`PlayError`] on failure, same taxonomy as `download_to`.
-pub async fn extract_urls(cfg: &Config, vid: &str) -> Result<Vec<String>, PlayError> {
-    let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
-    let mut cmd = Command::new(&cfg.ytdlp);
-    cmd.args([
-        "-q",
-        "--no-playlist",
-        "--no-warnings",
-        "--socket-timeout",
-        "15",
-        "--cache-dir",
-        &cache, // reuse the nsig/player-JS work
-        "-f",
-        &cfg.ytdlp_format,
-        "--get-url",
-        &watch_url(vid),
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
-    apply_extractor_args(&mut cmd, cfg);
-    let out = match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(PlayError::spawn(e)),
-        Err(_) => return Err(PlayError::timed_out()),
-    };
-    let urls = parse_get_url(&String::from_utf8_lossy(&out.stdout));
-    if out.status.success() && !urls.is_empty() {
-        Ok(urls)
-    } else {
-        Err(classify(out.status.code(), &String::from_utf8_lossy(&out.stderr)))
     }
 }
 
