@@ -146,8 +146,15 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
 
     if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
         let _ = tokio::fs::remove_file(&tmp).await;
+        // /health signal (moved here from the old resolve-time probe): a SYSTEMIC extraction failure
+        // (YouTube BotGuard / a broken nsig-JS runtime) bumps the counter; a per-video geo-block/removal
+        // does not. A successful download below clears it. `extractor_unavailable` trips past the threshold.
+        if e.reason == "extraction_failed" {
+            state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err(e);
     }
+    state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed); // extraction worked → clear the signal
 
     // Detect the content rect (cached for /crop) and bake a `clap` box — on the TEMP file, BEFORE
     // publishing. So the file that appears at `fp` is already final and immutable: no request can

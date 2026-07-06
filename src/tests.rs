@@ -263,42 +263,37 @@ async fn resolve_returns_alternates_after_the_primary_for_fallback() {
 }
 
 #[tokio::test]
-async fn resolve_skips_geoblocked_and_falls_back() {
-    use crate::ytdlp::Probe;
+async fn resolve_returns_candidates_in_rank_order_without_probing() {
+    // No resolve-time probe: the TMDB/KinoCheck candidates come back in rank order, unvalidated. A dead /
+    // geo-blocked / portrait pick is the client's problem (it advances to the next), and playability is
+    // validated lazily on /play — so /meta never spawns yt-dlp.
     let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
-    let prober: ProbeFn = Box::new(|id| {
-        Box::pin(async move {
-            if id == "blockedUS01" { Probe::Unplayable } else { Probe::Playable { landscape: true } }
-        })
-    });
-    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("worldwide22"));
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids, vec!["blockedUS01".to_string(), "worldwide22".to_string()]);
 }
 
 #[tokio::test]
-async fn resolve_returns_empty_when_none_playable() {
-    let fake = FakeUpstream::new(&["blockedUS01"], None);
-    let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Unplayable }));
-    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await, Vec::<String>::new());
+async fn resolve_empty_only_when_no_candidates_at_all() {
+    // Empty ONLY when TMDB/KinoCheck carry no trailer (and search finds nothing) — never because a
+    // candidate looked unplayable (that check moved to /play).
+    let fake = FakeUpstream::new(&["someCandidate"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids, vec!["someCandidate".to_string()]);
 }
 
 #[tokio::test]
 async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
-    use crate::ytdlp::Probe;
-    // TMDB + KinoCheck carry no trailer, but the title is known → search YouTube and probe the results.
+    // TMDB + KinoCheck carry no trailer, but the title is known → search YouTube and return the results
+    // (in search order; no probe — the client picks the first that plays + is landscape).
     let fake = FakeUpstream::new(&[], None);
     fake.set_title("Backrooms 2025");
-    let prober: ProbeFn = Box::new(|id| {
-        Box::pin(async move {
-            if id == "searchHit01" { Probe::Playable { landscape: true } } else { Probe::Unplayable }
-        })
-    });
     let searcher: crate::state::SearchFn =
-        Box::new(|_q| Box::pin(async { vec!["searchMiss".into(), "searchHit01".into()] }));
-    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
-    let id = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
-    assert_eq!(id.first().map(String::as_str), Some("searchHit01"));
+        Box::new(|_q| Box::pin(async { vec!["searchOne".into(), "searchTwo".into()] }));
+    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    assert_eq!(ids, vec!["searchOne".to_string(), "searchTwo".to_string()]);
 }
 
 #[tokio::test]
@@ -312,28 +307,9 @@ async fn resolve_no_search_when_title_unknown() {
     assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await, Vec::<String>::new());
 }
 
-#[tokio::test]
-async fn resolve_prefers_landscape_over_a_higher_ranked_portrait() {
-    use crate::ytdlp::Probe;
-    // Top candidate is a playable PORTRAIT trailer; a lower-ranked one is landscape. We should serve
-    // the landscape one (a portrait trailer plays as a tall sliver on the landscape billboard).
-    let fake = FakeUpstream::new(&["portraitTop", "landscape02"], None);
-    let prober: ProbeFn = Box::new(|id| {
-        Box::pin(async move { Probe::Playable { landscape: id != "portraitTop" } })
-    });
-    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("landscape02"));
-}
-
-#[tokio::test]
-async fn resolve_falls_back_to_portrait_when_no_landscape_playable() {
-    use crate::ytdlp::Probe;
-    // Only portrait trailers are playable → serve the highest-ranked one rather than nothing.
-    let fake = FakeUpstream::new(&["portraitTop", "portrait02"], None);
-    let prober: ProbeFn = Box::new(|_id| Box::pin(async { Probe::Playable { landscape: false } }));
-    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("portraitTop"));
-}
+// (Landscape preference moved off the server: den-reel returns candidates in rank order and the CLIENT
+// advances past a portrait/dead pick — so the old `resolve_prefers_landscape` / `falls_back_to_portrait`
+// probe tests are gone. `parse_landscape` is still exercised below since the prober helper retains it.)
 
 #[test]
 fn parse_landscape_reads_dims_and_defaults_safely() {

@@ -84,48 +84,6 @@ pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String]) -> Value 
     json!({ "meta": { "id": imdb, "type": ty, "links": links } })
 }
 
-/// The best trailer yt-dlp can extract here: the highest-ranked **landscape** playable, falling back
-/// to the highest-ranked playable of any orientation only if nothing landscape is playable. Preferring
-/// landscape keeps a portrait trailer (which plays as a tall sliver on the landscape billboard) from
-/// being served when a landscape one exists. The common case (top trailer plays and is landscape)
-/// still costs ONE probe; only a portrait/blocked top pick fans the rest out concurrently.
-async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String {
-    use crate::ytdlp::Probe;
-    if candidates.is_empty() {
-        return String::new();
-    }
-    let p0 = (state.prober)(candidates[0].clone()).await;
-    if matches!(p0, Probe::Playable { landscape: true }) {
-        return candidates[0].clone();
-    }
-    // Top is portrait or unplayable — remember a playable-but-portrait top as the last-resort fallback,
-    // then probe the rest concurrently for a landscape one.
-    let mut fallback = matches!(p0, Probe::Playable { .. }).then_some(0usize);
-    let rest = &candidates[1..];
-    let mut handles: Vec<_> = rest
-        .iter()
-        .map(|c| tokio::spawn((state.prober)(c.clone())))
-        .collect();
-    for i in 0..handles.len() {
-        match (&mut handles[i]).await.unwrap_or(Probe::Unplayable) {
-            // Await in rank order → first landscape hit is the highest-ranked one. Cancel the rest
-            // (their yt-dlp processes die with the task via kill_on_drop).
-            Probe::Playable { landscape: true } => {
-                for h in &handles[i + 1..] {
-                    h.abort();
-                }
-                return rest[i].clone();
-            }
-            // Highest-ranked portrait becomes the fallback if the top wasn't already one.
-            Probe::Playable { landscape: false } => {
-                fallback.get_or_insert(i + 1);
-            }
-            Probe::Unplayable => continue,
-        }
-    }
-    fallback.map(|i| candidates[i].clone()).unwrap_or_default()
-}
-
 /// Resolve (and cache) trailer ytIds for an imdb id, **best-playable first** then the remaining
 /// candidates as unprobed fallbacks (so the client can try the next on a playback failure). Empty =
 /// nothing playable (cached shorter, in case transient). `tmdb_key`/`kinocheck_key` are the effective
@@ -162,56 +120,28 @@ pub async fn resolve_youtube_ids(
         }
     }
     candidates.truncate(MAX_PROBE);
-    // The best-playable pick + the pool it came from (the pool's other members become fallbacks).
-    let mut primary = first_playable(state, &candidates).await;
-    let mut pool = candidates.clone();
-    // Fallback: TMDB/KinoCheck gave no playable trailer (a brand-new title TMDB hasn't linked a video
-    // for, or all its candidates unplayable here) → search YouTube for "<title year> trailer" and probe
-    // those. Only fires on a miss, so the common path is unchanged.
-    if primary.is_empty() {
+    // NO probe: return the TMDB/KinoCheck candidates in rank order. The client plays the first that is
+    // playable AND landscape, advancing past a portrait/dead pick — so yt-dlp stays OFF the /meta critical
+    // path (a resolve is a TMDB call, ~200 ms, not a 2–4 s extraction). Playability + de-letterboxing are
+    // validated lazily on /play (whose download outcome now drives the /health extraction signal).
+    let mut ids = candidates;
+    // Fallback: NO TMDB/KinoCheck candidate at all (a brand-new title TMDB hasn't linked a video for) →
+    // search YouTube for "<title year> trailer". Still no probe — the results are returned as candidates.
+    if ids.is_empty() {
         if let Some(title) = state.upstream.tmdb_title(tmdb_key, imdb, ty).await {
             let query = format!("{title} trailer");
-            let found = (state.searcher)(query.clone()).await;
-            let mut search_cands: Vec<String> = Vec::new();
-            for c in found {
+            for c in (state.searcher)(query.clone()).await {
                 if seen.insert(c.clone()) {
-                    search_cands.push(c);
+                    ids.push(c);
                 }
             }
-            if !search_cands.is_empty() {
-                primary = first_playable(state, &search_cands).await;
-                pool = search_cands;
-                eprintln!(
-                    "trailer {imdb} ({ty}/{lang}): search {query:?} → {} result(s), playable={}",
-                    pool.len(),
-                    !primary.is_empty()
-                );
-            }
+            ids.truncate(MAX_PROBE);
+            eprintln!("trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)", ids.len());
         }
     }
-    // Ordered result: the probed-playable pick first, then its pool's other members as unprobed
-    // fallbacks (no extra probing — the client only tries them if the first fails to play).
-    let ids: Vec<String> = if primary.is_empty() {
-        Vec::new()
-    } else {
-        let mut out = vec![primary.clone()];
-        out.extend(pool.into_iter().filter(|c| *c != primary));
-        out.truncate(MAX_PROBE);
-        out
-    };
-    // Surface the "no trailer" causes so an outage isn't a silent empty (never swallow), and track the
-    // systemic-extraction signal for /health: a resolve that had real candidates but extracted nothing
-    // bumps the counter; any playable result clears it. "No candidates" is a title with no trailer, not
-    // an extraction failure, so it leaves the counter untouched.
+    // A title with no trailer at all is a normal empty (short-cached), not an extraction failure.
     if ids.is_empty() {
-        if candidates.is_empty() {
-            eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing playable");
-        } else {
-            state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) + search, none playable here", candidates.len());
-        }
-    } else {
-        state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing");
     }
     let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {
