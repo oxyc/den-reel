@@ -266,7 +266,7 @@ pub async fn handle_meta(
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
     let extra: &[(&str, &str)] = if has_link {
-        &[("cache-control", "public, max-age=604800")]
+        &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400")]
     } else {
         &[("cache-control", "no-store")]
     };

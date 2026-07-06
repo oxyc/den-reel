@@ -4,7 +4,8 @@
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::{Response, StatusCode};
+use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+use hyper::{Method, Response, StatusCode};
 
 /// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can
 /// fail mid-flight, full-buffer bodies never do).
@@ -13,6 +14,31 @@ pub type Body = BoxBody<Bytes, std::io::Error>;
 /// A fully-buffered body from anything byte-ish.
 pub fn full(data: impl Into<Bytes>) -> Body {
     Full::new(data.into()).map_err(|never| match never {}).boxed()
+}
+
+/// A strong, quoted ETag derived from the response body. A fast non-crypto hash (std
+/// `DefaultHasher`) is plenty — an ETag only needs to change when the bytes change, not resist an
+/// adversary. Length is folded in as a cheap extra guard against hash collisions.
+pub fn etag_of(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("\"{:016x}-{:x}\"", h.finish(), bytes.len())
+}
+
+/// The `Cache-Control` value from a handler's extra-header slice, if any (case-insensitive key).
+fn cache_control_of<'a>(extra: &'a [(&str, &str)]) -> Option<&'a str> {
+    extra
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, v)| *v)
+}
+
+/// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
+/// caching directive that isn't `no-store`. Errors and `no-store` bodies never get an ETag.
+fn cacheable(status: StatusCode, cache_control: Option<&str>) -> bool {
+    status == StatusCode::OK
+        && cache_control.is_some_and(|cc| !cc.is_empty() && !cc.contains("no-store"))
 }
 
 /// `sendJson` equivalent: JSON + permissive CORS + explicit Content-Length, plus any extra headers
@@ -28,13 +54,17 @@ pub fn json(
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
         .header("content-length", s.len());
-    let has_cc = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cache-control"));
+    let cc = cache_control_of(extra);
     for (k, v) in extra {
         b = b.header(*k, *v);
     }
     // Errors must never be cached (a transient 502/503/504 mustn't stick in a client/proxy cache).
-    if !status.is_success() && !has_cc {
+    if !status.is_success() && cc.is_none() {
         b = b.header("cache-control", "no-store");
+    }
+    // Attach a strong validator to cacheable 200s so a conditional GET can collapse to a 304.
+    if cacheable(status, cc) {
+        b = b.header(ETAG, etag_of(&s));
     }
     b.body(full(s)).unwrap()
 }
@@ -45,8 +75,12 @@ pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> R
         .status(status)
         .header("content-type", "text/html; charset=utf-8")
         .header("content-length", body.len());
+    let cc = cache_control_of(extra);
     for (k, v) in extra {
         b = b.header(*k, *v);
+    }
+    if cacheable(status, cc) {
+        b = b.header(ETAG, etag_of(body.as_bytes()));
     }
     b.body(full(body)).unwrap()
 }
@@ -65,6 +99,52 @@ pub fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
         b = b.header("cache-control", "no-store");
     }
     b.body(full(msg)).unwrap()
+}
+
+/// Honor a conditional GET/HEAD: if the request's `If-None-Match` matches the response's `ETag`,
+/// collapse to a `304 Not Modified` that keeps the `ETag` + `Cache-Control` headers and drops the
+/// body. A no-op for unsafe methods, responses without an ETag (errors, `no-store`), or a
+/// non-matching request.
+pub fn apply_conditional(
+    method: &Method,
+    req_headers: &HeaderMap,
+    resp: Response<Body>,
+) -> Response<Body> {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return resp;
+    }
+    let Some(etag) = resp.headers().get(ETAG) else {
+        return resp;
+    };
+    let matched = req_headers
+        .get(IF_NONE_MATCH)
+        .is_some_and(|inm| if_none_match_matches(inm, etag));
+    if !matched {
+        return resp;
+    }
+    let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
+    let headers = b.headers_mut().expect("fresh builder has headers");
+    if let Some(v) = resp.headers().get(ETAG) {
+        headers.insert(ETAG, v.clone());
+    }
+    if let Some(v) = resp.headers().get(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, v.clone());
+    }
+    b.body(full("")).unwrap()
+}
+
+/// RFC 9110 `If-None-Match`: `*` matches anything; otherwise any entry in the comma-separated list
+/// that equals the ETag matches. Our ETags are strong, but we compare with the weak-validator
+/// prefix (`W/`) stripped from both sides so a proxy that weakened it still gets its 304.
+fn if_none_match_matches(inm: &HeaderValue, etag: &HeaderValue) -> bool {
+    let (Ok(inm), Ok(etag)) = (inm.to_str(), etag.to_str()) else {
+        return false;
+    };
+    let etag = etag.trim_start_matches("W/");
+    inm.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/") == etag
+    })
 }
 
 /// Look up a query-string parameter without pulling in a URL parser. Returns the decoded value of

@@ -187,7 +187,7 @@ where
 ///
 /// `Err(())` means the file vanished before we could open it (evicted between fetch and serve) —
 /// the caller retries with a fresh fetch. Every other outcome is a finished `Response`.
-async fn serve_file(range: Option<&str>, fp: &Path) -> Result<Response<Body>, ()> {
+async fn serve_file(range: Option<&str>, fp: &Path, vid: &str) -> Result<Response<Body>, ()> {
     let file = match tokio::fs::File::open(fp).await {
         Ok(f) => f,
         Err(e) => {
@@ -199,6 +199,9 @@ async fn serve_file(range: Option<&str>, fp: &Path) -> Result<Response<Body>, ()
         Ok(m) => m.len(),
         Err(_) => return Ok(httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "stat failed")),
     };
+    // The cached MP4 for a given id is byte-stable + immutable (a new extraction would be a new id),
+    // so it can be cached hard. A strong ETag from id+size lets a caller/proxy revalidate cheaply.
+    let etag = httputil::etag_of(format!("{vid}:{size}").as_bytes());
 
     let resp = match parse_range(range, size) {
         Some(RangeReq::Unsatisfiable) => Response::builder()
@@ -218,6 +221,8 @@ async fn serve_file(range: Option<&str>, fp: &Path) -> Result<Response<Body>, ()
                 .header("accept-ranges", "bytes")
                 .header("content-length", len)
                 .header("content-type", "video/mp4")
+                .header("cache-control", "public, max-age=31536000, immutable")
+                .header("etag", &etag)
                 .body(stream_body(file.take(len)))
                 .unwrap()
         }
@@ -226,6 +231,8 @@ async fn serve_file(range: Option<&str>, fp: &Path) -> Result<Response<Body>, ()
             .header("content-length", size)
             .header("content-type", "video/mp4")
             .header("accept-ranges", "bytes")
+            .header("cache-control", "public, max-age=31536000, immutable")
+            .header("etag", &etag)
             .body(stream_body(file))
             .unwrap(),
     };
@@ -254,7 +261,7 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
     // At most two attempts: if the cached file is evicted between fetch and open, re-fetch once.
     for attempt in 0..2 {
         match fetch_trailer(state.clone(), vid.clone()).await {
-            Ok(fp) => match serve_file(range.as_deref(), &fp).await {
+            Ok(fp) => match serve_file(range.as_deref(), &fp, &vid).await {
                 Ok(resp) => return resp,
                 Err(()) if attempt == 0 => continue, // evicted mid-serve — retry a fresh fetch
                 Err(()) => break,

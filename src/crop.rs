@@ -400,5 +400,7 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
 
 fn json(report: &CropReport) -> Response<Body> {
     let value = to_value(report).unwrap_or_else(|_| serde_json::json!({ "letterboxed": false }));
-    httputil::json(StatusCode::OK, &value, &[])
+    // The detected crop rect is immutable per video (the cached MP4 never changes), so it can be
+    // cached hard + `immutable`; the ETag `json` attaches lets a conditional GET still 304.
+    httputil::json(StatusCode::OK, &value, &[("cache-control", "public, max-age=31536000, immutable")])
 }

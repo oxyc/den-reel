@@ -83,6 +83,13 @@ fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32) -
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
+    let resp = route(state, &parts).await;
+    // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
+    // collapses to a 304 (a no-op for unsafe methods, errors, and `no-store` bodies).
+    httputil::apply_conditional(&parts.method, &parts.headers, resp)
+}
+
+async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
 
@@ -95,7 +102,11 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {
-        return httputil::json(StatusCode::OK, &addon::manifest(), &[]);
+        return httputil::json(
+            StatusCode::OK,
+            &addon::manifest(),
+            &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
+        );
     }
     // The /configure UI seals a BYOK TMDB key into the install URL (den-scout/docs/SEALED-CONFIG.md).
     if path == "/" || path == "/configure" || path == "/configure/" {
