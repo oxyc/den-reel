@@ -74,9 +74,17 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB
         let ytdlp_cache = cache_dir.join("yt-dlp");
+        // The ladder degrades in QUALITY ORDER. It used to fall from the ≤max_height rungs straight to itag
+        // 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
+        // panel even when a perfectly good 720p existed. The intermediate rungs cost nothing when the top
+        // one resolves (yt-dlp stops at the first match) and only matter when it doesn't.
         let ytdlp_format = format!(
             "bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/\
-             b[height<={h}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]",
+             b[height<={h}][vcodec^=avc1][acodec^=mp4a]/\
+             bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/\
+             b[height<=720][vcodec^=avc1][acodec^=mp4a]/\
+             bv*[height<=480][vcodec^=avc1]+ba[acodec^=mp4a]/\
+             b[height<=480][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]",
             h = max_height
         );
         // tv_embedded first (BotGuard/nsig-resistant, clean avc1) with android as fallback for the
