@@ -1,6 +1,6 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
-//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, YTDLP_PLAYER_CLIENTS (playback);
+//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
@@ -8,6 +8,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub struct Config {
     pub port: u16,
@@ -23,6 +24,10 @@ pub struct Config {
     pub bake_clap: bool,
     pub max_height: String,
     pub cache_max_bytes: u64,
+    /// Last-access TTL: a cached trailer not served within this window is evicted regardless of the
+    /// size cap. atime is bumped on every serve, so a rewatched trailer keeps a fresh timestamp and
+    /// survives; only genuinely-stale ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
+    pub cache_ttl: Duration,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,
     /// Legacy server-side discovery keys — a MIGRATION FALLBACK used only when a request carries no
@@ -70,9 +75,17 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
         let max_height = env_opt("MAX_HEIGHT").unwrap_or_else(|| "1080".to_string());
+        // Sized to fit den's ~10 GB container volume with headroom (was 8 GB, which could fill it).
         let cache_max_bytes = env_opt("CACHE_MAX_BYTES")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(8 * 1024 * 1024 * 1024); // 8 GB
+            .unwrap_or(4 * 1024 * 1024 * 1024); // 4 GB
+        // Last-access TTL: evict trailers not served within CACHE_TTL_DAYS (default 14). 0 disables it.
+        let cache_ttl = Duration::from_secs(
+            env_opt("CACHE_TTL_DAYS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(14)
+                * 24 * 60 * 60,
+        );
         let ytdlp_cache = cache_dir.join("yt-dlp");
         // The ladder degrades in QUALITY ORDER. It used to fall from the ≤max_height rungs straight to itag
         // 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
@@ -106,6 +119,7 @@ impl Config {
             bake_clap: env_opt("CLAP").as_deref() != Some("0"),
             max_height,
             cache_max_bytes,
+            cache_ttl,
             ytdlp_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),

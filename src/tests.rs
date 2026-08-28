@@ -83,6 +83,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         bake_clap: true,
         max_height: "1080".into(),
         cache_max_bytes: 8 * 1024 * 1024 * 1024,
+        cache_ttl: std::time::Duration::from_secs(365 * 24 * 60 * 60), // effectively off for the size-cap tests
         tmdb_key: Some("test-key".into()),
         kinocheck_key: None,
         config_key: String::new(),
@@ -798,6 +799,24 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
         dir.join(".bbbbbb.123.0.partial.mp4").exists(),
         "in-progress .partial temp must be skipped by eviction"
     );
+}
+
+#[test]
+fn eviction_ttl_drops_stale_but_keeps_fresh() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    std::fs::write(dir.join("fresh.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("stale.mp4"), vec![0u8; 100]).unwrap();
+    // Age stale.mp4's last-access to 20 days ago (past a 14-day TTL); fresh.mp4 stays at "now".
+    let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
+    let f = std::fs::File::open(dir.join("stale.mp4")).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.cache_ttl = Duration::from_secs(14 * 24 * 60 * 60); // 14-day TTL
+    cfg.cache_max_bytes = u64::MAX; // isolate the TTL: the size cap must not interfere
+    crate::play::evict_if_needed(&cfg);
+    assert!(!dir.join("stale.mp4").exists(), "trailer past the last-access TTL should be evicted");
+    assert!(dir.join("fresh.mp4").exists(), "recently-served trailer must be kept");
 }
 
 #[tokio::test]
