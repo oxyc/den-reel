@@ -220,6 +220,22 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let max_h = cfg.max_height.clone();
 
     let state = AppState::new(cfg);
+
+    // Periodic cache sweep so the last-access TTL is enforced during idle stretches too — eviction
+    // otherwise only runs after a download. Hourly is ample for a day-scale TTL, and interval's first
+    // tick fires immediately so a cache left stale over a long downtime is trimmed on boot.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let cfg = state.cfg.clone();
+                let _ = tokio::task::spawn_blocking(move || crate::play::evict_if_needed(&cfg)).await;
+            }
+        });
+    }
+
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!(
         "den-reel on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",

@@ -69,6 +69,21 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
             .collect(),
         Err(_) => return,
     };
+    // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
+    // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
+    // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
+    if !cfg.cache_ttl.is_zero() {
+        if let Some(cutoff) = SystemTime::now().checked_sub(cfg.cache_ttl) {
+            files.retain(|(p, _size, atime)| {
+                if *atime < cutoff {
+                    let _ = std::fs::remove_file(p);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     if total <= cfg.cache_max_bytes {
         return;
