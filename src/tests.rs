@@ -948,10 +948,12 @@ fn the_format_ladder_never_exceeds_the_configured_cap() {
         );
         assert_eq!(got, expect_rungs, "cap {cap}");
     }
-    // A MAX_HEIGHT that is not a number must cost the setting, not the service. yt-dlp rejects a
+    // A MAX_HEIGHT the ladder cannot use must cost the setting, not the service. yt-dlp rejects a
     // malformed filter while BUILDING the selector, so `height<=abc` in the first rung killed the
     // whole chain — terminal fallback included — and every trailer 502'd until the env was fixed.
-    for bad in ["abc", "-5", "1e3", "1080p", "", "  "] {
+    // "0" and "12" parse but are the opposite failure: no rung can match, so selection falls
+    // through to the uncapped terminal fallback and the cap becomes no cap at all.
+    for bad in ["abc", "-5", "1e3", "1080p", "", "  ", "0", "12"] {
         std::env::set_var("MAX_HEIGHT", bad);
         let cfg = crate::config::Config::from_env();
         std::env::remove_var("MAX_HEIGHT");
@@ -1162,6 +1164,9 @@ fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
         ".aaaaaa.1.0.partial.mp4.part",
         ".aaaaaa.1.0.partial.f137.mp4.part",
         ".aaaaaa.1.0.partial.f140.m4a.part",
+        // MP4Box's own working copy, from `-tmp <cache_dir>`: no dot, no extension. A SIGKILL mid
+        // bake leaves it, and it matched neither cleanup filter.
+        "_libgpac_64884_0x133704950_4587_352815186",
     ];
     for name in abandoned {
         std::fs::write(dir.join(name), vec![0u8; 100]).unwrap();
@@ -1181,6 +1186,16 @@ fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
     }
     assert!(dir.join(".bbbbbb.2.0.partial.mp4.part").exists(), "a live download was deleted under its writer");
     assert!(dir.join("cccccc.mp4").exists(), "the sweep touched a finished trailer");
+
+    // yt-dlp keeps its player-JS cache in a subdirectory here; the sweep must not touch it.
+    let ytdlp_cache = dir.join("yt-dlp");
+    std::fs::create_dir_all(&ytdlp_cache).unwrap();
+    std::fs::write(ytdlp_cache.join("player.json"), b"{}").unwrap();
+    let old_dir = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    let f = std::fs::File::open(&ytdlp_cache).unwrap();
+    let _ = f.set_times(std::fs::FileTimes::new().set_modified(old_dir).set_accessed(old_dir));
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+    assert!(ytdlp_cache.join("player.json").exists(), "the sweep removed yt-dlp's own cache");
 }
 
 #[test]

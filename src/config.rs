@@ -107,7 +107,10 @@ impl Config {
         // `height<=abc` into the selector, and yt-dlp rejects a malformed filter while BUILDING it
         // — so the whole `/`-chain dies, terminal fallback included, and every trailer 502s until
         // the env var is fixed. A typo should cost the setting, not the service.
-        let cap: u32 = max_height.parse().unwrap_or(DEFAULT_MAX_HEIGHT);
+        // A parse alone is not enough: `0` parses, and `height<=0` matches nothing, so every rung
+        // fails through to the uncapped terminal fallback — the cap inverted into no cap at all.
+        // 144 is YouTube's lowest rendition; below it no rung can ever match.
+        let cap: u32 = max_height.parse().ok().filter(|c| *c >= 144).unwrap_or(DEFAULT_MAX_HEIGHT);
         let mut ytdlp_format = rung(&cap.to_string());
         for step in [720u32, 480] {
             if step < cap {

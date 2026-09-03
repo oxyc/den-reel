@@ -62,11 +62,15 @@ pub(crate) fn sweep_partials(cfg: &Config) {
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Any dot-prefixed leftover, not just `.partial.mp4`. While a download runs, yt-dlp writes
-        // `<tmp>.part` and per-format `<tmp>.f<id>.<ext>.part` — matching only the finished name
-        // meant the sweep never saw the files a killed download actually leaves behind. The cache
-        // dir holds nothing else: published trailers are `<vid>.mp4`.
-        if !name.starts_with('.') {
+        // Anything that is not a published trailer is scratch. Naming the shapes one at a time kept
+        // missing one: first only `.partial.mp4` (yt-dlp actually writes `<tmp>.part` and
+        // `<tmp>.f<id>.<ext>.part`), then only dotfiles (MP4Box's `-tmp` file is `_libgpac_…`, no
+        // dot, no extension). A published trailer is `<vid>.mp4` and nothing else is.
+        if is_published_trailer(&name) {
+            continue;
+        }
+        // Directories are not ours to remove — yt-dlp's own cache lives in one here.
+        if !entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
             continue;
         }
         let stale = entry
@@ -79,6 +83,11 @@ pub(crate) fn sweep_partials(cfg: &Config) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// `<vid>.mp4`, the only shape this service publishes.
+fn is_published_trailer(name: &str) -> bool {
+    name.strip_suffix(".mp4").is_some_and(crate::is_valid_vid)
 }
 
 /// Evict least-recently-used cached files until under the size cap (bounded cache). Sync fs, run
