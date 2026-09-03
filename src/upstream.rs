@@ -39,6 +39,11 @@ pub trait Upstream: Send + Sync {
     fn hard_faults(&self) -> u64 {
         0
     }
+    /// Hard faults from the FALLBACK source only. Matters solely when it is the only source
+    /// consulted — a keyless request, where TMDB is never asked at all.
+    fn fallback_faults(&self) -> u64 {
+        0
+    }
 }
 
 /// Rank a TMDB /videos entry: official trailer first, then trailer, teaser, anything else.
@@ -84,11 +89,20 @@ pub struct HttpUpstream {
     fails: AtomicU32,
     /// Never reset, and not restricted to the source /health speaks for. See `hard_faults`.
     faults: AtomicU64,
+    /// The same, for KinoCheck. Normally ignorable — it is a fallback — but it is the ONLY source a
+    /// keyless request consults, and there its outage is a total failure to get an answer.
+    fallback_faults: AtomicU64,
 }
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream { cfg, http, fails: AtomicU32::new(0), faults: AtomicU64::new(0) }
+        HttpUpstream {
+            cfg,
+            http,
+            fails: AtomicU32::new(0),
+            faults: AtomicU64::new(0),
+            fallback_faults: AtomicU64::new(0),
+        }
     }
 
     /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
@@ -107,11 +121,16 @@ impl HttpUpstream {
             Ok(r) => r,
             Err(e) => {
                 // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
-                // (path only; the api_key lives in the query string and is dropped by redact()).
-                eprintln!("upstream request failed: {} ({e})", redact(url));
+                // with the path only. redact() strips the api_key from OUR url, but reqwest's own
+                // Display re-appends the whole thing ("… for url (…?api_key=…)"), so redacting one
+                // side and interpolating the error beside it published the BYOK key on every
+                // outage. without_url() drops reqwest's copy; keep both, or neither works.
+                eprintln!("{}", transport_fault_line(url, e));
                 if self.counts_toward_health(url) {
                     self.faults.fetch_add(1, Ordering::Relaxed);
                     self.fails.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.fallback_faults.fetch_add(1, Ordering::Relaxed);
                 }
                 return None;
             }
@@ -122,8 +141,12 @@ impl HttpUpstream {
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
             eprintln!("upstream {} -> {status}", redact(url));
             // A 404 is a real "this title is not there"; anything else means we did not get an answer.
-            if status != 404 && self.counts_toward_health(url) {
-                self.faults.fetch_add(1, Ordering::Relaxed);
+            if status != 404 {
+                if self.counts_toward_health(url) {
+                    self.faults.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.fallback_faults.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // 401/403 is THIS install's key, not the upstream. The counter is process-wide while
             // keys are per-install, so counting them let one bad key report "TMDB has been failing"
@@ -163,13 +186,31 @@ impl HttpUpstream {
     }
 
     /// Log, count, and return None: we did not get an answer, whatever the status line said.
+    ///
+    /// Moves BOTH counters. A fault that lands after the status line is the same outage as one that
+    /// lands before it — reqwest's timeout spans the body read, so which side of the line a wedged
+    /// upstream falls on is arbitrary — and bumping only the caching counter left /health reporting
+    /// ok indefinitely while every resolve came back empty.
     fn no_answer(&self, url: &str, why: &str) -> Option<Value> {
         eprintln!("upstream {}: {why}", redact(url));
         if self.counts_toward_health(url) {
             self.faults.fetch_add(1, Ordering::Relaxed);
+            self.fails.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.fallback_faults.fetch_add(1, Ordering::Relaxed);
         }
         None
     }
+}
+
+/// The log line for a transport fault, built here so it can be tested for what it must NOT contain.
+///
+/// Both halves have to be redacted. `redact()` strips the api_key from our own URL, but reqwest's
+/// Display re-appends the entire thing ("… for url (…?api_key=…)") whenever the error carries one,
+/// so interpolating the error beside a redacted URL published the BYOK key on every transport fault
+/// — throughout precisely the outage that generates the most log lines.
+pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
+    format!("upstream request failed: {} ({})", redact(url), e.without_url())
 }
 
 /// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
@@ -273,5 +314,8 @@ impl Upstream for HttpUpstream {
     }
     fn hard_faults(&self) -> u64 {
         self.faults.load(Ordering::Relaxed)
+    }
+    fn fallback_faults(&self) -> u64 {
+        self.fallback_faults.load(Ordering::Relaxed)
     }
 }

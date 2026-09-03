@@ -27,6 +27,8 @@ struct FakeInner {
     calls: AtomicUsize,
     faults: AtomicU64,
     fail: std::sync::atomic::AtomicBool,
+    fail_kc: std::sync::atomic::AtomicBool,
+    kc_faults: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -41,6 +43,8 @@ impl FakeUpstream {
             calls: AtomicUsize::new(0),
             faults: AtomicU64::new(0),
             fail: std::sync::atomic::AtomicBool::new(false),
+            fail_kc: std::sync::atomic::AtomicBool::new(false),
+            kc_faults: AtomicU64::new(0),
         }))
     }
     fn set_tmdb(&self, tmdb: &[&str]) {
@@ -58,6 +62,10 @@ impl FakeUpstream {
     fn fail_next(&self) {
         self.0.fail.store(true, Ordering::SeqCst);
     }
+    /// A hard fault on the FALLBACK source, as the real upstream records it.
+    fn fail_fallback(&self) {
+        self.0.fail_kc.store(true, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -71,6 +79,10 @@ impl Upstream for FakeUpstream {
         self.0.tmdb.lock().unwrap().clone()
     }
     async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
+        if self.0.fail_kc.load(Ordering::SeqCst) {
+            self.0.kc_faults.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
         self.0.kc.lock().unwrap().clone()
     }
     async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> Option<String> {
@@ -78,6 +90,9 @@ impl Upstream for FakeUpstream {
     }
     fn hard_faults(&self) -> u64 {
         self.0.faults.load(Ordering::SeqCst)
+    }
+    fn fallback_faults(&self) -> u64 {
+        self.0.kc_faults.load(Ordering::SeqCst)
     }
 }
 
@@ -1514,6 +1529,10 @@ async fn a_failed_search_is_not_cached_as_no_trailer() {
 /// Serve one fixed HTTP response on an ephemeral port, then close. `body` may be shorter than the
 /// declared `content_length`, which is how a truncated response is simulated.
 async fn serve_once(status_line: &str, content_length: usize, body: &'static str) -> String {
+    serve_once_bytes(status_line, content_length, body.as_bytes().to_vec()).await
+}
+
+async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8>) -> String {
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1521,7 +1540,7 @@ async fn serve_once(status_line: &str, content_length: usize, body: &'static str
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
             let _ = sock.shutdown().await;
         }
     });
@@ -1547,4 +1566,115 @@ async fn a_200_that_fails_after_the_status_line_is_not_an_answer() {
             "a {label} body counted as a real 'no trailer' answer"
         );
     }
+}
+
+/// The BYOK TMDB key is a bearer secret the app keeps in the Keychain and never logs. redact()
+/// strips it from our own URL, but reqwest's Display re-appends the whole thing ("… for url
+/// (…?api_key=…)"), so interpolating the error beside a redacted URL published the key on every
+/// transport fault — i.e. throughout exactly the outage that produces the most log lines.
+#[tokio::test]
+async fn a_transport_fault_does_not_log_the_api_key() {
+    let url = "http://127.0.0.1:1/tmdb/3/find/tt0111161?external_source=imdb_id&api_key=SUPERSECRETKEY";
+    let err = reqwest::Client::new().get(url).send().await.expect_err("a closed port must fail");
+
+    let logged = crate::upstream::transport_fault_line(url, err);
+    assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
+    assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+    // It still has to say which upstream failed, or the redaction has eaten the diagnostic.
+    assert!(logged.contains("/3/find/tt0111161"), "the log line lost the path: {logged}");
+}
+
+/// A fault that lands AFTER the status line is the same outage as one that lands before it —
+/// reqwest's timeout spans the body read, so which side a wedged upstream falls on is arbitrary.
+/// Bumping only the caching counter left /health reporting ok while every resolve came back empty.
+#[tokio::test]
+async fn a_200_that_fails_late_also_degrades_health() {
+    let base = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = base;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(up.recent_failures(), 0);
+    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+    assert!(
+        up.recent_failures() > 0,
+        "/health stayed green through an outage that empties every resolve"
+    );
+}
+
+/// A body over the cap is the third late-failure shape, and was the one arm with no test. The body
+/// has to genuinely exceed the cap — a short body under a large content-length trips the truncation
+/// path instead, which is a different arm.
+#[tokio::test]
+async fn an_oversize_body_is_not_an_answer() {
+    let big = 6 * 1024 * 1024; // > MAX_UPSTREAM_BODY (4 MB)
+    let mut body = Vec::with_capacity(big);
+    body.push(b'[');
+    body.resize(big, b' ');
+    let base = serve_once_bytes("HTTP/1.1 200 OK", big, body).await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = base;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    let before = up.hard_faults();
+    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+    assert!(up.hard_faults() > before, "an oversize body counted as a real 'no trailer' answer");
+}
+
+/// With no TMDB key, KinoCheck is the only source consulted — so its outage is a total failure to
+/// get an answer, not the ignorable fallback blip it is for a keyed install.
+#[tokio::test]
+async fn a_keyless_lookup_treats_a_fallback_outage_as_no_answer() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    let before = up.fallback_faults();
+    up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
+    assert!(
+        up.fallback_faults() > before,
+        "a keyless install's only source failed and nothing recorded it"
+    );
+    // ...and it still must not move the TMDB-facing signals.
+    assert_eq!(up.recent_failures(), 0, "a fallback outage degraded /health");
+    assert_eq!(up.hard_faults(), 0, "a fallback outage disabled the negative cache for keyed installs");
+}
+
+/// A keyless install consults ONLY KinoCheck, so its outage there is a total failure to get an
+/// answer — it must take the short cooldown, not pin "no trailer" for an hour on the one path where
+/// no other signal (health, the TMDB fault counter, the log line) can see it.
+#[tokio::test]
+async fn a_keyless_lookup_does_not_pin_a_fallback_outage_for_an_hour() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_fallback();
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+
+    // Past the cooldown but far short of a real negative: the outage must be re-asked.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(
+        fake.calls() > after,
+        "a keyless install pinned its only source's outage as 'no trailer' for a full hour"
+    );
+}
+
+/// ...while for a KEYED install a KinoCheck outage stays ignorable: TMDB answered, so the negative
+/// is real and must keep its full TTL rather than being re-asked every minute.
+#[tokio::test]
+async fn a_keyed_lookup_still_ignores_a_fallback_outage() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_fallback();
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert_eq!(fake.calls(), after, "a fallback outage shortened a real answer's TTL");
 }

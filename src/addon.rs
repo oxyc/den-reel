@@ -121,6 +121,7 @@ pub async fn resolve_youtube_ids(
         }
     }
     let faults_before = state.upstream.hard_faults();
+    let fallback_faults_before = state.upstream.fallback_faults();
     // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
     // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
     let (tmdb, kc) = tokio::join!(
@@ -166,8 +167,10 @@ pub async fn resolve_youtube_ids(
     if ids.is_empty() {
         // Two different failures, and the log used to call both the second one: if `tmdb_title`
         // returned None no search ever ran, which means TMDB does not know this id at all.
+        // Three outcomes, not two: TMDB knows nothing of the id (no search ran), the search ran and
+        // found nothing, or the search could not run at all.
         if search_failed {
-            eprintln!("trailer {imdb} ({ty}/{lang}): search could not run (see above)");
+            eprintln!("trailer {imdb} ({ty}/{lang}): the search could not run (see above)");
         } else {
             eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
         }
@@ -186,7 +189,14 @@ pub async fn resolve_youtube_ids(
     // process-wide, so an unrelated title's fault can land in this window and cost a good answer
     // its full TTL; that errs toward re-asking, which is why the cooldown has to be cheap.
     let asked_and_got_an_answer =
-        !search_failed && state.upstream.hard_faults() == faults_before;
+        !search_failed
+            && state.upstream.hard_faults() == faults_before
+            // With no TMDB key, TMDB is never asked and KinoCheck is the ONLY source — so its
+            // outage, normally ignorable, is here a total failure to get an answer. Counting only
+            // TMDB meant a keyless install pinned a KinoCheck blip as "no trailer" for an hour, on
+            // the one path where no other signal can see it.
+            && (!tmdb_key.is_empty()
+                || state.upstream.fallback_faults() == fallback_faults_before);
     let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
         (false, _) => YT_TTL_MS,
         (true, true) => YT_NEG_TTL_MS,
