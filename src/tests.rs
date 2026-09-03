@@ -1580,8 +1580,13 @@ async fn a_transport_fault_does_not_log_the_api_key() {
     let logged = crate::upstream::transport_fault_line(url, err);
     assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
     assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
-    // It still has to say which upstream failed, or the redaction has eaten the diagnostic.
+    // It still has to say which upstream failed AND why, or the redaction has eaten the diagnostic:
+    // Display alone renders connection-refused, DNS failure and TLS failure byte-identically.
     assert!(logged.contains("/3/find/tt0111161"), "the log line lost the path: {logged}");
+    assert!(
+        logged.to_lowercase().contains("connection refused"),
+        "the log line carries no cause — every transport failure renders alike: {logged}"
+    );
 }
 
 /// A fault that lands AFTER the status line is the same outage as one that lands before it —
@@ -1602,23 +1607,27 @@ async fn a_200_that_fails_late_also_degrades_health() {
     );
 }
 
-/// A body over the cap is the third late-failure shape, and was the one arm with no test. The body
-/// has to genuinely exceed the cap — a short body under a large content-length trips the truncation
-/// path instead, which is a different arm.
+/// A body over the cap is the third late-failure shape. The body must stay VALID JSON past the cap:
+/// an invalid one falls into the not-JSON arm, which bumps the same counter, so the test passed
+/// with the cap removed entirely — pinning nothing, while claiming to pin the one guard against
+/// buffering a runaway upstream.
 #[tokio::test]
 async fn an_oversize_body_is_not_an_answer() {
-    let big = 6 * 1024 * 1024; // > MAX_UPSTREAM_BODY (4 MB)
-    let mut body = Vec::with_capacity(big);
+    let mut body = Vec::with_capacity(6 * 1024 * 1024);
     body.push(b'[');
-    body.resize(big, b' ');
-    let base = serve_once_bytes("HTTP/1.1 200 OK", big, body).await;
+    while body.len() < 6 * 1024 * 1024 {
+        body.extend_from_slice(b"0,");
+    }
+    body.extend_from_slice(b"0]");
+    let len = body.len();
+    let base = serve_once_bytes("HTTP/1.1 200 OK", len, body).await;
     let mut cfg = test_cfg(temp_dir());
     cfg.tmdb_base = base;
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
     let before = up.hard_faults();
     up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
-    assert!(up.hard_faults() > before, "an oversize body counted as a real 'no trailer' answer");
+    assert!(up.hard_faults() > before, "an oversize body was buffered and accepted as an answer");
 }
 
 /// With no TMDB key, KinoCheck is the only source consulted — so its outage is a total failure to
@@ -1677,4 +1686,59 @@ async fn a_keyed_lookup_still_ignores_a_fallback_outage() {
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
     assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
     assert_eq!(fake.calls(), after, "a fallback outage shortened a real answer's TTL");
+}
+
+/// Every way a source can fail to answer must move its counter — the bad-status path and the
+/// post-200 body paths as well as the transport one. Only the transport writer was pinned, and the
+/// two unpinned ones are exactly what fires when KinoCheck 5xx's or truncates: the decisive signal
+/// for a keyless install, where it is the only source consulted.
+#[tokio::test]
+async fn every_no_answer_shape_moves_its_counter() {
+    // (status line, content-length, body, is_tmdb)
+    let cases: [(&str, usize, &'static str); 3] = [
+        ("HTTP/1.1 503 Service Unavailable", 2, "{}"), // bad status
+        ("HTTP/1.1 200 OK", 500, "{\"re"),             // truncated body
+        ("HTTP/1.1 200 OK", 5, "hello"),               // not JSON
+    ];
+    for (status_line, len, body) in cases {
+        // The fallback source...
+        let base = serve_once(status_line, len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
+        assert!(
+            up.fallback_faults() > 0,
+            "{status_line:?} on the fallback source recorded nothing; a keyless install would cache it as an answer"
+        );
+        assert_eq!(up.hard_faults(), 0, "a fallback fault reached the TMDB counter");
+
+        // ...and the primary.
+        let base = serve_once(status_line, len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+        assert!(up.hard_faults() > 0, "{status_line:?} on TMDB recorded nothing");
+        assert_eq!(up.fallback_faults(), 0, "a TMDB fault reached the fallback counter");
+    }
+}
+
+/// A wrong key means THIS request got no answer, so it must count — otherwise the empty result is
+/// cached as a real "no trailer" for an hour, under a key that excludes the credential, and one
+/// install's typo blanks the title for every install. That is the bug the counter exists for, and
+/// it is easy to "tidy away" by mirroring the health counter, which excludes 401/403 for a
+/// different and correct reason.
+#[tokio::test]
+async fn a_wrong_key_counts_as_no_answer_even_though_health_ignores_it() {
+    for status_line in ["HTTP/1.1 401 Unauthorized", "HTTP/1.1 403 Forbidden"] {
+        let base = serve_once(status_line, 2, "{}").await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        up.tmdb_candidates("wrong-key", "tt0111161", "movie", "en").await;
+        assert!(up.hard_faults() > 0, "{status_line:?} was cached as a real 'no trailer'");
+        assert_eq!(up.recent_failures(), 0, "{status_line:?} marked the upstream itself down");
+    }
 }

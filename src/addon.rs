@@ -167,8 +167,6 @@ pub async fn resolve_youtube_ids(
     if ids.is_empty() {
         // Two different failures, and the log used to call both the second one: if `tmdb_title`
         // returned None no search ever ran, which means TMDB does not know this id at all.
-        // Three outcomes, not two: TMDB knows nothing of the id (no search ran), the search ran and
-        // found nothing, or the search could not run at all.
         if search_failed {
             eprintln!("trailer {imdb} ({ty}/{lang}): the search could not run (see above)");
         } else {

@@ -141,6 +141,12 @@ impl HttpUpstream {
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
             eprintln!("upstream {} -> {status}", redact(url));
             // A 404 is a real "this title is not there"; anything else means we did not get an answer.
+            // 401/403 IS counted here, unlike in `fails` below: a wrong key means this request got
+            // no answer, and caching that as "no trailer" for an hour is the bug this counter
+            // exists to prevent. The cost is that both counters are process-wide while keys are
+            // per-install, so one install's bad key can shorten another's cache entry to the 60s
+            // cooldown. Wrong in the safe direction — a re-ask, never a wrong answer — and bounded
+            // by that cooldown; fixing it properly means a per-call signal, not more gating here.
             if status != 404 {
                 if self.counts_toward_health(url) {
                     self.faults.fetch_add(1, Ordering::Relaxed);
@@ -210,7 +216,19 @@ impl HttpUpstream {
 /// so interpolating the error beside a redacted URL published the BYOK key on every transport fault
 /// — throughout precisely the outage that generates the most log lines.
 pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
-    format!("upstream request failed: {} ({})", redact(url), e.without_url())
+    // Display alone is bare "error sending request" for connection-refused, DNS failure, TLS
+    // failure and connect-timeout alike, and reqwest never prints the source — so the line named
+    // the request and not one thing about why it failed. Debug does carry the chain, but it also
+    // re-includes the url (and with it the key), so walk source() instead: those are hyper/std
+    // errors that never carry the url.
+    let e = e.without_url();
+    let mut why = e.to_string();
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(c) = cause {
+        why.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    format!("upstream request failed: {} ({why})", redact(url))
 }
 
 /// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
