@@ -2236,3 +2236,29 @@ fn scratch_filling_the_cap_does_not_wipe_the_cache() {
     assert!(dir.join("aaaaaaaaaa1.mp4").exists(), "a trailer was evicted to make room for scratch");
     assert!(dir.join("bbbbbbbbbb2.mp4").exists(), "the cache was wiped by unevictable scratch");
 }
+
+/// The process-group registry has real kill power, so a pgid left in it after the process died
+/// would make shutdown SIGKILL whatever the OS reused that number for. A no-op'd `unregister_group`
+/// is invisible to every other test, and that is exactly the dangerous mutation.
+///
+/// Asserted per-id rather than on the registry's size: it is process-wide, so a concurrent test's
+/// subprocesses are in it too, and `kill_live_groups()` here would kill them.
+#[test]
+fn a_finished_download_leaves_nothing_in_the_kill_registry() {
+    // A pgid no real process can hold, so nothing is signalled whatever happens.
+    let fake_pgid = u32::MAX - 7;
+    assert!(!crate::ytdlp::is_group_live(fake_pgid));
+
+    crate::ytdlp::register_group(Some(fake_pgid));
+    assert!(crate::ytdlp::is_group_live(fake_pgid), "a live download was not registered");
+
+    crate::ytdlp::unregister_group(Some(fake_pgid));
+    assert!(
+        !crate::ytdlp::is_group_live(fake_pgid),
+        "a finished download stayed in the registry; shutdown would signal a reused pgid"
+    );
+
+    // pgid 0 is "the caller's own group" — registering it would make shutdown kill den-reel itself.
+    crate::ytdlp::register_group(Some(0));
+    assert!(!crate::ytdlp::is_group_live(0), "pgid 0 was registered; shutdown would kill our own group");
+}

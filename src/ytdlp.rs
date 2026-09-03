@@ -347,20 +347,43 @@ impl Drop for GroupGuard {
 static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
 
-fn register_group(pgid: Option<u32>) {
+pub(crate) fn register_group(pgid: Option<u32>) {
     if let Some(p) = pgid.filter(|&p| p != 0) {
         let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(Default::default).insert(p);
     }
 }
 
-fn unregister_group(pgid: Option<u32>) {
+pub(crate) fn unregister_group(pgid: Option<u32>) {
     if let Some(p) = pgid.filter(|&p| p != 0) {
         let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(set) = g.as_mut() {
             set.remove(&p);
         }
     }
+}
+
+/// Run `cmd` in its own process group, registered as live for the duration, so shutdown can kill
+/// the whole tree. `Command::output()` owns the child, so `kill_on_drop` covers a timeout or a
+/// cancelled task — but not the process exiting out from under it, which is what shutdown is.
+pub(crate) async fn output_in_group(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    let pgid = child.id();
+    register_group(pgid);
+    let out = child.wait_with_output().await;
+    kill_group(pgid); // whatever it forked
+    unregister_group(pgid);
+    out
+}
+
+/// Is this group still registered as live? Tests only — the registry is process-wide, so asserting
+/// on its size races other tests' subprocesses; asking about one id does not.
+#[cfg(test)]
+pub(crate) fn is_group_live(pgid: u32) -> bool {
+    let g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|set| set.contains(&pgid))
 }
 
 /// SIGKILL every download still running. Returns how many groups it signalled.

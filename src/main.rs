@@ -295,11 +295,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
                 }
             },
             // A redeploy (`podman auto-update`) sends SIGTERM. Without handling it the process is
-            // killed outright: every in-flight yt-dlp keeps running in its own process group, and
-            // the partial files it was writing sit on the cache volume — invisible to the size cap
-            // and unreclaimable until the sweep's 30-minute grace, under a pid that no longer
-            // exists. Stopping the accept loop drops the runtime, which fires each download's
-            // kill-on-drop and process-group kill, and then we remove what this pid was writing.
+            // killed outright: every in-flight subprocess keeps running in its own process group,
+            // and the partial files it was writing sit on the cache volume — invisible to the size
+            // cap and unreclaimable until the sweep's 30-minute grace, under a pid that no longer
+            // exists. See the shutdown block below for what stopping the loop actually does.
             _ = &mut shutdown => {
                 eprintln!("shutting down: stopping accepts, killing in-flight downloads");
                 break;

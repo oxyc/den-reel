@@ -304,10 +304,15 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
     .stderr(Stdio::piped())
     .kill_on_drop(true);
     // Backstop timeout: on elapse the output future (owning the child) is dropped → kill_on_drop.
-    let out = tokio::time::timeout(Duration::from_secs(DETECT_TIMEOUT_SECS), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
+    // In its own process group and registered live, so a SIGTERM kills it too. Without that it was
+    // orphaned on shutdown — and this timeout lives in den-reel's timer, so an orphan has none.
+    let out = tokio::time::timeout(
+        Duration::from_secs(DETECT_TIMEOUT_SECS),
+        crate::ytdlp::output_in_group(&mut cmd),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     let boxes = parse_all_crops(&stderr);
     let src = parse_source_dims(&stderr);
@@ -358,7 +363,14 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     // output(), not status(): a piped stderr nobody reads can wedge the child on a full pipe.
-    match tokio::time::timeout(Duration::from_secs(BAKE_TIMEOUT_SECS), cmd.output()).await {
+    // Grouped and registered for the same reason as detect: a bake orphaned by a redeploy keeps
+    // rewriting the trailer with no timeout behind it.
+    match tokio::time::timeout(
+        Duration::from_secs(BAKE_TIMEOUT_SECS),
+        crate::ytdlp::output_in_group(&mut cmd),
+    )
+    .await
+    {
         Ok(Ok(o)) if o.status.success() => true,
         Ok(Ok(o)) => {
             eprintln!(
