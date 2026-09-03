@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::state::{default_clock, AppState, PrewarmFn, ProbeFn};
+use crate::upstream::NoAnswer;
 use crate::upstream::{pick_trailer_candidates, Upstream};
 use crate::ytdlp::classify;
 
@@ -25,11 +26,9 @@ struct FakeInner {
     kc: Mutex<Option<String>>,
     title: Mutex<Option<String>>,
     calls: AtomicUsize,
-    faults: AtomicU64,
     fail: std::sync::atomic::AtomicBool,
     fail_kc: std::sync::atomic::AtomicBool,
-    kc_faults: AtomicU64,
-    fault_only: std::sync::atomic::AtomicBool,
+    fail_title: std::sync::atomic::AtomicBool,
     /// Holds a lookup inside `tmdb_candidates` until the test releases it, so a second resolve can
     /// run to completion in between. The live-entry branch is only reachable that way.
     gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -45,11 +44,9 @@ impl FakeUpstream {
             kc: Mutex::new(kc.map(|s| s.to_string())),
             title: Mutex::new(None),
             calls: AtomicUsize::new(0),
-            faults: AtomicU64::new(0),
             fail: std::sync::atomic::AtomicBool::new(false),
             fail_kc: std::sync::atomic::AtomicBool::new(false),
-            kc_faults: AtomicU64::new(0),
-            fault_only: std::sync::atomic::AtomicBool::new(false),
+            fail_title: std::sync::atomic::AtomicBool::new(false),
             gate: Mutex::new(None),
         }))
     }
@@ -75,11 +72,10 @@ impl FakeUpstream {
         *self.0.gate.lock().unwrap() = Some(sem.clone());
         sem
     }
-    /// A fault that lands during the call WITHOUT emptying the result — an unrelated resolve
-    /// faulting inside our window, which is the steady state: the counter is process-wide and a
-    /// /meta row resolves many titles at once.
-    fn fault_but_still_answer(&self) {
-        self.0.fault_only.store(true, Ordering::SeqCst);
+    /// The title lookup could not be made. It gates the search fallback, so its failure means no
+    /// search ran and the empty result is not an answer.
+    fn fail_title(&self) {
+        self.0.fail_title.store(true, Ordering::SeqCst);
     }
     /// A hard fault on the FALLBACK source, as the real upstream records it.
     fn fail_fallback(&self) {
@@ -89,7 +85,7 @@ impl FakeUpstream {
 
 #[async_trait]
 impl Upstream for FakeUpstream {
-    async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> Vec<String> {
+    async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> crate::upstream::Answered<Vec<String>> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
         // Claim this call's outcome BEFORE parking, or the resolve that runs while we are parked
         // consumes the flag that was armed for us.
@@ -99,29 +95,21 @@ impl Upstream for FakeUpstream {
             let _ = sem.acquire().await;
         }
         if failed {
-            self.0.faults.fetch_add(1, Ordering::SeqCst);
-            return Vec::new();
+            return Err(crate::upstream::NoAnswer);
         }
-        if self.0.fault_only.swap(false, Ordering::SeqCst) {
-            self.0.faults.fetch_add(1, Ordering::SeqCst);
-        }
-        self.0.tmdb.lock().unwrap().clone()
+        Ok(self.0.tmdb.lock().unwrap().clone())
     }
-    async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
+    async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> crate::upstream::Answered<Option<String>> {
         if self.0.fail_kc.load(Ordering::SeqCst) {
-            self.0.kc_faults.fetch_add(1, Ordering::SeqCst);
-            return None;
+            return Err(crate::upstream::NoAnswer);
         }
-        self.0.kc.lock().unwrap().clone()
+        Ok(self.0.kc.lock().unwrap().clone())
     }
-    async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> Option<String> {
-        self.0.title.lock().unwrap().clone()
-    }
-    fn hard_faults(&self) -> u64 {
-        self.0.faults.load(Ordering::SeqCst)
-    }
-    fn fallback_faults(&self) -> u64 {
-        self.0.kc_faults.load(Ordering::SeqCst)
+    async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> crate::upstream::Answered<Option<String>> {
+        if self.0.fail_title.load(Ordering::SeqCst) {
+            return Err(crate::upstream::NoAnswer);
+        }
+        Ok(self.0.title.lock().unwrap().clone())
     }
 }
 
@@ -1357,16 +1345,11 @@ async fn only_the_primary_source_moves_the_fault_counter() {
     cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
-    let before = up.hard_faults();
-    up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
-    assert_eq!(
-        up.hard_faults(),
-        before,
-        "a dead fallback counted as 'no answer', which disables the negative cache service-wide"
-    );
-
-    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
-    assert!(up.hard_faults() > before, "a dead TMDB did not register as 'no answer'");
+    // Both report NoAnswer for themselves — the caller decides which one matters, per request.
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await, Err(NoAnswer));
+    // ...and neither marks the UPSTREAM down, which is a separate question from this call's outcome.
+    assert_eq!(up.recent_failures(), 1, "only the primary source speaks for /health");
 }
 
 /// A keyless lookup asks a narrower question — only KinoCheck runs — so its answer lives under its
@@ -1605,10 +1588,9 @@ async fn a_200_that_fails_after_the_status_line_is_not_an_answer() {
         cfg.tmdb_base = base;
         let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
-        let before = up.hard_faults();
-        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
-        assert!(
-            up.hard_faults() > before,
+        assert_eq!(
+            up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
             "a {label} body counted as a real 'no trailer' answer"
         );
     }
@@ -1659,7 +1641,7 @@ async fn a_200_that_fails_late_also_degrades_health() {
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
     assert_eq!(up.recent_failures(), 0);
-    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+    assert_eq!(up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await, Err(NoAnswer));
     assert!(
         up.recent_failures() > 0,
         "/health stayed green through an outage that empties every resolve"
@@ -1684,9 +1666,11 @@ async fn an_oversize_body_is_not_an_answer() {
     cfg.tmdb_base = base;
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
-    let before = up.hard_faults();
-    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
-    assert!(up.hard_faults() > before, "an oversize body was buffered and accepted as an answer");
+    assert_eq!(
+        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+        Err(NoAnswer),
+        "an oversize body was buffered and accepted as an answer"
+    );
 }
 
 /// With no TMDB key, KinoCheck is the only source consulted — so its outage is a total failure to
@@ -1697,15 +1681,13 @@ async fn a_keyless_lookup_treats_a_fallback_outage_as_no_answer() {
     cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
     let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
-    let before = up.fallback_faults();
-    up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
-    assert!(
-        up.fallback_faults() > before,
+    assert_eq!(
+        up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await,
+        Err(NoAnswer),
         "a keyless install's only source failed and nothing recorded it"
     );
-    // ...and it still must not move the TMDB-facing signals.
+    // ...and it still must not move the TMDB-facing signal.
     assert_eq!(up.recent_failures(), 0, "a fallback outage degraded /health");
-    assert_eq!(up.hard_faults(), 0, "a fallback outage disabled the negative cache for keyed installs");
 }
 
 /// A keyless install consults ONLY KinoCheck, so its outage there is a total failure to get an
@@ -1765,21 +1747,22 @@ async fn every_no_answer_shape_moves_its_counter() {
         let mut cfg = test_cfg(temp_dir());
         cfg.kinocheck_base = base;
         let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
-        up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
-        assert!(
-            up.fallback_faults() > 0,
-            "{status_line:?} on the fallback source recorded nothing; a keyless install would cache it as an answer"
+        assert_eq!(
+            up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} on the fallback source read as an answer; a keyless install would cache it"
         );
-        assert_eq!(up.hard_faults(), 0, "a fallback fault reached the TMDB counter");
 
         // ...and the primary.
         let base = serve_once(status_line, len, body).await;
         let mut cfg = test_cfg(temp_dir());
         cfg.tmdb_base = base;
         let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
-        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
-        assert!(up.hard_faults() > 0, "{status_line:?} on TMDB recorded nothing");
-        assert_eq!(up.fallback_faults(), 0, "a TMDB fault reached the fallback counter");
+        assert_eq!(
+            up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} on TMDB read as an answer"
+        );
     }
 }
 
@@ -1796,8 +1779,11 @@ async fn a_wrong_key_counts_as_no_answer_even_though_health_ignores_it() {
         cfg.tmdb_base = base;
         let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
 
-        up.tmdb_candidates("wrong-key", "tt0111161", "movie", "en").await;
-        assert!(up.hard_faults() > 0, "{status_line:?} was cached as a real 'no trailer'");
+        assert_eq!(
+            up.tmdb_candidates("wrong-key", "tt0111161", "movie", "en").await,
+            Err(NoAnswer),
+            "{status_line:?} was read as a real 'no trailer'"
+        );
         assert_eq!(up.recent_failures(), 0, "{status_line:?} marked the upstream itself down");
     }
 }
@@ -1872,39 +1858,31 @@ async fn a_body_fault_says_which_kind_it_was() {
     assert_ne!(a, b, "a truncated body and a stalled one log the same line: {a}");
 }
 
-/// A fresh, non-empty answer must win over a cached one. The fault counter is process-wide, so an
-/// unrelated resolve faulting inside this call's window says nothing about this lookup — and
-/// substituting there served a superseded trailer id while holding the current one, which /meta
-/// then ships with a 7-day max-age.
+/// One title's outage must not touch another's. The old signal was a process-wide counter sampled
+/// across the join, so a fault raised while resolving ANY title read as this title's lookup having
+/// failed — and Den resolves a whole row at once, so overlapping resolves are the steady state.
 #[tokio::test]
-async fn a_fresh_answer_beats_a_stale_one_even_when_something_else_faulted() {
-    let fake = FakeUpstream::new(&["oldTrailer11"], None);
+async fn one_titles_outage_does_not_touch_another_title() {
+    let fake = FakeUpstream::new(&[], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
+    fake.fail_next();
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en").await.is_empty());
+
+    // A different title, resolved successfully right after, must be cached at the FULL TTL.
+    fake.set_tmdb(&["goodTrailer1"]);
     assert_eq!(
         crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
-        vec!["oldTrailer11".to_string()]
+        vec!["goodTrailer1".to_string()]
     );
-    clock.advance(crate::YT_TTL_MS + 1);
-
-    // The trailer is replaced upstream, and some OTHER resolve faults while we are asking.
-    fake.set_tmdb(&["newTrailer22"]);
-    fake.fault_but_still_answer();
-    assert_eq!(
-        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
-        vec!["newTrailer22".to_string()],
-        "a fresh answer was discarded for a stale cached one"
-    );
-
-    // ...and it was cached at the full TTL, not the failure cooldown.
     let after = fake.calls();
-    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
         crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
-        vec!["newTrailer22".to_string()]
+        vec!["goodTrailer1".to_string()]
     );
-    assert_eq!(fake.calls(), after, "a good answer was cached at the failure cooldown");
+    assert_eq!(fake.calls(), after, "another title's outage downgraded this title's entry");
 }
 
 /// Serving the last-known-good must still rate-limit the outage. Returning early skipped the
@@ -2047,4 +2025,23 @@ async fn the_cache_sweep_drops_only_expired_entries() {
         Some(vec!["keepMe00001".to_string()]),
         "the sweep dropped a live entry"
     );
+}
+
+/// The title lookup gates the search fallback: if IT could not be made, no search ran, so the empty
+/// result is "we could not ask", not "this title has no trailer". Treating it as an answer pinned
+/// the title empty for a full hour on the path that exists for titles TMDB has no video for.
+#[tokio::test]
+async fn a_failed_title_lookup_is_not_an_answer() {
+    let fake = FakeUpstream::new(&[], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    fake.fail_title();
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+
+    // Past the failure cooldown but well short of a negative TTL: it must be re-asked.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert!(fake.calls() > after, "a failed title lookup was cached as 'this title has no trailer'");
 }

@@ -120,14 +120,18 @@ pub async fn resolve_youtube_ids(
             }
         }
     }
-    let faults_before = state.upstream.hard_faults();
-    let fallback_faults_before = state.upstream.fallback_faults();
     // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
     // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
     let (tmdb, kc) = tokio::join!(
         state.upstream.tmdb_candidates(tmdb_key, imdb, ty, lang),
         state.upstream.kinocheck_youtube_id(kinocheck_key, imdb, ty, lang),
     );
+    // Whether we got an ANSWER, per call. With a key TMDB decides — KinoCheck is a fallback whose
+    // outage means only that we lost the fallback. Without one TMDB is never consulted, so
+    // KinoCheck is the sole source and its outage is a total failure to get an answer.
+    let sources_answered = if tmdb_key.is_empty() { kc.is_ok() } else { tmdb.is_ok() };
+    let tmdb = tmdb.unwrap_or_default();
+    let kc = kc.unwrap_or_default();
     let mut seen = HashSet::new();
     let mut candidates: Vec<String> = Vec::new();
     for c in tmdb.into_iter().chain(kc) {
@@ -145,7 +149,11 @@ pub async fn resolve_youtube_ids(
     // Fallback: NO TMDB/KinoCheck candidate at all (a brand-new title TMDB hasn't linked a video for) →
     // search YouTube for "<title year> trailer". Still no probe — the results are returned as candidates.
     if ids.is_empty() {
-        if let Some(title) = state.upstream.tmdb_title(tmdb_key, imdb, ty).await {
+        let title = state.upstream.tmdb_title(tmdb_key, imdb, ty).await;
+        // The title lookup is the gate on the search: if IT could not be asked, no search ran, and
+        // the empty result below is not an answer either.
+        search_failed = title.is_err();
+        if let Ok(Some(title)) = title {
             let query = format!("{title} trailer");
             match (state.searcher)(query.clone()).await {
                 Some(found) => {
@@ -181,20 +189,15 @@ pub async fn resolve_youtube_ids(
     // to a real miss. A keyless request is not a failure but a narrower question — cached under its
     // own key, so it neither blanks keyed installs nor re-asks on every browse.
     //
+    // Every source that was consulted actually answered. This used to be a process-wide counter
+    // sampled before and after the join, which could not tell WHICH lookup faulted: an unrelated
+    // title's outage landing in the window was read as this title's answer, and one install's bad
+    // key marked every concurrent resolve failed. The signal travels with the call now.
+    //
     // A short cooldown rather than no entry at all: skipping the cache entirely meant a persistent
-    // upstream fault turned every browse of a trailer-less title into two TMDB calls plus a yt-dlp
-    // search, with nothing to rate-limit it — trading a stale answer for a stampede. The counter is
-    // process-wide, so an unrelated title's fault can land in this window and cost a good answer
-    // its full TTL; that errs toward re-asking, which is why the cooldown has to be cheap.
-    let asked_and_got_an_answer =
-        !search_failed
-            && state.upstream.hard_faults() == faults_before
-            // With no TMDB key, TMDB is never asked and KinoCheck is the ONLY source — so its
-            // outage, normally ignorable, is here a total failure to get an answer. Counting only
-            // TMDB meant a keyless install pinned a KinoCheck blip as "no trailer" for an hour, on
-            // the one path where no other signal can see it.
-            && (!tmdb_key.is_empty()
-                || state.upstream.fallback_faults() == fallback_faults_before);
+    // fault turned every browse of a trailer-less title into two TMDB calls plus a yt-dlp search,
+    // with nothing to rate-limit it — trading a stale answer for a stampede.
+    let asked_and_got_an_answer = sources_answered && !search_failed;
     let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
         (false, _) => YT_TTL_MS,
         (true, true) => YT_NEG_TTL_MS,
