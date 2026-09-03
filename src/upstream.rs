@@ -98,8 +98,12 @@ impl HttpUpstream {
         if !status.is_success() {
             // Surface the faults that mean "misconfigured / throttled / upstream down" — but not 404
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
-            if status == 401 || status == 403 || status == 429 || status.is_server_error() {
-                eprintln!("upstream {} -> {status}", redact(url));
+            eprintln!("upstream {} -> {status}", redact(url));
+            // 401/403 is THIS install's key, not the upstream. The counter is process-wide while
+            // keys are per-install, so counting them let one bad key report "TMDB has been failing"
+            // for everyone — and, the other way round, a healthy install's traffic cleared the
+            // counter so a persistently broken one never showed up at all.
+            if status == 429 || status.is_server_error() {
                 self.fails.fetch_add(1, Ordering::Relaxed);
             }
             return None;

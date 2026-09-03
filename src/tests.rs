@@ -801,6 +801,71 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     );
 }
 
+/// The search fallback is the third source of YouTube ids, after TMDB and KinoCheck, and they all
+/// become filenames. It was the one left ungated when the other two were fixed.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_ids_are_gated_like_every_other_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let fake = dir.join("fake-ytdlp");
+    // yt-dlp prints one id per line; these are what a hostile or broken source could emit.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '../../../../tmp/evil\\n/etc/passwd\\nhas/slash\\nsh\\ndQw4w9WgXcQ\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    assert_eq!(
+        crate::ytdlp::search(&cfg, "anything", 5).await,
+        vec!["dQw4w9WgXcQ".to_string()],
+        "an id that is not a YouTube id must not reach a filename"
+    );
+}
+
+/// `/health`'s upstream counter is process-wide, but TMDB keys are per-install. A 401 means THIS
+/// install's key is wrong — counting it let one bad key report "TMDB has been failing" for
+/// everyone, and let a healthy install's traffic clear a broken one's failures so they never
+/// surfaced. Only faults that are actually about the upstream count.
+#[tokio::test]
+async fn a_bad_install_key_does_not_mark_the_upstream_down() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn server(status: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = "{}";
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    let fails_after = |status: &'static str| async move {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = server(status).await;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        let _ = up.tmdb_candidates("bad-key", "tt0111161", "movie", "en").await;
+        crate::upstream::Upstream::recent_failures(&up)
+    };
+
+    assert_eq!(fails_after("401 Unauthorized").await, 0, "one install's bad key marked TMDB down");
+    assert_eq!(fails_after("403 Forbidden").await, 0, "one install's bad key marked TMDB down");
+    assert!(fails_after("503 Service Unavailable").await > 0, "a real upstream fault must count");
+    assert!(fails_after("429 Too Many Requests").await > 0, "throttling must count");
+}
+
 /// The scheme in the play URL comes from a client-supplied header. Reflected unchecked it produced
 /// `javascript://host/...` — the same spoofing the Host filter beside it was written to stop.
 #[tokio::test]
@@ -900,17 +965,31 @@ fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
     let dir = temp_dir();
     // Dot-prefixed so eviction skips them — which is why nothing counted them toward the cap and
     // nothing ever removed them. A crash or redeploy mid-download left one on disk forever.
-    std::fs::write(dir.join(".aaaaaa.1.0.partial.mp4"), vec![0u8; 100]).unwrap();
-    std::fs::write(dir.join(".bbbbbb.2.0.partial.mp4"), vec![0u8; 100]).unwrap();
+    // The names yt-dlp actually leaves behind mid-download, not just the finished temp name:
+    // `<tmp>.part` while fetching, and a per-format `.f<id>.<ext>.part` for each stream it merges.
+    let abandoned = [
+        ".aaaaaa.1.0.partial.mp4",
+        ".aaaaaa.1.0.partial.mp4.part",
+        ".aaaaaa.1.0.partial.f137.mp4.part",
+        ".aaaaaa.1.0.partial.f140.m4a.part",
+    ];
+    for name in abandoned {
+        std::fs::write(dir.join(name), vec![0u8; 100]).unwrap();
+    }
+    std::fs::write(dir.join(".bbbbbb.2.0.partial.mp4.part"), vec![0u8; 100]).unwrap();
     std::fs::write(dir.join("cccccc.mp4"), vec![0u8; 100]).unwrap();
     // Older than any download can still be running: the download timeout is 240s.
     let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
-    let f = std::fs::File::open(dir.join(".aaaaaa.1.0.partial.mp4")).unwrap();
-    f.set_times(std::fs::FileTimes::new().set_modified(old).set_accessed(old)).unwrap();
+    for name in abandoned {
+        let f = std::fs::File::open(dir.join(name)).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old).set_accessed(old)).unwrap();
+    }
 
     crate::play::sweep_partials(&test_cfg(dir.clone()));
-    assert!(!dir.join(".aaaaaa.1.0.partial.mp4").exists(), "an abandoned partial was left on disk");
-    assert!(dir.join(".bbbbbb.2.0.partial.mp4").exists(), "a live download was deleted under its writer");
+    for name in abandoned {
+        assert!(!dir.join(name).exists(), "{name} was left on disk");
+    }
+    assert!(dir.join(".bbbbbb.2.0.partial.mp4.part").exists(), "a live download was deleted under its writer");
     assert!(dir.join("cccccc.mp4").exists(), "the sweep touched a finished trailer");
 }
 

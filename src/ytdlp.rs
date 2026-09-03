@@ -209,7 +209,9 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Vec<String> {
         Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
+            // Same gate the TMDB and KinoCheck candidates get: this is the third source of ids and
+            // they all end up as filenames.
+            .filter(|l| crate::is_valid_vid(l))
             .collect(),
         Ok(Ok(o)) => {
             eprintln!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
