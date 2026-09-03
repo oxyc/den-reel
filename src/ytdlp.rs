@@ -251,6 +251,9 @@ pub fn parse_landscape(s: &str) -> bool {
 pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), PlayError> {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
+    // Shared so the guard below can reap the group even when the future is dropped mid-flight.
+    let group = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let group_for_work = group.clone();
     let work = async {
         let mut cmd = Command::new(&cfg.ytdlp);
         cmd.args([
@@ -278,9 +281,15 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true); // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
+        // Its own process group, so a timeout can reap the whole tree. yt-dlp forks ffmpeg to do
+        // the merge, and kill_on_drop signals only the direct child — the ffmpeg survived, kept
+        // writing, and could recreate the temp file we had just deleted.
+        .process_group(0)
+        .kill_on_drop(true);
         apply_extractor_args(&mut cmd, cfg); // same player-client override the probe validated with
         let mut child = cmd.spawn().map_err(PlayError::spawn)?;
+        let pgid = child.id();
+        group_for_work.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
 
         // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
@@ -291,6 +300,7 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         });
         let status = child.wait().await.map_err(PlayError::spawn)?;
         let stderr = drain.await.unwrap_or_default();
+        kill_group(pgid);
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
         if status.success() && wrote {
@@ -299,9 +309,32 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
             Err(classify(status.code(), &stderr))
         }
     };
-    // On timeout the work future (owning `child`) is dropped → kill_on_drop reaps yt-dlp/ffmpeg.
-    match tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), work).await {
+    // Dropping the future kills yt-dlp; `guard` kills whatever it forked.
+    let guard = GroupGuard(group.clone());
+    let out = tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), work).await;
+    drop(guard);
+    match out {
         Ok(r) => r,
         Err(_) => Err(PlayError::timed_out()),
     }
 }
+
+/// Kills the download's process group on the way out, however the future ended.
+struct GroupGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn kill_group(pgid: Option<u32>) {
+    if let Some(pgid) = pgid {
+        // Negative pid = the whole group. Already-exited is ESRCH, which we don't care about.
+        unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_group(_pgid: Option<u32>) {}

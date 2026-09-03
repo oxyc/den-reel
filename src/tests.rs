@@ -801,6 +801,101 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     );
 }
 
+/// yt-dlp forks ffmpeg to do the merge, so killing the direct child left the grandchild running —
+/// and it kept writing to the temp path we had just deleted. The download runs in its own process
+/// group so the whole tree can be reaped; this pins that the group kill reaches a grandchild.
+#[cfg(unix)]
+#[tokio::test]
+async fn killing_the_group_reaches_a_grandchild() {
+    use std::os::unix::process::CommandExt;
+    let dir = temp_dir();
+    let marker = dir.join("grandchild-alive");
+    // A parent that forks a long-lived child, exactly like yt-dlp spawning ffmpeg.
+    let script = dir.join("parent.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nsh -c 'sleep 30; : > {}' &\nsleep 30\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755)).unwrap();
+
+    let mut cmd = std::process::Command::new(&script);
+    cmd.process_group(0);
+    let mut child = cmd.spawn().unwrap();
+    let pgid = child.id();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    crate::ytdlp::kill_group(Some(pgid));
+    let _ = child.wait();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Still alive? Then it is holding CPU and will finish writing to a path nobody supervises.
+    let alive = std::process::Command::new("pgrep")
+        .args(["-g", &pgid.to_string()])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    assert!(!alive, "a grandchild outlived the group kill");
+}
+
+/// Ids from TMDB/KinoCheck become a cache filename and a yt-dlp `-o` path, and `/meta` prewarms on
+/// them with no client involvement — so a traversal in upstream data wrote outside the cache dir.
+/// The inbound imdb id was already checked for exactly this reason; this is the other direction.
+#[test]
+fn a_traversing_id_from_upstream_is_not_a_candidate() {
+    use serde_json::json;
+    let results = vec![
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "../../../../tmp/evil"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "/etc/cron.d/evil"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "has/slash"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "sh"}),
+        json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "dQw4w9WgXcQ"}),
+    ];
+    assert_eq!(
+        crate::upstream::pick_trailer_candidates(&results),
+        vec!["dQw4w9WgXcQ".to_string()],
+        "an id that is not a YouTube id must not reach a filename"
+    );
+}
+
+/// And the sink refuses it too, so a future caller cannot reintroduce the same hole.
+#[tokio::test]
+async fn fetch_trailer_refuses_an_id_that_is_not_a_youtube_id() {
+    let dir = temp_dir();
+    let state = build_state(
+        dir.clone(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let err = crate::play::fetch_trailer(state, "../../../../tmp/evil".into())
+        .await
+        .expect_err("a traversing id must be refused");
+    assert_eq!(err.status, 400);
+    let escaped = dir.join("../../../../tmp/evil.mp4");
+    assert!(!escaped.exists(), "a file was written outside the cache dir");
+}
+
+#[test]
+fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    // Dot-prefixed so eviction skips them — which is why nothing counted them toward the cap and
+    // nothing ever removed them. A crash or redeploy mid-download left one on disk forever.
+    std::fs::write(dir.join(".aaaaaa.1.0.partial.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join(".bbbbbb.2.0.partial.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("cccccc.mp4"), vec![0u8; 100]).unwrap();
+    // Older than any download can still be running: the download timeout is 240s.
+    let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    let f = std::fs::File::open(dir.join(".aaaaaa.1.0.partial.mp4")).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_modified(old).set_accessed(old)).unwrap();
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+    assert!(!dir.join(".aaaaaa.1.0.partial.mp4").exists(), "an abandoned partial was left on disk");
+    assert!(dir.join(".bbbbbb.2.0.partial.mp4").exists(), "a live download was deleted under its writer");
+    assert!(dir.join("cccccc.mp4").exists(), "the sweep touched a finished trailer");
+}
+
 #[test]
 fn eviction_ttl_drops_stale_but_keeps_fresh() {
     use std::time::{Duration, SystemTime};

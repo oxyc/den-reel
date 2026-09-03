@@ -231,7 +231,11 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             loop {
                 tick.tick().await;
                 let cfg = state.cfg.clone();
-                let _ = tokio::task::spawn_blocking(move || crate::play::evict_if_needed(&cfg)).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::play::sweep_partials(&cfg);
+                    crate::play::evict_if_needed(&cfg);
+                })
+                .await;
             }
         });
     }

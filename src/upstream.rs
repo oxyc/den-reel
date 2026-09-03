@@ -48,7 +48,10 @@ fn rank(v: &Value) -> u8 {
 pub fn pick_trailer_candidates(results: &[Value]) -> Vec<String> {
     let mut yt: Vec<&Value> = results
         .iter()
-        .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(|k| !k.is_empty()))
+        // An id from upstream is untrusted: it ends up as a cache filename and a yt-dlp -o path,
+        // so `../../tmp/evil` would write outside the cache dir. The inbound imdb id is already
+        // checked for the same reason; this is the other direction.
+        .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(crate::is_valid_vid))
         .collect();
     yt.sort_by_key(|v| rank(v)); // stable → preserves TMDB order within a rank, like JS's sort
     let mut seen = std::collections::HashSet::new();
@@ -208,7 +211,10 @@ impl Upstream for HttpUpstream {
             headers.push(("X-Api-Host", "api.kinocheck.com"));
         }
         let data = self.get_json(&url, &headers).await?;
-        data["trailer"]["youtube_video_id"].as_str().map(|s| s.to_string())
+        data["trailer"]["youtube_video_id"]
+            .as_str()
+            .filter(|id| crate::is_valid_vid(id))
+            .map(|s| s.to_string())
     }
 
     fn recent_failures(&self) -> u32 {

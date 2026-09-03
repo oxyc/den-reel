@@ -47,3 +47,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# killpg: kill_on_drop reaps only the direct child, and yt-dlp forks ffmpeg to do the merge.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

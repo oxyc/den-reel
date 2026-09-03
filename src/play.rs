@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use futures_util::{FutureExt, TryStreamExt};
 use hyper::body::Frame;
@@ -49,9 +49,37 @@ fn touch_atime(fp: PathBuf) {
     });
 }
 
+/// A partial older than this cannot still be downloading: the download timeout is 240s.
+const PARTIAL_GRACE: Duration = Duration::from_secs(30 * 60);
+
+/// Reclaim partials nothing is writing any more.
+///
+/// They are dot-prefixed to keep eviction from deleting a live download, which also kept them out
+/// of the size cap — so a crash, an OOM kill or a redeploy mid-download left a file that nothing
+/// counted and nothing ever removed, on a persistent volume.
+pub(crate) fn sweep_partials(cfg: &Config) {
+    let Ok(rd) = std::fs::read_dir(&cfg.cache_dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with('.') || !name.ends_with(".partial.mp4") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|md| md.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > PARTIAL_GRACE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Evict least-recently-used cached files until under the size cap (bounded cache). Sync fs, run
 /// off the runtime thread via spawn_blocking. Skips dotfiles so an in-progress `.<vid>.…partial.mp4`
-/// is neither counted nor deleted out from under its writer.
+/// is neither counted nor deleted out from under its writer; `sweep_partials` reclaims stale ones.
 pub(crate) fn evict_if_needed(cfg: &Config) {
     let mut files: Vec<(PathBuf, u64, SystemTime)> = match std::fs::read_dir(&cfg.cache_dir) {
         Ok(rd) => rd
@@ -102,6 +130,16 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
 pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
+    // Checked here as well as at the routes, because `vid` also arrives from TMDB/KinoCheck via
+    // prewarm, and it becomes a filename and a yt-dlp -o path. One `..` writes outside the cache.
+    if !crate::is_valid_vid(&vid) {
+        return Err(PlayError {
+            status: 400,
+            reason: "bad_id".into(),
+            message: "Not a YouTube id.".into(),
+            detail: format!("rejected vid {vid:?}"),
+        });
+    }
     let fp = cache_path(&state.cfg, &vid);
     if let Ok(md) = tokio::fs::metadata(&fp).await {
         if md.len() > 0 {
