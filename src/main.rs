@@ -47,6 +47,13 @@ pub const SEARCH_MAX: usize = 4; // YouTube-search fallback: how many results to
 pub const PREWARM_MAX: usize = 2;
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
+// A lookup that FAILED, rather than one that answered "nothing": long enough to stop a browse from
+// stampeding a sick upstream, short enough that a recovery is visible in about a minute.
+pub const YT_FAIL_TTL_MS: u64 = 60 * 1000;
+const _: () = assert!(
+    YT_FAIL_TTL_MS < YT_NEG_TTL_MS,
+    "a failure must be re-asked sooner than a real 'no trailer'"
+);
 pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
 pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the same way
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)

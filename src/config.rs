@@ -141,9 +141,11 @@ impl Config {
             mp4box: env_opt("MP4BOX_PATH").unwrap_or_else(|| "MP4Box".to_string()),
             // The documented escape hatch for a mis-cropped trailer, so it has to answer to more than
             // the one spelling: `CLAP=false` silently leaving baking ON is the worst time to be strict.
+            // Read through `env` rather than `env_opt`, which maps an empty value to None: someone
+            // writing `-e CLAP=` is reaching for the off switch and must not get baking left on.
             bake_clap: !matches!(
-                env_opt("CLAP").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-                Some("0" | "false" | "off" | "no" | "")
+                env::var("CLAP").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Ok("0" | "false" | "off" | "no" | "")
             ),
             max_height: cap.to_string(), // normalised: a bad value falls back, never propagates
             cache_max_bytes,

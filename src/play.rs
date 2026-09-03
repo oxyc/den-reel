@@ -85,12 +85,19 @@ pub(crate) fn sweep_partials(cfg: &Config) {
     }
 }
 
-/// Remove `tmp` and every scratch file yt-dlp derived from it (`<tmp>.part`, and a
-/// `<tmp>.f<id>.<ext>.part` per merged stream). Unlinking only `tmp` left the rest dot-prefixed on
-/// disk, where the size cap does not count them and cannot evict them — so a run of failing
-/// downloads pushed real usage past the cap until the hourly sweep's 30-min grace expired.
+/// Remove `tmp` and every scratch file yt-dlp derived from it. Unlinking only `tmp` left the rest
+/// on disk, where the size cap neither counts nor evicts them, so a run of failing downloads pushed
+/// real usage past the cap until the hourly sweep's 30-min grace expired.
+///
+/// Matched on the name WITHOUT the extension, because yt-dlp puts `.f<id>` on either side of it:
+/// `prepend_extension` inserts before the extension when the stream's ext matches the output's and
+/// appends otherwise. The ladder forces avc1+mp4a, so video is always `.mp4` (inserted:
+/// `<stem>.f137.mp4`) and audio always `.m4a` (appended: `<stem>.mp4.f140`). Matching the full
+/// filename therefore reclaimed the small audio partial and left the large video one — the leak
+/// this exists to close. `<stem>` is unique per download (pid + generation), so it cannot reach
+/// another in-flight temp.
 pub(crate) async fn remove_temp_set(cfg: &Config, tmp: &std::path::Path) {
-    let Some(stem) = tmp.file_name().and_then(|n| n.to_str()).map(String::from) else { return };
+    let Some(stem) = tmp.file_stem().and_then(|n| n.to_str()).map(String::from) else { return };
     let _ = tokio::fs::remove_file(tmp).await;
     let Ok(mut rd) = tokio::fs::read_dir(&cfg.cache_dir).await else { return };
     while let Ok(Some(entry)) = rd.next_entry().await {
@@ -247,7 +254,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     }
 
     tokio::fs::rename(&tmp, &fp).await.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp); // don't leak the temp on a rename failure
+        let _ = std::fs::remove_file(&tmp); // by here yt-dlp has merged and cleaned its own siblings
         PlayError {
             status: 502,
             reason: "extraction_failed".into(),

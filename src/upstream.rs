@@ -31,8 +31,11 @@ pub trait Upstream: Send + Sync {
     }
     /// Monotonic count of hard faults, for callers that must tell "the lookup failed" from "the
     /// lookup found nothing". Compare it across a call: if it moved, the empty result is not an
-    /// answer. Unlike `recent_failures` this never resets and counts BOTH upstreams — a caching
-    /// decision must not depend on which source broke, or on a later success clearing the signal.
+    /// answer. Like `recent_failures` this speaks only for TMDB — KinoCheck is a fallback, and
+    /// letting its outage mean "we got no answer" made every resolve refuse to cache, which turned
+    /// one dead fallback into unbounded repeat lookups. Unlike `recent_failures` it never resets
+    /// (a later success must not erase what this call saw) and it counts 401/403, which are not a
+    /// health signal but do mean this request got no answer.
     fn hard_faults(&self) -> u64 {
         0
     }
@@ -106,8 +109,8 @@ impl HttpUpstream {
                 // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
                 // (path only; the api_key lives in the query string and is dropped by redact()).
                 eprintln!("upstream request failed: {} ({e})", redact(url));
-                self.faults.fetch_add(1, Ordering::Relaxed);
                 if self.counts_toward_health(url) {
+                    self.faults.fetch_add(1, Ordering::Relaxed);
                     self.fails.fetch_add(1, Ordering::Relaxed);
                 }
                 return None;
@@ -119,7 +122,7 @@ impl HttpUpstream {
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
             eprintln!("upstream {} -> {status}", redact(url));
             // A 404 is a real "this title is not there"; anything else means we did not get an answer.
-            if status != 404 {
+            if status != 404 && self.counts_toward_health(url) {
                 self.faults.fetch_add(1, Ordering::Relaxed);
             }
             // 401/403 is THIS install's key, not the upstream. The counter is process-wide while

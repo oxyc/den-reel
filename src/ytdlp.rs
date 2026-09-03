@@ -189,7 +189,10 @@ async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
 /// YouTube-search fallback: `yt-dlp "ytsearchN:<query>"` → up to `n` video ids (flat, no per-video
 /// extraction, no download). Used when TMDB/KinoCheck carry no trailer for a title; the ids are then
 /// probed like any other candidate. Empty on any error (logged, never swallowed).
-pub async fn search(cfg: &Config, query: &str, n: usize) -> Vec<String> {
+/// `None` means the search could not be run (spawn error, non-zero exit, timeout) — distinct from
+/// `Some(vec![])`, "YouTube has nothing". The caller negative-caches an empty answer, so collapsing
+/// the two pinned "this title has no trailer" for an hour every time yt-dlp was broken.
+pub async fn search(cfg: &Config, query: &str, n: usize) -> Option<Vec<String>> {
     let mut cmd = Command::new(&cfg.ytdlp);
     cmd.args([
         "-q",
@@ -212,18 +215,19 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Vec<String> {
             // Same gate the TMDB and KinoCheck candidates get: this is the third source of ids and
             // they all end up as filenames.
             .filter(|l| crate::is_valid_vid(l))
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         Ok(Ok(o)) => {
             eprintln!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
-            Vec::new()
+            None
         }
         Ok(Err(e)) => {
             eprintln!("search {query:?}: yt-dlp spawn error — {e}");
-            Vec::new()
+            None
         }
         Err(_) => {
             eprintln!("search {query:?}: timed out after {PROBE_TIMEOUT_SECS}s");
-            Vec::new()
+            None
         }
     }
 }

@@ -21,7 +21,7 @@ use crate::ytdlp::{self, PlayError};
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send + Sync>;
 /// YouTube-search fallback: query → candidate video ids. Injectable so tests stay hermetic.
-pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Vec<String>> + Send + Sync>;
+pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Option<Vec<String>>> + Send + Sync>;
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).

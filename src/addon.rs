@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::httputil::{self, query_param, Body};
 use crate::state::{AppState, YtEntry};
-use crate::{MAX_PROBE, YT_CACHE_MAX, YT_NEG_TTL_MS, YT_TTL_MS};
+use crate::{MAX_PROBE, YT_CACHE_MAX, YT_FAIL_TTL_MS, YT_NEG_TTL_MS, YT_TTL_MS};
 
 pub fn manifest() -> Value {
     json!({
@@ -130,18 +130,26 @@ pub async fn resolve_youtube_ids(
     // path (a resolve is a TMDB call, ~200 ms, not a 2–4 s extraction). Playability + de-letterboxing are
     // validated lazily on /play (whose download outcome now drives the /health extraction signal).
     let mut ids = candidates;
+    let mut search_failed = false;
     // Fallback: NO TMDB/KinoCheck candidate at all (a brand-new title TMDB hasn't linked a video for) →
     // search YouTube for "<title year> trailer". Still no probe — the results are returned as candidates.
     if ids.is_empty() {
         if let Some(title) = state.upstream.tmdb_title(tmdb_key, imdb, ty).await {
             let query = format!("{title} trailer");
-            for c in (state.searcher)(query.clone()).await {
-                if seen.insert(c.clone()) {
-                    ids.push(c);
+            match (state.searcher)(query.clone()).await {
+                Some(found) => {
+                    for c in found {
+                        if seen.insert(c.clone()) {
+                            ids.push(c);
+                        }
+                    }
+                    ids.truncate(MAX_PROBE);
+                    eprintln!("trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)", ids.len());
                 }
+                // The third source has the same two-failures-one-value problem as the other two: a
+                // broken yt-dlp returned the same empty list as "YouTube has nothing".
+                None => search_failed = true,
             }
-            ids.truncate(MAX_PROBE);
-            eprintln!("trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)", ids.len());
         }
     }
     // A title with no trailer at all is a normal empty (short-cached), not an extraction failure.
@@ -156,12 +164,19 @@ pub async fn resolve_youtube_ids(
     // deliberately excludes the credential. So one install with a typo'd key, or a single TMDB
     // blip, blanked trailers for every install, with /health still green and a log line identical
     // to a real miss. A keyless request is the same hole from the other side: nothing was asked.
+    //
+    // A short cooldown rather than no entry at all: skipping the cache entirely meant a persistent
+    // upstream fault turned every browse of a trailer-less title into two TMDB calls plus a yt-dlp
+    // search, with nothing to rate-limit it — trading a stale answer for a stampede. The counter is
+    // process-wide, so an unrelated title's fault can land in this window and cost a good answer
+    // its full TTL; that errs toward re-asking, which is why the cooldown has to be cheap.
     let asked_and_got_an_answer =
-        !tmdb_key.is_empty() && state.upstream.hard_faults() == faults_before;
-    if ids.is_empty() && !asked_and_got_an_answer {
-        return ids;
-    }
-    let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
+        !tmdb_key.is_empty() && !search_failed && state.upstream.hard_faults() == faults_before;
+    let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
+        (false, _) => YT_TTL_MS,
+        (true, true) => YT_NEG_TTL_MS,
+        (true, false) => YT_FAIL_TTL_MS,
+    };
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Bound growth: when the map gets large, sweep expired entries before inserting so a

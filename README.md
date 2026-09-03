@@ -130,7 +130,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
 | `PORT` | `8092` | |
-| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume |
+| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: anything in it that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
 | `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |
@@ -143,7 +143,8 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 ## Maintenance
 
 `/health` always returns 200 (liveness) with a JSON `status`: `ok`, or `degraded` with a `reason` —
-`tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB/KinoCheck failing), or
+`tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
+fallback and its outage is deliberately invisible here), or
 `extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
 YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` or tune `YTDLP_PLAYER_CLIENTS`).
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep

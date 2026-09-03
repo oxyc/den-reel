@@ -81,6 +81,19 @@ impl Upstream for FakeUpstream {
     }
 }
 
+/// A clock the test drives, so a TTL can be asserted by advancing time rather than sleeping.
+#[derive(Clone, Default)]
+struct TestClock(Arc<AtomicU64>);
+impl TestClock {
+    fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+    fn as_fn(&self) -> crate::state::ClockFn {
+        let c = self.0.clone();
+        Box::new(move || c.load(Ordering::SeqCst))
+    }
+}
+
 static TMP_CNT: AtomicUsize = AtomicUsize::new(0);
 fn temp_dir() -> PathBuf {
     let n = TMP_CNT.fetch_add(1, Ordering::SeqCst);
@@ -122,7 +135,7 @@ fn noop_prewarm() -> PrewarmFn {
 
 /// The search fallback never fires in most tests (mock `tmdb_title` is None); a no-op keeps them hermetic.
 fn noop_searcher() -> crate::state::SearchFn {
-    Box::new(|_q| Box::pin(async { Vec::<String>::new() }))
+    Box::new(|_q| Box::pin(async { Some(Vec::<String>::new()) }))
 }
 
 fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
@@ -161,6 +174,13 @@ fn build_state_full(
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
     })
+}
+
+fn build_state_clock(cache_dir: PathBuf, upstream: Box<dyn Upstream>, clock: crate::state::ClockFn) -> Arc<AppState> {
+    let state = build_state(cache_dir, upstream, always_playable(), noop_prewarm());
+    let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+    state.clock = clock;
+    Arc::new(state)
 }
 
 /// Start the real router on an ephemeral port; returns the base URL.
@@ -309,7 +329,7 @@ async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
     let fake = FakeUpstream::new(&[], None);
     fake.set_title("Backrooms 2025");
     let searcher: crate::state::SearchFn =
-        Box::new(|_q| Box::pin(async { vec!["searchOne".into(), "searchTwo".into()] }));
+        Box::new(|_q| Box::pin(async { Some(vec!["searchOne".into(), "searchTwo".into()]) }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
     let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
     assert_eq!(ids, vec!["searchOne".to_string(), "searchTwo".to_string()]);
@@ -321,7 +341,7 @@ async fn resolve_no_search_when_title_unknown() {
     let fake = FakeUpstream::new(&[], None); // title left None
     let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }));
     let searcher: crate::state::SearchFn =
-        Box::new(|_q| Box::pin(async { vec!["shouldNotBeUsed".into()] }));
+        Box::new(|_q| Box::pin(async { Some(vec!["shouldNotBeUsed".into()]) }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
     assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await, Vec::<String>::new());
 }
@@ -1013,7 +1033,7 @@ async fn search_ids_are_gated_like_every_other_source() {
     cfg.ytdlp = fake.to_string_lossy().into_owned();
     assert_eq!(
         crate::ytdlp::search(&cfg, "anything", 5).await,
-        vec!["dQw4w9WgXcQ".to_string()],
+        Some(vec!["dQw4w9WgXcQ".to_string()]),
         "an id that is not a YouTube id must not reach a filename"
     );
 }
@@ -1250,18 +1270,27 @@ async fn play_unsatisfiable_range_is_416() {
 
 /// A failed lookup and a title with no trailer both arrive as an empty Vec, and the negative cache
 /// pinned either for an hour under a key that excludes the credential — so one install's 401, or one
-/// TMDB blip, blanked that title for every install while /health stayed green.
+/// TMDB blip, blanked that title for every install while /health stayed green. A failure now gets a
+/// short cooldown instead: long enough not to stampede a sick upstream, short enough that a recovery
+/// shows up in about a minute rather than an hour.
 #[tokio::test]
-async fn a_failed_lookup_is_not_cached_as_no_trailer() {
+async fn a_failed_lookup_cools_down_instead_of_caching_no_trailer() {
     let fake = FakeUpstream::new(&[], None);
-    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_next();
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
-    assert!(ids.is_empty(), "the failure still yields no ids");
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
 
-    // The upstream recovers. Nothing should have been remembered from the failure.
+    // Within the cooldown the failure is not re-asked — that is what bounds the stampede.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS / 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert_eq!(fake.calls(), after, "a failed lookup is not rate-limited at all");
+
+    // Past it — and long before a real negative would have expired — the recovery is visible.
     fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_FAIL_TTL_MS);
     let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
     assert_eq!(
         ids.first().map(String::as_str),
@@ -1270,16 +1299,44 @@ async fn a_failed_lookup_is_not_cached_as_no_trailer() {
     );
 }
 
+/// A KinoCheck fault must NOT move the fault counter: it is a fallback, and treating its outage as
+/// "we got no answer" made every resolve refuse to cache — turning one dead fallback into unbounded
+/// repeat lookups, which then fed the very 429s that kept it dead.
+///
+/// Exercised against the real HttpUpstream, because the thing under test is which URLs count, and a
+/// fake upstream cannot get that wrong. Both bases point at a closed port, so each call is a
+/// transport error with no server needed.
+#[tokio::test]
+async fn only_the_primary_source_moves_the_fault_counter() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = "http://127.0.0.1:1/tmdb".to_string();
+    cfg.kinocheck_base = "http://127.0.0.1:1/kinocheck".to_string();
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    let before = up.hard_faults();
+    up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        up.hard_faults(),
+        before,
+        "a dead fallback counted as 'no answer', which disables the negative cache service-wide"
+    );
+
+    up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+    assert!(up.hard_faults() > before, "a dead TMDB did not register as 'no answer'");
+}
+
 /// The keyless case is the same hole from the other side: with no TMDB key no request is made at
 /// all, and caching that empty result let a config-less /meta blank the title for keyed installs.
 #[tokio::test]
 async fn a_keyless_lookup_is_not_cached_as_no_trailer() {
     let fake = FakeUpstream::new(&[], None);
-    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
 
     fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
     let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
     assert_eq!(
         ids.first().map(String::as_str),
@@ -1327,7 +1384,7 @@ fn a_cache_cap_too_small_to_hold_a_trailer_falls_back() {
 /// three other obvious spellings silently left baking enabled.
 #[test]
 fn the_clap_escape_hatch_answers_to_more_than_one_spelling() {
-    for off in ["0", "false", "off", "no", "FALSE", " off "] {
+    for off in ["0", "false", "off", "no", "FALSE", " off ", ""] {
         std::env::set_var("CLAP", off);
         let cfg = crate::config::Config::from_env();
         std::env::remove_var("CLAP");
@@ -1352,7 +1409,13 @@ async fn a_failed_download_leaves_none_of_its_scratch_behind() {
     for name in [
         ".vidvidvid11.42.0.partial.mp4",
         ".vidvidvid11.42.0.partial.mp4.part",
-        ".vidvidvid11.42.0.partial.mp4.f137.mp4.part",
+        // yt-dlp puts `.f<id>` on EITHER side of the extension: inserted when the stream's ext
+        // matches the output's (video, always mp4 under this ladder), appended when it differs
+        // (audio, m4a). Matching the full filename caught only the small audio one and left the
+        // multi-hundred-MB video partial — which is the whole leak.
+        ".vidvidvid11.42.0.partial.f137.mp4",
+        ".vidvidvid11.42.0.partial.f137.mp4.part",
+        ".vidvidvid11.42.0.partial.f137.mp4.part-Frag3",
         ".vidvidvid11.42.0.partial.mp4.f140.m4a.part",
     ] {
         std::fs::write(dir.join(name), b"x").unwrap();
@@ -1367,7 +1430,7 @@ async fn a_failed_download_leaves_none_of_its_scratch_behind() {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains(".42.0."))
+        .filter(|n| n.starts_with(".vidvidvid11.42.0."))
         .collect();
     assert!(left.is_empty(), "the failed download left scratch the size cap cannot see: {left:?}");
     assert!(dir.join(".vidvidvid11.99.0.partial.mp4.part").exists(), "another download's temp was removed");
@@ -1388,4 +1451,37 @@ fn a_cacheable_body_names_the_headers_its_urls_came_from() {
     let vary = vary.unwrap_or_default();
     assert!(vary.contains("x-forwarded-host"), "cacheable body did not vary on the host it embedded: {vary:?}");
     assert!(vary.contains("x-forwarded-proto"), "cacheable body did not vary on the scheme it embedded: {vary:?}");
+}
+
+/// A broken yt-dlp made the search fallback return the same empty list as "YouTube has nothing",
+/// and that got negative-cached for an hour — the same two-failures-one-value bug as the other two
+/// sources, on the one path that only runs for titles TMDB has no video for.
+#[tokio::test]
+async fn a_failed_search_is_not_cached_as_no_trailer() {
+    let fake = FakeUpstream::new(&[], None);
+    fake.set_title("Backrooms 2025");
+    let broken: crate::state::SearchFn = Box::new(|_q| Box::pin(async { None }));
+    let clock = TestClock::default();
+    let mut state = build_state_full(
+        test_cfg(temp_dir()),
+        Box::new(fake.clone()),
+        always_playable(),
+        noop_prewarm(),
+        broken,
+    );
+    {
+        let st = Arc::get_mut(&mut state).expect("sole owner");
+        st.clock = clock.as_fn();
+    }
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.is_empty());
+
+    fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_FAIL_TTL_MS + 1);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a broken search was cached as 'this title has no trailer'"
+    );
 }

@@ -150,6 +150,11 @@ pub fn apply_conditional(
     if let Some(v) = resp.headers().get(CACHE_CONTROL) {
         headers.insert(CACHE_CONTROL, v.clone());
     }
+    // RFC 9110 §15.4.5: a 304 carries the Vary the 200 would have. Caches keep the stored one, but
+    // it is the header this response exists to be correct about.
+    if let Some(v) = resp.headers().get("vary") {
+        headers.insert("vary", v.clone());
+    }
     b.body(full("")).unwrap()
 }
 
