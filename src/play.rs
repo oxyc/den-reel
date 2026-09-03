@@ -107,6 +107,34 @@ pub(crate) async fn remove_temp_set(cfg: &Config, tmp: &std::path::Path) {
     }
 }
 
+/// Remove the scratch THIS process was writing, on the way out.
+///
+/// Temps are named with our pid, so once we exit nothing can tell them from another instance's
+/// live work — `sweep_partials` has to wait out its 30-minute grace before touching them, during
+/// which they sit on the cache volume uncounted by nothing and unreclaimable. A redeploy is the
+/// common case, and it is exactly when the volume is under pressure.
+pub(crate) fn sweep_own_temps(cfg: &Config) {
+    let Ok(rd) = std::fs::read_dir(&cfg.cache_dir) else { return };
+    let mine = format!(".{}.", std::process::id());
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // `.{vid}.{pid}.{gen}.partial.mp4` — match on the pid segment, wherever the vid puts it.
+        if is_published_trailer(&name) || !name.contains(&mine) {
+            continue;
+        }
+        if entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        eprintln!("shutdown: reclaimed {removed} partial file(s)");
+    }
+}
+
 /// `<vid>.mp4`, the only shape this service publishes.
 fn is_published_trailer(name: &str) -> bool {
     name.strip_suffix(".mp4").is_some_and(crate::is_valid_vid)
@@ -116,22 +144,32 @@ fn is_published_trailer(name: &str) -> bool {
 /// off the runtime thread via spawn_blocking. Skips dotfiles so an in-progress `.<vid>.…partial.mp4`
 /// is neither counted nor deleted out from under its writer; `sweep_partials` reclaims stale ones.
 pub(crate) fn evict_if_needed(cfg: &Config) {
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = match std::fs::read_dir(&cfg.cache_dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter(|e| {
+    // Everything on the volume counts toward the cap, but only published trailers are EVICTABLE.
+    // Counting just `<vid>.mp4` made the cap a floor on real usage rather than a ceiling: an
+    // in-progress download or a leaked MP4Box temp is trailer-sized and was invisible here, so the
+    // volume could sit well over its limit while this function believed it was under. Scratch is
+    // reclaimed by sweep_partials once it is provably abandoned — deleting it here would race a
+    // live download — but the space it occupies has to be subtracted from what trailers may use.
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut scratch_bytes: u64 = 0;
+    match std::fs::read_dir(&cfg.cache_dir) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let Ok(md) = e.metadata() else { continue };
+                if !md.is_file() {
+                    continue; // yt-dlp's own cache lives in a subdirectory here
+                }
                 let name = e.file_name();
-                let name = name.to_string_lossy();
-                !name.starts_with('.') && name.ends_with(".mp4")
-            })
-            .filter_map(|e| {
-                let md = e.metadata().ok()?;
-                let atime = md.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
-                Some((e.path(), md.len(), atime))
-            })
-            .collect(),
+                if is_published_trailer(&name.to_string_lossy()) {
+                    let atime = md.accessed().unwrap_or(SystemTime::UNIX_EPOCH);
+                    files.push((e.path(), md.len(), atime));
+                } else {
+                    scratch_bytes += md.len();
+                }
+            }
+        }
         Err(_) => return,
-    };
+    }
     // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
     // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
     // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
@@ -147,7 +185,7 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
             });
         }
     }
-    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    let mut total: u64 = files.iter().map(|f| f.1).sum::<u64>() + scratch_bytes;
     if total <= cfg.cache_max_bytes {
         return;
     }

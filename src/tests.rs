@@ -1271,18 +1271,20 @@ fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
 fn eviction_ttl_drops_stale_but_keeps_fresh() {
     use std::time::{Duration, SystemTime};
     let dir = temp_dir();
-    std::fs::write(dir.join("fresh.mp4"), vec![0u8; 100]).unwrap();
-    std::fs::write(dir.join("stale.mp4"), vec![0u8; 100]).unwrap();
-    // Age stale.mp4's last-access to 20 days ago (past a 14-day TTL); fresh.mp4 stays at "now".
+    // Real `<vid>.mp4` names: anything else on the volume is scratch, which the TTL pass leaves to
+    // sweep_partials rather than deleting under a live download.
+    std::fs::write(dir.join("freshVid0001.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("staleVid0001.mp4"), vec![0u8; 100]).unwrap();
+    // Age the stale one's last-access to 20 days ago (past a 14-day TTL); the other stays at "now".
     let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
-    let f = std::fs::File::open(dir.join("stale.mp4")).unwrap();
+    let f = std::fs::File::open(dir.join("staleVid0001.mp4")).unwrap();
     f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
     let mut cfg = test_cfg(dir.clone());
     cfg.cache_ttl = Duration::from_secs(14 * 24 * 60 * 60); // 14-day TTL
     cfg.cache_max_bytes = u64::MAX; // isolate the TTL: the size cap must not interfere
     crate::play::evict_if_needed(&cfg);
-    assert!(!dir.join("stale.mp4").exists(), "trailer past the last-access TTL should be evicted");
-    assert!(dir.join("fresh.mp4").exists(), "recently-served trailer must be kept");
+    assert!(!dir.join("staleVid0001.mp4").exists(), "trailer past the last-access TTL should be evicted");
+    assert!(dir.join("freshVid0001.mp4").exists(), "recently-served trailer must be kept");
 }
 
 #[tokio::test]
@@ -2124,4 +2126,33 @@ async fn meta_shortens_max_age_for_a_stand_in_answer() {
         "a stand-in answer was pinned in the client for a week: {header}"
     );
     assert!(header.contains("max-age"), "a stand-in answer lost caching entirely: {header}");
+}
+
+/// A redeploy (SIGTERM from `podman auto-update`) must not strand the partials it was writing.
+/// They carry this process's pid, so after exit nothing can tell them from another instance's live
+/// work — sweep_partials has to wait out its 30-minute grace, and until then they sit on the volume.
+#[test]
+fn shutdown_reclaims_this_processes_partials() {
+    let dir = temp_dir();
+    let pid = std::process::id();
+    let mine = [
+        format!(".vidvidvid11.{pid}.0.partial.mp4"),
+        format!(".vidvidvid11.{pid}.0.partial.mp4.part"),
+        format!(".othervid001.{pid}.3.partial.f137.mp4.part"),
+    ];
+    for n in &mine {
+        std::fs::write(dir.join(n), b"x").unwrap();
+    }
+    // Another instance's live work, and a published trailer: neither is ours to remove.
+    let other = format!(".vidvidvid11.{}.0.partial.mp4.part", pid + 1);
+    std::fs::write(dir.join(&other), b"x").unwrap();
+    std::fs::write(dir.join("cccccccccc1.mp4"), b"x").unwrap();
+
+    crate::play::sweep_own_temps(&test_cfg(dir.clone()));
+
+    for n in &mine {
+        assert!(!dir.join(n).exists(), "{n} survived shutdown and is unreclaimable until the sweep");
+    }
+    assert!(dir.join(&other).exists(), "another instance's live download was deleted");
+    assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was deleted");
 }

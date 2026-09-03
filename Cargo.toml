@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
 # minimal on a homelab box.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

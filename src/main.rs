@@ -250,6 +250,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let max_h = cfg.max_height.clone();
 
     let state = AppState::new(cfg);
+    let cfg_for_shutdown = state.cfg.clone();
 
     // Periodic cache sweep so the last-access TTL is enforced during idle stretches too — eviction
     // otherwise only runs after a download. Hourly is ample for a day-scale TTL, and interval's first
@@ -279,11 +280,23 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     loop {
         // A transient accept error (e.g. EMFILE under an fd-exhausting burst) must not take the
         // whole server down — log and keep accepting.
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("accept: {e}");
-                continue;
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    continue;
+                }
+            },
+            // A redeploy (`podman auto-update`) sends SIGTERM. Without handling it the process is
+            // killed outright: every in-flight yt-dlp keeps running in its own process group, and
+            // the partial files it was writing sit on the cache volume — invisible to the size cap
+            // and unreclaimable until the sweep's 30-minute grace, under a pid that no longer
+            // exists. Stopping the accept loop drops the runtime, which fires each download's
+            // kill-on-drop and process-group kill, and then we remove what this pid was writing.
+            _ = shutdown_signal() => {
+                eprintln!("shutting down: stopping accepts, killing in-flight downloads");
+                break;
             }
         };
         let state = state.clone();
@@ -298,6 +311,37 @@ async fn run(cfg: Config) -> std::io::Result<()> {
                 .serve_connection(io, service)
                 .await;
         });
+    }
+    // Only the shutdown branch breaks — an accept error continues — so reaching here means SIGTERM.
+    // Drop the state first: that releases the download tasks, whose kill-on-drop and process-group
+    // kill stop the yt-dlp/ffmpeg children before we delete what they were writing. Otherwise a
+    // surviving child recreates the file just after the sweep.
+    drop(state);
+    crate::play::sweep_own_temps(&cfg_for_shutdown);
+    Ok(())
+}
+
+/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal). On a platform without unix signals only
+/// ctrl-c is available, which is what a dev run sends anyway.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot listen for SIGTERM ({e}); a redeploy will strand in-flight work");
+                return std::future::pending().await;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
