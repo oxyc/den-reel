@@ -1325,36 +1325,61 @@ async fn only_the_primary_source_moves_the_fault_counter() {
     assert!(up.hard_faults() > before, "a dead TMDB did not register as 'no answer'");
 }
 
-/// The keyless case is the same hole from the other side: with no TMDB key no request is made at
-/// all, and caching that empty result let a config-less /meta blank the title for keyed installs.
+/// A keyless lookup asks a narrower question — only KinoCheck runs — so its answer lives under its
+/// own cache key. Sharing it let a config-less /meta blank titles for installs that DO have a key.
 #[tokio::test]
-async fn a_keyless_lookup_is_not_cached_as_no_trailer() {
+async fn a_keyless_answer_does_not_blank_the_title_for_keyed_installs() {
+    let fake = FakeUpstream::new(&[], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+
+    fake.set_tmdb(&["realTrailer"]);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a keyless lookup was cached as the keyed answer"
+    );
+}
+
+/// ...and the keyless answer is still cached in its own right, at the FULL negative TTL. Treating a
+/// missing key as a transient failure meant re-asking KinoCheck every 60s, forever, per title.
+#[tokio::test]
+async fn a_keyless_answer_is_cached_for_a_full_negative_ttl() {
     let fake = FakeUpstream::new(&[], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
-
-    fake.set_tmdb(&["realTrailer"]);
-    clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
-    assert_eq!(
-        ids.first().map(String::as_str),
-        Some("realTrailer"),
-        "a lookup that never ran was cached as 'this title has no trailer'"
-    );
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert_eq!(fake.calls(), after, "a missing key was priced as a transient blip and re-asked");
 }
 
-/// A genuine "no trailer" must still be negative-cached, or every browse re-hits TMDB.
+/// A genuine "no trailer" must still be negative-cached for the FULL hour, or every browse re-hits
+/// TMDB. Nothing pinned this arm: the failure tests all advance the clock past the 60s cooldown, so
+/// collapsing every negative onto the cooldown — a 60x load increase — passed the whole suite.
 #[tokio::test]
-async fn a_real_empty_answer_is_still_cached() {
+async fn a_real_empty_answer_is_cached_for_the_full_negative_ttl() {
     let fake = FakeUpstream::new(&[], None);
-    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
     let after = fake.calls();
+
+    // Well past the failure cooldown — a real answer must not be re-asked on that schedule.
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
     assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
-    assert_eq!(fake.calls(), after, "a real empty answer stopped being cached");
+    assert_eq!(fake.calls(), after, "a real 'no trailer' was re-asked at the failure cooldown");
+
+    // ...and it does expire eventually, so a geo-block or a late-added trailer is picked up.
+    fake.set_tmdb(&["realTrailer"]);
+    clock.advance(crate::YT_NEG_TTL_MS);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids.first().map(String::as_str), Some("realTrailer"), "the negative cache never expired");
 }
 
 
@@ -1484,4 +1509,42 @@ async fn a_failed_search_is_not_cached_as_no_trailer() {
         Some("realTrailer"),
         "a broken search was cached as 'this title has no trailer'"
     );
+}
+
+/// Serve one fixed HTTP response on an ephemeral port, then close. `body` may be shorter than the
+/// declared `content_length`, which is how a truncated response is simulated.
+async fn serve_once(status_line: &str, content_length: usize, body: &'static str) -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = format!("{status_line}\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n");
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A 200 whose body then fails — truncated, oversized, or not JSON — returns the same empty result
+/// as "this title has no trailer". Counting only the status line meant an overloaded TMDB (which
+/// accepts, replies 200, then stalls) got that empty answer pinned for an hour for every install,
+/// with /health still green because the status line had already cleared the signal.
+#[tokio::test]
+async fn a_200_that_fails_after_the_status_line_is_not_an_answer() {
+    for (label, len, body) in [("truncated", 500usize, "{\"re"), ("not JSON", 5usize, "hello")] {
+        let base = serve_once("HTTP/1.1 200 OK", len, body).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        let before = up.hard_faults();
+        up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await;
+        assert!(
+            up.hard_faults() > before,
+            "a {label} body counted as a real 'no trailer' answer"
+        );
+    }
 }

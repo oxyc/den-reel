@@ -134,22 +134,41 @@ impl HttpUpstream {
             }
             return None;
         }
-        if self.counts_toward_health(url) {
-            self.fails.store(0, Ordering::Relaxed); // a successful TMDB call clears the signal
-        }
         // Cap the body (defense-in-depth beyond the 15s timeout): these JSON payloads are small, so a
         // multi-MB response is either broken or hostile — stop reading rather than buffer it all.
         let mut stream = res.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.ok()?;
+            let chunk = match chunk {
+                Ok(c) => c,
+                // A body that stalls or truncates after a 200 — the shape an overloaded upstream
+                // takes. Everything below returns the same empty result as "no trailer", so a
+                // status line alone must not count as an answer: it used to return here silently,
+                // having ALREADY cleared the health signal, and the caller then pinned "no trailer"
+                // for an hour for every install.
+                Err(e) => return self.no_answer(url, &format!("body read failed ({e})")),
+            };
             if buf.len() + chunk.len() > MAX_UPSTREAM_BODY {
-                eprintln!("upstream body over {MAX_UPSTREAM_BODY} bytes: {}", redact(url));
-                return None;
+                return self.no_answer(url, &format!("body over {MAX_UPSTREAM_BODY} bytes"));
             }
             buf.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&buf).ok() // null (not throw) on a malformed body, like safeJson()
+        let Ok(v) = serde_json::from_slice(&buf) else {
+            return self.no_answer(url, "body was not JSON");
+        };
+        if self.counts_toward_health(url) {
+            self.fails.store(0, Ordering::Relaxed); // a parsed TMDB response clears the signal
+        }
+        Some(v)
+    }
+
+    /// Log, count, and return None: we did not get an answer, whatever the status line said.
+    fn no_answer(&self, url: &str, why: &str) -> Option<Value> {
+        eprintln!("upstream {}: {why}", redact(url));
+        if self.counts_toward_health(url) {
+            self.faults.fetch_add(1, Ordering::Relaxed);
+        }
+        None
     }
 }
 

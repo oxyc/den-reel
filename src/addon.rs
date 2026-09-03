@@ -101,7 +101,17 @@ pub async fn resolve_youtube_ids(
     ty: &str,
     lang: &str,
 ) -> Vec<String> {
-    let cache_key = format!("{imdb}:{lang}");
+    // A keyless request gets its OWN namespace. The key is otherwise deliberately credential-free
+    // (a resolved trailer is public and key-independent) — true for a lookup that ran, false for one
+    // that could not: with no TMDB key only KinoCheck is consulted, and sharing that thinner answer
+    // with keyed installs let a config-less /meta blank titles for everyone. Namespacing it means
+    // the answer can be cached normally instead of re-asked forever, which is what the failure
+    // cooldown was being stretched to cover — badly, since a missing key is not a transient blip.
+    let cache_key = if tmdb_key.is_empty() {
+        format!("{imdb}:{lang}:nokey")
+    } else {
+        format!("{imdb}:{lang}")
+    };
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = cache.get(&cache_key) {
@@ -156,14 +166,19 @@ pub async fn resolve_youtube_ids(
     if ids.is_empty() {
         // Two different failures, and the log used to call both the second one: if `tmdb_title`
         // returned None no search ever ran, which means TMDB does not know this id at all.
-        eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
+        if search_failed {
+            eprintln!("trailer {imdb} ({ty}/{lang}): search could not run (see above)");
+        } else {
+            eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
+        }
     }
     // An empty result is only an ANSWER if we actually got one. Every failure mode — transport
     // error, a wrong BYOK key's 401, a 429, a 5xx — arrives here as the same empty Vec as a title
     // with no trailer, and caching that pinned "no trailer" for an hour under a key that
     // deliberately excludes the credential. So one install with a typo'd key, or a single TMDB
     // blip, blanked trailers for every install, with /health still green and a log line identical
-    // to a real miss. A keyless request is the same hole from the other side: nothing was asked.
+    // to a real miss. A keyless request is not a failure but a narrower question — cached under its
+    // own key, so it neither blanks keyed installs nor re-asks on every browse.
     //
     // A short cooldown rather than no entry at all: skipping the cache entirely meant a persistent
     // upstream fault turned every browse of a trailer-less title into two TMDB calls plus a yt-dlp
@@ -171,7 +186,7 @@ pub async fn resolve_youtube_ids(
     // process-wide, so an unrelated title's fault can land in this window and cost a good answer
     // its full TTL; that errs toward re-asking, which is why the cooldown has to be cheap.
     let asked_and_got_an_answer =
-        !tmdb_key.is_empty() && !search_failed && state.upstream.hard_faults() == faults_before;
+        !search_failed && state.upstream.hard_faults() == faults_before;
     let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
         (false, _) => YT_TTL_MS,
         (true, true) => YT_NEG_TTL_MS,
