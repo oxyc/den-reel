@@ -30,6 +30,9 @@ struct FakeInner {
     fail_kc: std::sync::atomic::AtomicBool,
     kc_faults: AtomicU64,
     fault_only: std::sync::atomic::AtomicBool,
+    /// Holds a lookup inside `tmdb_candidates` until the test releases it, so a second resolve can
+    /// run to completion in between. The live-entry branch is only reachable that way.
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 #[derive(Clone)]
@@ -47,6 +50,7 @@ impl FakeUpstream {
             fail_kc: std::sync::atomic::AtomicBool::new(false),
             kc_faults: AtomicU64::new(0),
             fault_only: std::sync::atomic::AtomicBool::new(false),
+            gate: Mutex::new(None),
         }))
     }
     fn set_tmdb(&self, tmdb: &[&str]) {
@@ -64,6 +68,13 @@ impl FakeUpstream {
     fn fail_next(&self) {
         self.0.fail.store(true, Ordering::SeqCst);
     }
+    /// Make the next lookup block inside `tmdb_candidates` until the returned semaphore is given a
+    /// permit. Lets a test interleave two resolves on the one runtime thread.
+    fn gate_next(&self) -> Arc<tokio::sync::Semaphore> {
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.0.gate.lock().unwrap() = Some(sem.clone());
+        sem
+    }
     /// A fault that lands during the call WITHOUT emptying the result — an unrelated resolve
     /// faulting inside our window, which is the steady state: the counter is process-wide and a
     /// /meta row resolves many titles at once.
@@ -80,7 +91,14 @@ impl FakeUpstream {
 impl Upstream for FakeUpstream {
     async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> Vec<String> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
-        if self.0.fail.swap(false, Ordering::SeqCst) {
+        // Claim this call's outcome BEFORE parking, or the resolve that runs while we are parked
+        // consumes the flag that was armed for us.
+        let failed = self.0.fail.swap(false, Ordering::SeqCst);
+        let gate = self.0.gate.lock().unwrap().take();
+        if let Some(sem) = gate {
+            let _ = sem.acquire().await;
+        }
+        if failed {
             self.0.faults.fetch_add(1, Ordering::SeqCst);
             return Vec::new();
         }
@@ -1961,21 +1979,37 @@ async fn a_stale_answer_survives_a_long_outage() {
 }
 
 /// A slow failing resolve must not downgrade a fast good one's full-TTL entry to the cooldown.
+///
+/// This needs the two resolves genuinely interleaved. Seeding the cache and calling again does not
+/// work — a live entry short-circuits at the top of the function, so the branch is never reached
+/// and the test passes with the code deleted. The failing resolve is held inside its upstream call
+/// while the good one runs to completion and inserts.
 #[tokio::test]
 async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&[], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
-
-    // A failing resolve that started before that insert lands now, against a LIVE entry.
-    fake.set_tmdb(&[]);
+    // A: starts first, will fail, and parks inside tmdb_candidates.
+    let gate = fake.gate_next();
     fake.fail_next();
+    let s_a = state.clone();
+    let a = tokio::spawn(async move {
+        crate::addon::resolve_youtube_ids(&s_a, "k", None, "tt0111161", "movie", "en").await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(fake.calls(), 1, "A did not reach the upstream");
+
+    // B: runs to completion while A is parked, inserting a live 24h entry.
+    fake.set_tmdb(&["goodTrailer1"]);
     let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
     assert_eq!(ids, vec!["goodTrailer1".to_string()]);
 
-    // The live entry must still be live well past the failure cooldown.
+    // A resumes and finds B's live entry.
+    gate.add_permits(1);
+    assert_eq!(a.await.unwrap(), vec!["goodTrailer1".to_string()], "A published its own empty result");
+
+    // B's entry must still be live well past the failure cooldown.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
@@ -1983,4 +2017,34 @@ async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
         vec!["goodTrailer1".to_string()]
     );
     assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
+}
+
+/// The size sweep drops entries by expiry. Keying it off any other field wipes the whole cache on
+/// every insert past the bound — which no test noticed.
+#[tokio::test]
+async fn the_cache_sweep_drops_only_expired_entries() {
+    let fake = FakeUpstream::new(&["keepMe00001"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A live answer, then enough expired junk to trip the sweep on the next insert.
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    {
+        let mut cache = state.yt_cache.lock().unwrap();
+        for i in 0..crate::YT_CACHE_MAX {
+            cache.insert(
+                format!("tt{i:08}:en"),
+                crate::state::YtEntry { ids: vec!["x".into()], exp: 0, confirmed: 0 },
+            );
+        }
+    }
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0000001", "movie", "en").await;
+
+    let cache = state.yt_cache.lock().unwrap();
+    assert!(cache.len() < crate::YT_CACHE_MAX, "the sweep did not run: {}", cache.len());
+    assert_eq!(
+        cache.get("tt0111161:en").map(|e| e.ids.clone()),
+        Some(vec!["keepMe00001".to_string()]),
+        "the sweep dropped a live entry"
+    );
 }
