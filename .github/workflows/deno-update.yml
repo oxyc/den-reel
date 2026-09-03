@@ -1,0 +1,101 @@
+name: deno-update
+
+# Deno is yt-dlp's JavaScript runtime: it executes YouTube's signature/nsig challenge, and without a
+# working one extraction is deprecated, formats go missing, and playback fails intermittently. That
+# makes it the pin most likely to rot silently, so it gets the same treatment as yt-dlp itself.
+#
+# Same shape as ytdlp-update.yml: a supply-chain cooldown so a poisoned release yanked within 48h is
+# never pulled, checksums refreshed for both arches, auto-merging PR gated on CI. Deno publishes no
+# checksum manifest, so the sums are computed from the downloaded archives.
+#
+# Requires the same one-time repo setup as ytdlp-update.yml (auto-merge enabled, branch protection,
+# and the YTDLP_PR_TOKEN secret — reused here rather than adding a second PAT).
+
+on:
+  schedule:
+    - cron: "30 6 * * 1" # weekly; deno moves slower than yt-dlp
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve latest eligible deno release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COOLDOWN_DAYS: "2"
+        run: |
+          set -euo pipefail
+          rel=$(gh api repos/denoland/deno/releases/latest)
+          tag=$(jq -r .tag_name <<<"$rel")            # e.g. v2.9.6
+          version=${tag#v}
+          published=$(jq -r .published_at <<<"$rel")
+          current=$(grep -oP '^ARG DENO_VERSION=\K\S+' Dockerfile)
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$published" +%s) ) / 86400 ))
+          echo "current=$current latest=$version age_days=$age_days"
+          if [ "$version" = "$current" ]; then
+            echo "::notice::already on the latest deno ($version)"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$age_days" -lt "$COOLDOWN_DAYS" ]; then
+            echo "::notice::deno $version is only ${age_days}d old (<${COOLDOWN_DAYS}d cooldown) — skipping"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base="https://github.com/denoland/deno/releases/download/${tag}"
+          curl -fsSL "${base}/deno-x86_64-unknown-linux-gnu.zip"  -o amd64.zip
+          curl -fsSL "${base}/deno-aarch64-unknown-linux-gnu.zip" -o arm64.zip
+          amd64=$(sha256sum amd64.zip | cut -d' ' -f1)
+          arm64=$(sha256sum arm64.zip | cut -d' ' -f1)
+          rm -f amd64.zip arm64.zip
+          if [ -z "$amd64" ] || [ -z "$arm64" ]; then
+            echo "::error::could not compute both SHA256 sums for $tag"; exit 1
+          fi
+          {
+            echo "proceed=true"
+            echo "version=$version"
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Patch Dockerfile
+        if: steps.rel.outputs.proceed == 'true'
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          AMD64: ${{ steps.rel.outputs.amd64 }}
+          ARM64: ${{ steps.rel.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^ARG DENO_VERSION=.*|ARG DENO_VERSION=${VERSION}|" Dockerfile
+          sed -i -E "s|^ARG DENO_SHA256_AMD64=.*|ARG DENO_SHA256_AMD64=${AMD64}|" Dockerfile
+          sed -i -E "s|^ARG DENO_SHA256_ARM64=.*|ARG DENO_SHA256_ARM64=${ARM64}|" Dockerfile
+          git diff -- Dockerfile
+
+      - name: Open auto-merging PR
+        id: cpr
+        if: steps.rel.outputs.proceed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.YTDLP_PR_TOKEN }}
+          branch: deno-bump/${{ steps.rel.outputs.version }}
+          title: "deno → ${{ steps.rel.outputs.version }}"
+          commit-message: "Bump deno to ${{ steps.rel.outputs.version }} (+ pinned SHA256)"
+          labels: dependencies
+          body: |
+            Automated bump of the pinned deno to `${{ steps.rel.outputs.version }}` — release is ≥2 days old (supply-chain cooldown).
+
+            deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. SHA256 pins are computed from the downloaded archives (deno publishes no checksum manifest); the PR image build verifies the amd64 checksum, and the publish build verifies arm64 on merge.
+
+            Auto-merges once CI is green. As with yt-dlp, CI proves the image builds and the checksum matches — it does **not** prove extraction still works. `/health` reports `degraded` on the homelab if it doesn't.
+
+      - name: Enable auto-merge
+        if: steps.rel.outputs.proceed == 'true' && steps.cpr.outputs.pull-request-number
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.YTDLP_PR_TOKEN }}
+        run: gh pr merge --auto --squash "${{ steps.cpr.outputs.pull-request-number }}"
