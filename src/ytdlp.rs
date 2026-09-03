@@ -348,7 +348,7 @@ static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
 
 pub(crate) fn register_group(pgid: Option<u32>) {
-    if let Some(p) = pgid.filter(|&p| p != 0) {
+    if let Some(p) = pgid.filter(|&p| p != 0 && p <= i32::MAX as u32) {
         let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(Default::default).insert(p);
     }
@@ -372,10 +372,23 @@ pub(crate) async fn output_in_group(cmd: &mut Command) -> std::io::Result<std::p
     let child = cmd.spawn()?;
     let pgid = child.id();
     register_group(pgid);
-    let out = child.wait_with_output().await;
-    kill_group(pgid); // whatever it forked
-    unregister_group(pgid);
-    out
+    // A guard, not statements after the await: the await is a cancellation point, and the routine
+    // way to reach it is a client hanging up mid-/crop, which main.rs correctly treats as normal.
+    // Cleaning up only on the happy path left the pgid registered forever — nothing else prunes it
+    // — so shutdown signalled a group that had been dead for hours, and pid reuse makes that
+    // somebody else's group. Same reason download_to uses GroupGuard.
+    let _entry = GroupEntry(pgid);
+    child.wait_with_output().await
+}
+
+/// Kills the group and deregisters it however the future ended — return, error, or cancellation.
+struct GroupEntry(Option<u32>);
+
+impl Drop for GroupEntry {
+    fn drop(&mut self) {
+        kill_group(self.0); // whatever it forked
+        unregister_group(self.0);
+    }
 }
 
 /// Is this group still registered as live? Tests only — the registry is process-wide, so asserting
@@ -400,7 +413,10 @@ pub(crate) fn kill_live_groups() -> usize {
 
 #[cfg(unix)]
 pub(crate) fn kill_group(pgid: Option<u32>) {
-    if let Some(pgid) = pgid {
+    // A pgid above i32::MAX negates into a POSITIVE number — i.e. a single unrelated pid, not a
+    // group. `-(u32::MAX - 7) as i32` is 8. Nothing should produce such a value, which is exactly
+    // why it must not be a SIGKILL aimed at whatever pid 8 happens to be.
+    if let Some(pgid) = pgid.filter(|&p| p != 0 && p <= i32::MAX as u32) {
         // Negative pid = the whole group. Already-exited is ESRCH, which we don't care about.
         unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
     }

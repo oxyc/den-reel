@@ -2245,20 +2245,67 @@ fn scratch_filling_the_cap_does_not_wipe_the_cache() {
 /// subprocesses are in it too, and `kill_live_groups()` here would kill them.
 #[test]
 fn a_finished_download_leaves_nothing_in_the_kill_registry() {
-    // A pgid no real process can hold, so nothing is signalled whatever happens.
-    let fake_pgid = u32::MAX - 7;
-    assert!(!crate::ytdlp::is_group_live(fake_pgid));
+    // In range, but far above any real pid — pid_max is orders of magnitude below this.
+    let unused_pgid = i32::MAX as u32 - 1;
+    assert!(!crate::ytdlp::is_group_live(unused_pgid));
 
-    crate::ytdlp::register_group(Some(fake_pgid));
-    assert!(crate::ytdlp::is_group_live(fake_pgid), "a live download was not registered");
+    crate::ytdlp::register_group(Some(unused_pgid));
+    assert!(crate::ytdlp::is_group_live(unused_pgid), "a live download was not registered");
 
-    crate::ytdlp::unregister_group(Some(fake_pgid));
+    crate::ytdlp::unregister_group(Some(unused_pgid));
     assert!(
-        !crate::ytdlp::is_group_live(fake_pgid),
+        !crate::ytdlp::is_group_live(unused_pgid),
         "a finished download stayed in the registry; shutdown would signal a reused pgid"
     );
 
     // pgid 0 is "the caller's own group" — registering it would make shutdown kill den-reel itself.
     crate::ytdlp::register_group(Some(0));
     assert!(!crate::ytdlp::is_group_live(0), "pgid 0 was registered; shutdown would kill our own group");
+
+    // A pgid above i32::MAX negates into a POSITIVE pid: `-(u32::MAX - 7) as i32` is 8. It must
+    // never reach the registry, because kill_group would then SIGKILL whatever pid 8 is.
+    crate::ytdlp::register_group(Some(u32::MAX - 7));
+    assert!(
+        !crate::ytdlp::is_group_live(u32::MAX - 7),
+        "a pgid that negates into a plain pid was registered"
+    );
+}
+
+/// A cancelled subprocess must leave nothing registered. The await in `output_in_group` is a
+/// cancellation point, and the routine way to reach it is a client hanging up mid-/crop — which the
+/// server treats as normal. Cleaning up only after the await left the pgid registered forever
+/// (nothing else prunes it), so shutdown SIGKILLed groups that had been dead for hours, and pid
+/// reuse makes that somebody else's group.
+#[tokio::test]
+async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
+    let dir = temp_dir();
+    let slow = dir.join("slow-cmd");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pgid = {
+        let mut cmd = tokio::process::Command::new(&slow);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let fut = crate::ytdlp::output_in_group(&mut cmd);
+        tokio::pin!(fut);
+
+        tokio::select! {
+            _ = &mut fut => panic!("the fake exited immediately; this test proves nothing"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+        // The child is ours and still running; its pid is its pgid (process_group(0)).
+        let out = std::process::Command::new("pgrep").arg("-f").arg(slow.to_string_lossy().as_ref()).output().unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).lines().next().expect("the fake is running").trim().parse().unwrap();
+        assert!(crate::ytdlp::is_group_live(pid), "a running subprocess was not registered");
+        pid
+        // `fut` is dropped here — the cancellation the client hangup causes.
+    };
+
+    assert!(
+        !crate::ytdlp::is_group_live(pgid),
+        "a cancelled subprocess stayed in the registry; shutdown would signal a reused pgid"
+    );
 }
