@@ -68,13 +68,16 @@ fn env_opt(key: &str) -> Option<String> {
     }
 }
 
+/// Fallback when MAX_HEIGHT is unset or not a number. avc1's practical ceiling on YouTube.
+const DEFAULT_MAX_HEIGHT: u32 = 1080;
+
 impl Config {
     pub fn from_env() -> Config {
         let port = env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8092);
         let cache_dir = env_opt("CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
-        let max_height = env_opt("MAX_HEIGHT").unwrap_or_else(|| "1080".to_string());
+        let max_height = env_opt("MAX_HEIGHT").unwrap_or_else(|| DEFAULT_MAX_HEIGHT.to_string());
         // Sized to fit den's ~10 GB container volume with headroom (was 8 GB, which could fill it).
         let cache_max_bytes = env_opt("CACHE_MAX_BYTES")
             .and_then(|v| v.parse().ok())
@@ -100,8 +103,12 @@ impl Config {
                 "bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1][acodec^=mp4a]/"
             )
         };
-        let cap: u32 = max_height.parse().unwrap_or(1080);
-        let mut ytdlp_format = rung(&max_height);
+        // The PARSED cap everywhere, including the first rung. Interpolating the raw string put
+        // `height<=abc` into the selector, and yt-dlp rejects a malformed filter while BUILDING it
+        // — so the whole `/`-chain dies, terminal fallback included, and every trailer 502s until
+        // the env var is fixed. A typo should cost the setting, not the service.
+        let cap: u32 = max_height.parse().unwrap_or(DEFAULT_MAX_HEIGHT);
+        let mut ytdlp_format = rung(&cap.to_string());
         for step in [720u32, 480] {
             if step < cap {
                 ytdlp_format.push_str(&rung(&step.to_string()));
@@ -125,7 +132,7 @@ impl Config {
             ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
             mp4box: env_opt("MP4BOX_PATH").unwrap_or_else(|| "MP4Box".to_string()),
             bake_clap: env_opt("CLAP").as_deref() != Some("0"),
-            max_height,
+            max_height: cap.to_string(), // normalised: a bad value falls back, never propagates
             cache_max_bytes,
             cache_ttl,
             ytdlp_cache,

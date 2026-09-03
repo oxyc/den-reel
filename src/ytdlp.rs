@@ -229,7 +229,7 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Vec<String> {
 }
 
 /// Last ~200 chars of stderr on one line, for a compact diagnostic log.
-fn stderr_tail(stderr: &[u8]) -> String {
+pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
     let s = String::from_utf8_lossy(stderr);
     let tail: String = s.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
     tail.replace('\n', " ").trim().to_string()

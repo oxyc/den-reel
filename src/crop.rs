@@ -347,13 +347,28 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
     };
     let spec = format!("1={w},1,{h},1,{ho},2,{vo},2");
     let mut cmd = Command::new(&cfg.mp4box);
-    cmd.args(["-clap", &spec, &fp.to_string_lossy()])
+    // -tmp keeps MP4Box's working copy on the cache volume. It rewrites via a temp file the size
+    // of the trailer, and by default that lands in the container's own /tmp — a filesystem nothing
+    // here sizes or evicts, so a bake could ENOSPC on a box with plenty of cache room. stderr is
+    // kept for the same reason ytdlp pipes it: a silent best-effort failure is undiagnosable.
+    let tmp_dir = cfg.cache_dir.to_string_lossy().into_owned();
+    cmd.args(["-tmp", &tmp_dir, "-clap", &spec, &fp.to_string_lossy()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(BAKE_TIMEOUT_SECS), cmd.status()).await {
-        Ok(Ok(s)) if s.success() => true,
+    // output(), not status(): a piped stderr nobody reads can wedge the child on a full pipe.
+    match tokio::time::timeout(Duration::from_secs(BAKE_TIMEOUT_SECS), cmd.output()).await {
+        Ok(Ok(o)) if o.status.success() => true,
+        Ok(Ok(o)) => {
+            eprintln!(
+                "bake_clap {}: exit {:?} — {}",
+                fp.display(),
+                o.status.code(),
+                crate::ytdlp::stderr_tail(&o.stderr)
+            );
+            false
+        }
         other => {
             eprintln!("bake_clap {}: {other:?}", fp.display());
             false

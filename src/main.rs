@@ -62,14 +62,14 @@ const HEALTH_FAIL_THRESHOLD: u32 = 3;
 
 /// Build the /health JSON body (ADDON-02). Pure so the branch logic is unit-testable without app
 /// state: `degraded` when trailers can't work at all (no server TMDB key AND no sealed-config keyring,
-/// so no install can supply one), or when the upstreams (TMDB/KinoCheck) have been failing
+/// so no install can supply one), or when TMDB has been failing
 /// (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`. `/health` is addon-level (no
 /// per-install config), so a keyring being present is enough to consider trailers workable.
 fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32) -> serde_json::Value {
     if !tmdb_available {
         serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
-        serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
+        serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     } else if extract_fails >= HEALTH_FAIL_THRESHOLD {
         // Trailers resolve upstream but yt-dlp can't extract any of them here — YouTube BotGuard or a
         // stale yt-dlp / broken nsig-JS runtime. Bump YTDLP_VERSION (Dockerfile) or tune YTDLP_PLAYER_CLIENTS.
@@ -95,7 +95,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 
     if path == "/health" {
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
-        // no server TMDB key AND no sealed-config keyring, or the upstreams (TMDB/KinoCheck) failing.
+        // no server TMDB key AND no sealed-config keyring, or TMDB failing. KinoCheck is a
+        // fallback: its outage does not mean trailers are broken, so it does not move this.
         let tmdb_available = state.cfg.tmdb_key.is_some() || state.config_keyring.is_some();
         let extract_fails = state.extract_fails.load(std::sync::atomic::Ordering::Relaxed);
         let body = health_body(tmdb_available, state.upstream.recent_failures(), extract_fails);

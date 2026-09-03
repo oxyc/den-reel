@@ -225,7 +225,7 @@ fn health_reports_degraded_and_ok_states() {
     // Key present but upstreams have been failing (>= threshold) → degraded (wins over the extractor).
     assert_eq!(
         crate::health_body(true, 3, 99),
-        json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
+        json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     );
     assert_eq!(crate::health_body(true, 4, 0)["reason"], "upstream_unavailable");
 
@@ -912,6 +912,25 @@ fn the_format_ladder_never_exceeds_the_configured_cap() {
         );
         assert_eq!(got, expect_rungs, "cap {cap}");
     }
+    // A MAX_HEIGHT that is not a number must cost the setting, not the service. yt-dlp rejects a
+    // malformed filter while BUILDING the selector, so `height<=abc` in the first rung killed the
+    // whole chain — terminal fallback included — and every trailer 502'd until the env was fixed.
+    for bad in ["abc", "-5", "1e3", "1080p", "", "  "] {
+        std::env::set_var("MAX_HEIGHT", bad);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("MAX_HEIGHT");
+        assert_eq!(cfg.max_height, "1080", "MAX_HEIGHT={bad:?} was not normalised");
+        // Every `height<=` in the selector must be followed by a number. If one isn't, yt-dlp
+        // rejects the whole chain while building it.
+        let total = cfg.ytdlp_format.matches("height<=").count();
+        assert_eq!(
+            heights_in(&cfg.ytdlp_format).len(),
+            total,
+            "MAX_HEIGHT={bad:?} put a non-numeric filter in the selector: {}",
+            cfg.ytdlp_format
+        );
+    }
+
     // The terminal fallback must still pin the hardware-decode codecs.
     std::env::set_var("MAX_HEIGHT", "1080");
     let cfg = crate::config::Config::from_env();
