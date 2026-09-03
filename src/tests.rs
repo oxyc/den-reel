@@ -1583,9 +1583,22 @@ async fn a_transport_fault_does_not_log_the_api_key() {
     // It still has to say which upstream failed AND why, or the redaction has eaten the diagnostic:
     // Display alone renders connection-refused, DNS failure and TLS failure byte-identically.
     assert!(logged.contains("/3/find/tt0111161"), "the log line lost the path: {logged}");
-    assert!(
-        logged.to_lowercase().contains("connection refused"),
-        "the log line carries no cause — every transport failure renders alike: {logged}"
+    // Pin the property, not an errno string: the line must distinguish failure shapes. Asserting
+    // "connection refused" couples the test to an OS message and to where reqwest nests the cause.
+    let timed_out = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1))
+        .build()
+        .unwrap()
+        .get("http://10.255.255.1/tmdb?api_key=SUPERSECRETKEY")
+        .send()
+        .await
+        .expect_err("an unroutable address must fail");
+    let other = crate::upstream::transport_fault_line(url, timed_out);
+    assert!(!other.contains("SUPERSECRETKEY"), "the api_key reached a log line: {other}");
+    assert_ne!(
+        logged.split(" (").nth(1),
+        other.split(" (").nth(1),
+        "two different transport failures log an identical cause: {logged}"
     );
 }
 
@@ -1741,4 +1754,72 @@ async fn a_wrong_key_counts_as_no_answer_even_though_health_ignores_it() {
         assert!(up.hard_faults() > 0, "{status_line:?} was cached as a real 'no trailer'");
         assert_eq!(up.recent_failures(), 0, "{status_line:?} marked the upstream itself down");
     }
+}
+
+/// The resolve cache key is credential-free and shared by every install, so an install whose key is
+/// wrong must not replace a working install's trailer list with an empty one — that is a cache HIT
+/// for the whole window, so the title shows no trailer and no upstream call happens to correct it.
+#[tokio::test]
+async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A healthy install caches a real answer, which then expires.
+    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids.first().map(String::as_str), Some("goodTrailer1"));
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // An install with a wrong key resolves the same title and gets nothing.
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let broken = crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        broken.first().map(String::as_str),
+        Some("goodTrailer1"),
+        "a failed lookup discarded the answer we already had"
+    );
+
+    // The healthy install must still see its trailer, and the failure must not be serving as a hit.
+    fake.set_tmdb(&["goodTrailer1"]);
+    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("goodTrailer1"),
+        "one install's bad key blanked the trailer for every install"
+    );
+}
+
+/// "error decoding response body" is what reqwest Displays for a truncation and for a timeout
+/// alike — one is the upstream dying mid-response, the other is it wedging, and that difference is
+/// the whole diagnostic during the outage this arm exists for.
+#[tokio::test]
+async fn a_body_fault_says_which_kind_it_was() {
+    let base = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let truncated = reqwest::Client::new()
+        .get(format!("{base}/x?api_key=SUPERSECRETKEY"))
+        .send()
+        .await
+        .expect("headers arrive")
+        .bytes()
+        .await
+        .expect_err("a truncated body must fail");
+
+    let slow = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let stalled = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(120))
+        .build()
+        .unwrap()
+        .get(format!("{slow}/x?api_key=SUPERSECRETKEY"))
+        .send()
+        .await
+        .expect("headers arrive")
+        .bytes()
+        .await
+        .expect_err("a stalled body must fail");
+
+    let a = crate::upstream::body_fault_why(&truncated);
+    let b = crate::upstream::body_fault_why(&stalled);
+    assert!(!a.contains("SUPERSECRETKEY") && !b.contains("SUPERSECRETKEY"), "{a} / {b}");
+    assert_ne!(a, b, "a truncated body and a stalled one log the same line: {a}");
 }

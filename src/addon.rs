@@ -202,6 +202,16 @@ pub async fn resolve_youtube_ids(
     };
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
+        // A failure must not overwrite a known-good answer. The key is credential-free and shared,
+        // so an install whose key is wrong would otherwise replace a working install's trailer list
+        // with an empty one — and that is a cache HIT for the whole window, not a re-ask: the title
+        // shows no trailer at all, with no upstream call to correct it. Serve the last answer we
+        // had instead, and leave its own expiry alone so the next caller still retries.
+        if !asked_and_got_an_answer {
+            if let Some(known) = cache.get(&cache_key).filter(|e| !e.ids.is_empty()) {
+                return known.ids.clone();
+            }
+        }
         // Bound growth: when the map gets large, sweep expired entries before inserting so a
         // long-running instance with many distinct lookups doesn't leak unboundedly.
         if cache.len() >= YT_CACHE_MAX {

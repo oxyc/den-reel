@@ -175,7 +175,7 @@ impl HttpUpstream {
                 // status line alone must not count as an answer: it used to return here silently,
                 // having ALREADY cleared the health signal, and the caller then pinned "no trailer"
                 // for an hour for every install.
-                Err(e) => return self.no_answer(url, &format!("body read failed ({e})")),
+                Err(e) => return self.no_answer(url, &body_fault_why(&e)),
             };
             if buf.len() + chunk.len() > MAX_UPSTREAM_BODY {
                 return self.no_answer(url, &format!("body over {MAX_UPSTREAM_BODY} bytes"));
@@ -215,20 +215,34 @@ impl HttpUpstream {
 /// Display re-appends the entire thing ("… for url (…?api_key=…)") whenever the error carries one,
 /// so interpolating the error beside a redacted URL published the BYOK key on every transport fault
 /// — throughout precisely the outage that generates the most log lines.
-pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
-    // Display alone is bare "error sending request" for connection-refused, DNS failure, TLS
-    // failure and connect-timeout alike, and reqwest never prints the source — so the line named
-    // the request and not one thing about why it failed. Debug does carry the chain, but it also
-    // re-includes the url (and with it the key), so walk source() instead: those are hyper/std
-    // errors that never carry the url.
-    let e = e.without_url();
-    let mut why = e.to_string();
-    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+/// An error plus its source chain. Display alone is a bare category ("error sending request",
+/// "error decoding response body") that renders connection-refused, DNS failure, TLS failure and
+/// timeout identically — the cause is only in the chain. Debug carries it too, but re-includes the
+/// url and with it the api_key, so walk source(): those are hyper/rustls/std errors, which never
+/// carry a url.
+fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
     while let Some(c) = cause {
-        why.push_str(&format!(": {c}"));
+        out.push_str(&format!(": {c}"));
         cause = c.source();
     }
-    format!("upstream request failed: {} ({why})", redact(url))
+    out
+}
+
+/// Why a body read failed, with its cause. Same reason as `transport_fault_line`: "error decoding
+/// response body" is identical for a truncation and for a timeout, and the difference — one is the
+/// upstream dying mid-response, the other is it wedging — is the whole diagnostic. Body errors
+/// never carry a url (reqwest sets one only on the send path), so no redaction is needed here.
+pub(crate) fn body_fault_why(e: &reqwest::Error) -> String {
+    format!("body read failed ({})", cause_chain(e))
+}
+
+pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
+    // without_url() is what keeps the api_key out: reqwest's Display re-appends the whole url, and
+    // it is the only error in the chain that carries one.
+    let e = e.without_url();
+    format!("upstream request failed: {} ({})", redact(url), cause_chain(&e))
 }
 
 /// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
