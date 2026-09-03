@@ -51,10 +51,10 @@ following `/play` is warm. Two knobs:
 - A **successful** `/meta` sends `Cache-Control: public, max-age=604800` (7d) so clients cache the
   resolution; an empty result (no trailer / geo-blocked / transient) is left uncached to re-check.
 
-`/meta` returns the first **playable** trailer: it probes TMDB's candidates (official first,
-then KinoCheck) with yt-dlp and skips ones that are geo-blocked / removed / undecodable *here*,
-so the URL it hands back actually plays. `links: []` means "nothing playable in this region"
-(or no trailer, or `TMDB_KEY` unset) — never an error.
+`/meta` returns TMDB's candidates in rank order (official first, then KinoCheck) — it does **not**
+probe them, so yt-dlp stays off the `/meta` path and the response is fast. The client plays the
+first that works and advances past a dead or portrait one; playability is settled lazily on
+`/play`. `links: []` means no trailer was found (or `TMDB_KEY` is unset) — never an error.
 
 `/crop` lets the app trim baked-in **letterbox bars** with no re-encode: it runs ffmpeg
 `cropdetect` (keyframe-sampled, so cheap) over the cached MP4 and returns the non-black content

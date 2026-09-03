@@ -40,14 +40,18 @@ fn valid_lang(l: &str) -> bool {
 }
 
 /// The base URL this server is reachable at (for building play URLs the device will fetch).
-fn self_base(cfg_public: Option<&str>, headers: &HeaderMap, port: u16) -> String {
+pub(crate) fn self_base(cfg_public: Option<&str>, headers: &HeaderMap, port: u16) -> String {
     if let Some(b) = cfg_public {
         return b.trim_end_matches('/').to_string();
     }
     let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let proto = hdr("x-forwarded-proto")
-        .map(|p| p.split(',').next().unwrap_or("http").trim().to_string())
-        .unwrap_or_else(|| "http".to_string());
+    // A scheme, not whatever the header says. Reflected unchecked it produced URLs like
+    // `javascript://host/play/...` — the same spoofing the Host filter below exists for, on the
+    // field next to it.
+    let proto = match hdr("x-forwarded-proto").map(|p| p.split(',').next().unwrap_or("").trim()) {
+        Some("https") => "https",
+        _ => "http",
+    };
     // Only reflect a sane Host charset into the play URL we hand back (a spoofed Host would otherwise
     // point the app at an attacker origin). PUBLIC_BASE_URL short-circuits this in prod.
     let host = hdr("x-forwarded-host")
@@ -170,7 +174,11 @@ pub async fn handle_meta(
     // Only imdb ids reach the upstreams (and our URLs) — reject anything else so a crafted id
     // can't be interpolated into a TMDB/KinoCheck request.
     if !is_imdb(imdb) {
-        return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, &[]), &[]);
+        return httputil::json(
+            StatusCode::OK,
+            &build_meta(ty, imdb, &base, &[]),
+            &[("cache-control", "no-store")],
+        );
     }
     // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
     // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).

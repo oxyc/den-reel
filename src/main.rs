@@ -152,7 +152,11 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 }
             };
             if rest == "manifest.json" {
-                return httputil::json(StatusCode::OK, &addon::manifest(), &[]);
+                return httputil::json(
+                    StatusCode::OK,
+                    &addon::manifest(),
+                    &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
+                );
             }
             let meta_rest = &rest["meta/".len()..];
             if let Some(resp) = meta_from_rest(&state, &parts.headers, Some(&cfg), meta_rest, query).await {

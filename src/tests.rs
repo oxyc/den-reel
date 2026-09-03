@@ -801,6 +801,24 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     );
 }
 
+/// The scheme in the play URL comes from a client-supplied header. Reflected unchecked it produced
+/// `javascript://host/...` — the same spoofing the Host filter beside it was written to stop.
+#[tokio::test]
+async fn a_forwarded_proto_is_a_scheme_or_it_is_http() {
+    use hyper::header::{HeaderMap, HeaderValue};
+    let base = |proto: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", HeaderValue::from_str(proto).unwrap());
+        h.insert("host", HeaderValue::from_static("reel.local:8092"));
+        crate::addon::self_base(None, &h, 8092)
+    };
+    assert_eq!(base("https"), "https://reel.local:8092");
+    assert_eq!(base("http"), "http://reel.local:8092");
+    for hostile in ["javascript", "https://attacker.evil", "file", "HTTPS", ""] {
+        assert_eq!(base(hostile), "http://reel.local:8092", "accepted scheme {hostile:?}");
+    }
+}
+
 /// yt-dlp forks ffmpeg to do the merge, so killing the direct child left the grandchild running —
 /// and it kept writing to the temp path we had just deleted. The download runs in its own process
 /// group so the whole tree can be reaped; this pins that the group kill reaches a grandchild.
