@@ -2156,3 +2156,61 @@ fn shutdown_reclaims_this_processes_partials() {
     assert!(dir.join(&other).exists(), "another instance's live download was deleted");
     assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was deleted");
 }
+
+/// body_fault_why is pub(crate) and drops the url as belt-and-braces: body errors carry none today,
+/// but a future caller handing it a SEND-path error — which does carry one, with the api_key in the
+/// query string — would leak immediately. Feed it exactly that.
+#[tokio::test]
+async fn body_fault_why_redacts_even_a_send_path_error() {
+    let url = "http://127.0.0.1:1/tmdb/3/find/tt0111161?external_source=imdb_id&api_key=SUPERSECRETKEY";
+    let send_err = reqwest::Client::new().get(url).send().await.expect_err("a closed port must fail");
+    assert!(
+        send_err.url().is_some(),
+        "this test is pointless unless the error carries the url it must not print"
+    );
+
+    let logged = crate::upstream::body_fault_why(send_err);
+    assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
+    assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+}
+
+/// /crop's ffmpeg pass takes a probe permit. It was the only subprocess spawn without one, and it
+/// is a whole-file decode with no negative cache behind it, so an undetectable trailer re-runs it on
+/// every request at any concurrency.
+#[tokio::test]
+async fn crop_detection_is_bounded_by_the_probe_budget() {
+    let dir = temp_dir();
+    // A fake ffmpeg that sleeps, so overlapping /crop calls are observable.
+    let fake = dir.join("slow-ffmpeg");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ffmpeg = fake.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // More concurrent /crop calls than the probe budget allows.
+    let over = crate::PROBE_CONCURRENCY + 4;
+    for i in 0..over {
+        let id = format!("cropvid{i:04}");
+        seed_cache(&dir, &id, 100);
+        let st = state.clone();
+        tokio::spawn(async move { crate::crop::handle_crop(st, id).await });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let running = std::process::Command::new("pgrep")
+        .args(["-f", &fake.to_string_lossy()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+    let _ = std::process::Command::new("pkill").args(["-f", &fake.to_string_lossy()]).status();
+
+    assert!(running > 0, "the fake ffmpeg never ran, so this test proves nothing");
+    assert!(
+        running <= crate::PROBE_CONCURRENCY,
+        "{running} concurrent ffmpeg passes for {over} requests, over a budget of {}",
+        crate::PROBE_CONCURRENCY
+    );
+}

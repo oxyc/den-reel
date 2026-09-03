@@ -4,12 +4,14 @@ name: deno-update
 # working one extraction is deprecated, formats go missing, and playback fails intermittently. That
 # makes it the pin most likely to rot silently, so it gets the same treatment as yt-dlp itself.
 #
-# Same shape as ytdlp-update.yml: a supply-chain cooldown so a poisoned release yanked within 48h is
-# never pulled, checksums refreshed for both arches, auto-merging PR gated on CI. Deno publishes no
-# checksum manifest, so the sums are computed from the downloaded archives.
+# Same supply-chain cooldown as ytdlp-update.yml (a poisoned release yanked within 48h is never
+# pulled) and the same checksum refresh for both arches. Deno publishes no checksum manifest, so the
+# sums are computed from the downloaded archives.
 #
-# Requires the same one-time repo setup as ytdlp-update.yml (auto-merge enabled, branch protection,
-# and the YTDLP_PR_TOKEN secret — reused here rather than adding a second PAT).
+# Unlike yt-dlp this does NOT auto-merge. A yt-dlp bump is routine and usually the fix for something
+# already broken; deno is a whole JS runtime, and CI cannot prove extraction still works — that
+# canary can't run on datacenter IPs. So this opens a PR and stops. Review it, and watch /health
+# after the deploy.
 
 on:
   schedule:
@@ -76,7 +78,7 @@ jobs:
           sed -i -E "s|^ARG DENO_SHA256_ARM64=.*|ARG DENO_SHA256_ARM64=${ARM64}|" Dockerfile
           git diff -- Dockerfile
 
-      - name: Open auto-merging PR
+      - name: Open PR
         id: cpr
         if: steps.rel.outputs.proceed == 'true'
         uses: peter-evans/create-pull-request@v7
@@ -91,11 +93,4 @@ jobs:
 
             deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. SHA256 pins are computed from the downloaded archives (deno publishes no checksum manifest); the PR image build verifies the amd64 checksum, and the publish build verifies arm64 on merge.
 
-            Auto-merges once CI is green. As with yt-dlp, CI proves the image builds and the checksum matches — it does **not** prove extraction still works. `/health` reports `degraded` on the homelab if it doesn't.
-
-      - name: Enable auto-merge
-        if: steps.rel.outputs.proceed == 'true' && steps.cpr.outputs.pull-request-number
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.YTDLP_PR_TOKEN }}
-        run: gh pr merge --auto --squash "${{ steps.cpr.outputs.pull-request-number }}"
+            **Not auto-merged, on purpose.** CI proves the image builds and the checksum matches; it does **not** prove YouTube extraction still works, and this is the runtime that does the extracting. Merge when you're ready to watch `/health` after the deploy.
