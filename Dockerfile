@@ -34,15 +34,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-c
 # JS runtime for yt-dlp. Recent yt-dlp REQUIRES one to solve YouTube's signature/nsig challenge —
 # without it extraction is deprecated, formats go missing, and playback fails intermittently. deno
 # is the one yt-dlp enables by default.
-ARG DENO_VERSION=2.1.4
+ARG DENO_VERSION=2.9.6
+# Checksummed like yt-dlp below: this binary executes YouTube's JS in our container, so it is the
+# last thing that should arrive unverified.
+ARG DENO_SHA256_AMD64=394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2
+ARG DENO_SHA256_ARM64=9a46afc6c392c7cd2ff71a31558935545b46408d0e87f7a86908c712721c046e
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) arch=x86_64-unknown-linux-gnu ;; \
-      arm64) arch=aarch64-unknown-linux-gnu ;; \
+      amd64) arch=x86_64-unknown-linux-gnu; sha=$DENO_SHA256_AMD64 ;; \
+      arm64) arch=aarch64-unknown-linux-gnu; sha=$DENO_SHA256_ARM64 ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-${arch}.zip" \
       -o /tmp/deno.zip; \
+    echo "${sha}  /tmp/deno.zip" | sha256sum -c -; \
     unzip -q -d /usr/local/bin /tmp/deno.zip
 
 # Pinned yt-dlp STANDALONE binary (PyInstaller onefile — bundles Python, so no system python3
