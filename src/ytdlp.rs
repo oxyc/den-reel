@@ -306,9 +306,15 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
             buf
         });
         let status = child.wait().await.map_err(PlayError::spawn)?;
-        let stderr = drain.await.unwrap_or_default();
+        // Kill the group BEFORE draining. The stderr pipe is inherited by every descendant, so the
+        // drain waits on EOF from whatever yt-dlp left behind — a merge ffmpeg it failed to reap, a
+        // postprocessor helper — not on yt-dlp itself. A download that had already finished, with a
+        // complete MP4 on disk, blocked for as long as that descendant lived, holding one of the
+        // three download slots, and past DOWNLOAD_TIMEOUT_SECS became a 504 whose cleanup deleted
+        // the file it had successfully downloaded. GroupGuard repeats the kill on the way out; this
+        // one is what releases the pipe.
         kill_group(pgid);
-        unregister_group(pgid);
+        let stderr = drain.await.unwrap_or_default();
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
         if status.success() && wrote {
@@ -348,7 +354,7 @@ static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
 
 pub(crate) fn register_group(pgid: Option<u32>) {
-    if let Some(p) = pgid.filter(|&p| p != 0 && p <= i32::MAX as u32) {
+    if let Some(p) = pgid.filter(|&p| p > 1 && p <= i32::MAX as u32) {
         let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(Default::default).insert(p);
     }
@@ -416,7 +422,9 @@ pub(crate) fn kill_group(pgid: Option<u32>) {
     // A pgid above i32::MAX negates into a POSITIVE number — i.e. a single unrelated pid, not a
     // group. `-(u32::MAX - 7) as i32` is 8. Nothing should produce such a value, which is exactly
     // why it must not be a SIGKILL aimed at whatever pid 8 happens to be.
-    if let Some(pgid) = pgid.filter(|&p| p != 0 && p <= i32::MAX as u32) {
+    // 0 is our own group and 1 makes kill(-1) "every process we may signal" — the whole container.
+    // Neither is reachable from child.id(), which is exactly why neither should be a live SIGKILL.
+    if let Some(pgid) = pgid.filter(|&p| p > 1 && p <= i32::MAX as u32) {
         // Negative pid = the whole group. Already-exited is ESRCH, which we don't care about.
         unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
     }

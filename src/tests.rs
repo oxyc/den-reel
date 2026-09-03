@@ -128,6 +128,22 @@ impl TestClock {
 
 static TMP_CNT: AtomicUsize = AtomicUsize::new(0);
 fn temp_dir() -> PathBuf {
+    // Sweep what earlier runs left. Nothing here removes its own directory — a test that fails
+    // mid-way should leave its files for inspection — but a suite run creates ~100, and they had
+    // accumulated into tens of thousands. Anything from a pid we are not is finished with.
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let me = format!("den-reel-test-{}-", std::process::id());
+        if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("den-reel-test-") && !name.starts_with(&me) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+    });
     let n = TMP_CNT.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!("den-reel-test-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
@@ -2288,7 +2304,10 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
         let mut cmd = tokio::process::Command::new(&slow);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // Every production caller sets this; without it the drop path under test is not theirs,
+            // and tokio leaves the child unreaped as a zombie for the life of the test binary.
+            .kill_on_drop(true);
         let fut = crate::ytdlp::output_in_group(&mut cmd);
         tokio::pin!(fut);
 
@@ -2307,5 +2326,38 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
     assert!(
         !crate::ytdlp::is_group_live(pgid),
         "a cancelled subprocess stayed in the registry; shutdown would signal a reused pgid"
+    );
+}
+
+/// yt-dlp's stderr pipe is inherited by everything it forks, so draining to EOF waits on the
+/// longest-lived descendant rather than on yt-dlp. A download that had already finished — complete
+/// file on disk, exit 0 — blocked for as long as that descendant lived, holding a download slot,
+/// and past the timeout became a 504 whose cleanup deleted the file it had just downloaded.
+#[tokio::test]
+async fn a_lingering_descendant_does_not_pin_a_finished_download() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-leaves-a-child");
+    // Fork a grandchild that holds the inherited stderr open, then exit 0 having written the file.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+         (sleep 30) &\nhead -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let out = dir.join("out.mp4");
+
+    let started = std::time::Instant::now();
+    let r = crate::ytdlp::download_to(&cfg, "abcdefghij1", &out).await;
+    let took = started.elapsed();
+
+    assert!(r.is_ok(), "the download failed: {r:?}");
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "a finished download was pinned by a lingering descendant for {took:?}"
     );
 }
