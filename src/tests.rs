@@ -126,21 +126,40 @@ impl TestClock {
     }
 }
 
+/// `kill(pid, 0)`: ESRCH means gone, anything else means it exists (EPERM included — not ours, but
+/// alive, so still not ours to delete).
+fn pid_is_alive(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    // last_os_error rather than errno directly: the symbol differs per platform (__error on macOS,
+    // __errno_location on Linux) and this has to build on both.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 static TMP_CNT: AtomicUsize = AtomicUsize::new(0);
 fn temp_dir() -> PathBuf {
-    // Sweep what earlier runs left. Nothing here removes its own directory — a test that fails
-    // mid-way should leave its files for inspection — but a suite run creates ~100, and they had
-    // accumulated into tens of thousands. Anything from a pid we are not is finished with.
+    // Sweep what DEAD runs left. Nothing removes its own directory — a test that fails mid-way
+    // should leave its files to look at — but a suite run creates ~100 and they had accumulated
+    // into tens of thousands.
+    //
+    // Liveness matters: "not my pid" also matches a second test binary running right now, and
+    // deleting its directories takes its fake yt-dlp/ffmpeg scripts out from under it. That
+    // reproduced every time two runs overlapped, and failed the other run's tests with errors
+    // pointing at the code rather than at this.
     static SWEPT: std::sync::Once = std::sync::Once::new();
     SWEPT.call_once(|| {
-        let me = format!("den-reel-test-{}-", std::process::id());
-        if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
-            for e in rd.flatten() {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("den-reel-test-") && !name.starts_with(&me) {
-                    let _ = std::fs::remove_dir_all(e.path());
-                }
+        let me = std::process::id();
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix("den-reel-test-") else { continue };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid != me && !pid_is_alive(pid) {
+                let _ = std::fs::remove_dir_all(e.path());
             }
         }
     });
@@ -2359,5 +2378,58 @@ async fn a_lingering_descendant_does_not_pin_a_finished_download() {
     assert!(
         took < std::time::Duration::from_secs(10),
         "a finished download was pinned by a lingering descendant for {took:?}"
+    );
+}
+
+/// yt-dlp's stderr decides how a failure is classified, which drives /play's status, the /health
+/// extraction signal and autoPickRank. read_to_string discards the WHOLE buffer on one non-UTF-8
+/// byte, so a single accented character in an upstream message blanked the log and turned a
+/// geo-block into a generic extraction failure.
+#[tokio::test]
+async fn a_non_utf8_byte_does_not_discard_the_whole_error() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-latin1");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf 'ERROR: [youtube] Caf\\351: The uploader has not made this video available in your country.\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("the fake exits 1");
+
+    assert_eq!(err.status, 451, "a geo-block was misclassified: {err:?}");
+}
+
+/// An ERROR line written after yt-dlp exits — by something holding the inherited pipe — must still
+/// be captured. Killing the group the instant the child exited threw it away, and with it the
+/// difference between "this video is geo-blocked" and "our extractor is broken".
+#[tokio::test]
+async fn an_error_written_after_exit_is_still_captured() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-late-error");
+    // A child that outlives the parent briefly and writes the diagnostic on the inherited stderr.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n(sleep 0.3; echo 'ERROR: [youtube] Video unavailable. This video is private' >&2) &\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("the fake exits 1");
+
+    assert_ne!(
+        err.reason, "extraction_failed",
+        "a late ERROR line was lost, so a private video read as a broken extractor: {err:?}"
     );
 }

@@ -12,6 +12,10 @@ use crate::config::Config;
 
 const PROBE_TIMEOUT_SECS: u64 = 30; // yt-dlp --simulate should be quick; backstop a hang
 const DOWNLOAD_TIMEOUT_SECS: u64 = 240; // download+mux backstop (yt-dlp also gets --socket-timeout)
+/// How long to wait for yt-dlp's stderr pipe to close after it exits, before assuming a descendant
+/// is holding it open and killing the group. Long enough for a normal exit, short enough that a
+/// stuck one costs a download slot for seconds rather than the full download timeout.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// A typed `/play` failure: an HTTP status + a short machine reason + a user-facing message.
 /// Clone-able because the in-flight de-dupe shares one download future across waiters.
@@ -299,22 +303,34 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         register_group(pgid);
 
         // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
+        // read_to_end, not read_to_string: read_to_string discards the WHOLE buffer on one non-UTF-8
+        // byte, so a single accented character in an upstream error message left the log blank and
+        // the failure misclassified as a generic extraction error.
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-        let drain = tokio::spawn(async move {
-            let mut buf = String::new();
-            let _ = stderr_pipe.read_to_string(&mut buf).await;
-            buf
+        let mut drain = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
         });
         let status = child.wait().await.map_err(PlayError::spawn)?;
-        // Kill the group BEFORE draining. The stderr pipe is inherited by every descendant, so the
-        // drain waits on EOF from whatever yt-dlp left behind — a merge ffmpeg it failed to reap, a
-        // postprocessor helper — not on yt-dlp itself. A download that had already finished, with a
-        // complete MP4 on disk, blocked for as long as that descendant lived, holding one of the
-        // three download slots, and past DOWNLOAD_TIMEOUT_SECS became a 504 whose cleanup deleted
-        // the file it had successfully downloaded. GroupGuard repeats the kill on the way out; this
-        // one is what releases the pipe.
-        kill_group(pgid);
-        let stderr = drain.await.unwrap_or_default();
+        // The stderr pipe is inherited by every descendant, so EOF means "the last of them exited",
+        // not "yt-dlp exited". Waiting on it unbounded let a lingering descendant pin a download
+        // that had already finished — complete file, exit 0 — until the 240s timeout turned it into
+        // a 504 whose cleanup deleted the file. Killing the group first fixed that and broke
+        // something worse: a descendant still writing the output got SIGKILLed mid-write and a
+        // truncated MP4 was published to the cache, and an ERROR line written after exit was lost,
+        // misrouting classify() and the /health signal.
+        //
+        // So: give the pipe a moment to close on its own — which is what stock yt-dlp does, and
+        // keeps stderr intact — and only force it if something is genuinely holding on.
+        let stderr = match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain).await {
+            Ok(r) => r.unwrap_or_default(),
+            Err(_) => {
+                eprintln!("yt-dlp {vid}: stderr still held after exit; killing the group");
+                kill_group(pgid);
+                drain.await.unwrap_or_default()
+            }
+        };
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
         if status.success() && wrote {
