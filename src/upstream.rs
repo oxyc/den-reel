@@ -175,7 +175,7 @@ impl HttpUpstream {
                 // status line alone must not count as an answer: it used to return here silently,
                 // having ALREADY cleared the health signal, and the caller then pinned "no trailer"
                 // for an hour for every install.
-                Err(e) => return self.no_answer(url, &body_fault_why(&e)),
+                Err(e) => return self.no_answer(url, &body_fault_why(e)),
             };
             if buf.len() + chunk.len() > MAX_UPSTREAM_BODY {
                 return self.no_answer(url, &format!("body over {MAX_UPSTREAM_BODY} bytes"));
@@ -234,8 +234,11 @@ fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// response body" is identical for a truncation and for a timeout, and the difference — one is the
 /// upstream dying mid-response, the other is it wedging — is the whole diagnostic. Body errors
 /// never carry a url (reqwest sets one only on the send path), so no redaction is needed here.
-pub(crate) fn body_fault_why(e: &reqwest::Error) -> String {
-    format!("body read failed ({})", cause_chain(e))
+pub(crate) fn body_fault_why(e: reqwest::Error) -> String {
+    // Body errors carry no url today (reqwest sets one only on the send path), so this is belt and
+    // braces — but the function is pub(crate), and a future caller handing it a send-path error
+    // would leak the api_key immediately. Costs nothing to not depend on that.
+    format!("body read failed ({})", cause_chain(&e.without_url()))
 }
 
 pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {

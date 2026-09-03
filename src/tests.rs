@@ -29,6 +29,7 @@ struct FakeInner {
     fail: std::sync::atomic::AtomicBool,
     fail_kc: std::sync::atomic::AtomicBool,
     kc_faults: AtomicU64,
+    fault_only: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -45,6 +46,7 @@ impl FakeUpstream {
             fail: std::sync::atomic::AtomicBool::new(false),
             fail_kc: std::sync::atomic::AtomicBool::new(false),
             kc_faults: AtomicU64::new(0),
+            fault_only: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     fn set_tmdb(&self, tmdb: &[&str]) {
@@ -62,6 +64,12 @@ impl FakeUpstream {
     fn fail_next(&self) {
         self.0.fail.store(true, Ordering::SeqCst);
     }
+    /// A fault that lands during the call WITHOUT emptying the result — an unrelated resolve
+    /// faulting inside our window, which is the steady state: the counter is process-wide and a
+    /// /meta row resolves many titles at once.
+    fn fault_but_still_answer(&self) {
+        self.0.fault_only.store(true, Ordering::SeqCst);
+    }
     /// A hard fault on the FALLBACK source, as the real upstream records it.
     fn fail_fallback(&self) {
         self.0.fail_kc.store(true, Ordering::SeqCst);
@@ -75,6 +83,9 @@ impl Upstream for FakeUpstream {
         if self.0.fail.swap(false, Ordering::SeqCst) {
             self.0.faults.fetch_add(1, Ordering::SeqCst);
             return Vec::new();
+        }
+        if self.0.fault_only.swap(false, Ordering::SeqCst) {
+            self.0.faults.fetch_add(1, Ordering::SeqCst);
         }
         self.0.tmdb.lock().unwrap().clone()
     }
@@ -1532,6 +1543,23 @@ async fn serve_once(status_line: &str, content_length: usize, body: &'static str
     serve_once_bytes(status_line, content_length, body.as_bytes().to_vec()).await
 }
 
+/// Send headers, then hold the socket open without sending the body — so a client timeout is what
+/// ends the request. `serve_once` closes immediately, which is a connection reset, not a stall.
+async fn serve_once_stalling(content_length: usize) -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n");
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(b"{\"re").await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+    format!("http://{addr}")
+}
+
 async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8>) -> String {
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1792,7 +1820,8 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
 
 /// "error decoding response body" is what reqwest Displays for a truncation and for a timeout
 /// alike — one is the upstream dying mid-response, the other is it wedging, and that difference is
-/// the whole diagnostic during the outage this arm exists for.
+/// the whole diagnostic during the outage this arm exists for. The stalling server has to actually
+/// stall: closing the socket is a reset, which is the truncation case wearing a timeout's name.
 #[tokio::test]
 async fn a_body_fault_says_which_kind_it_was() {
     let base = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
@@ -1805,9 +1834,9 @@ async fn a_body_fault_says_which_kind_it_was() {
         .await
         .expect_err("a truncated body must fail");
 
-    let slow = serve_once("HTTP/1.1 200 OK", 500, "{\"re").await;
+    let slow = serve_once_stalling(500).await;
     let stalled = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(120))
+        .timeout(std::time::Duration::from_millis(300))
         .build()
         .unwrap()
         .get(format!("{slow}/x?api_key=SUPERSECRETKEY"))
@@ -1816,10 +1845,73 @@ async fn a_body_fault_says_which_kind_it_was() {
         .expect("headers arrive")
         .bytes()
         .await
-        .expect_err("a stalled body must fail");
+        .expect_err("a stalled body must time out");
 
-    let a = crate::upstream::body_fault_why(&truncated);
-    let b = crate::upstream::body_fault_why(&stalled);
+    let a = crate::upstream::body_fault_why(truncated);
+    let b = crate::upstream::body_fault_why(stalled);
     assert!(!a.contains("SUPERSECRETKEY") && !b.contains("SUPERSECRETKEY"), "{a} / {b}");
+    assert!(b.to_lowercase().contains("time"), "a stalled body did not report a timeout: {b}");
     assert_ne!(a, b, "a truncated body and a stalled one log the same line: {a}");
+}
+
+/// A fresh, non-empty answer must win over a cached one. The fault counter is process-wide, so an
+/// unrelated resolve faulting inside this call's window says nothing about this lookup — and
+/// substituting there served a superseded trailer id while holding the current one, which /meta
+/// then ships with a 7-day max-age.
+#[tokio::test]
+async fn a_fresh_answer_beats_a_stale_one_even_when_something_else_faulted() {
+    let fake = FakeUpstream::new(&["oldTrailer11"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        vec!["oldTrailer11".to_string()]
+    );
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // The trailer is replaced upstream, and some OTHER resolve faults while we are asking.
+    fake.set_tmdb(&["newTrailer22"]);
+    fake.fault_but_still_answer();
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        vec!["newTrailer22".to_string()],
+        "a fresh answer was discarded for a stale cached one"
+    );
+
+    // ...and it was cached at the full TTL, not the failure cooldown.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 2);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        vec!["newTrailer22".to_string()]
+    );
+    assert_eq!(fake.calls(), after, "a good answer was cached at the failure cooldown");
+}
+
+/// Serving the last-known-good must still rate-limit the outage. Returning early skipped the
+/// insert, so every browse during a fault paid a full upstream round.
+#[tokio::test]
+async fn serving_a_stale_answer_still_rate_limits_the_outage() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // A persistent outage, browsed repeatedly.
+    fake.set_tmdb(&[]);
+    let mut calls = Vec::new();
+    for _ in 0..5 {
+        fake.fail_next();
+        let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+        assert_eq!(ids, vec!["goodTrailer1".to_string()], "the last known answer was dropped");
+        calls.push(fake.calls());
+        clock.advance(crate::YT_FAIL_TTL_MS / 4);
+    }
+    assert!(
+        calls[4] - calls[0] <= 1,
+        "each browse during the outage paid a full upstream round: {calls:?}"
+    );
 }

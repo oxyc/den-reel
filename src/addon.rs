@@ -195,21 +195,29 @@ pub async fn resolve_youtube_ids(
             // the one path where no other signal can see it.
             && (!tmdb_key.is_empty()
                 || state.upstream.fallback_faults() == fallback_faults_before);
-    let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
+    let mut ttl = match (ids.is_empty(), asked_and_got_an_answer) {
         (false, _) => YT_TTL_MS,
         (true, true) => YT_NEG_TTL_MS,
         (true, false) => YT_FAIL_TTL_MS,
     };
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
-        // A failure must not overwrite a known-good answer. The key is credential-free and shared,
-        // so an install whose key is wrong would otherwise replace a working install's trailer list
-        // with an empty one — and that is a cache HIT for the whole window, not a re-ask: the title
-        // shows no trailer at all, with no upstream call to correct it. Serve the last answer we
-        // had instead, and leave its own expiry alone so the next caller still retries.
-        if !asked_and_got_an_answer {
-            if let Some(known) = cache.get(&cache_key).filter(|e| !e.ids.is_empty()) {
-                return known.ids.clone();
+        // A failure with nothing to show falls back to the last answer we had. The key is
+        // credential-free and shared, so publishing an empty list here is a cache HIT for every
+        // install — the title shows no trailer, and no upstream call happens to correct it.
+        //
+        // Only when the lookup produced NOTHING. A fresh non-empty result is the better answer even
+        // if some other resolve faulted inside our window — the fault counter is process-wide, so
+        // that says nothing about this lookup. Substituting there served a stale id while holding
+        // the current one, and /meta ships it with a 7-day max-age.
+        if ids.is_empty() && !asked_and_got_an_answer {
+            if let Some(known) = cache.get(&cache_key).map(|e| e.ids.clone()).filter(|v| !v.is_empty()) {
+                eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
+                ids = known;
+                // Cooldown, not the full TTL: still rate-limits the outage, and re-checks in a
+                // minute. Returning early instead skipped the insert, so every browse during an
+                // outage paid a full upstream round — 20 browses, 20 rounds.
+                ttl = YT_FAIL_TTL_MS;
             }
         }
         // Bound growth: when the map gets large, sweep expired entries before inserting so a

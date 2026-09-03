@@ -405,13 +405,23 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
             let cached = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
             match cached {
                 Some(r) => r,
-                None => match detect(&state.cfg, &id, &fp).await {
-                    Some(r) => {
-                        cache_report(&state, &id, r.clone());
-                        r
+                // The one subprocess spawn that took no permit. Every other one — downloads, probes,
+                // searches — is capped, and this is a whole-file ffmpeg pass per request with no
+                // negative cache behind it, so a trailer that yields no parsable box re-runs it on
+                // every call, at any concurrency. Shares the probe budget: same weight, same purpose.
+                None => {
+                    let detected = {
+                        let _permit = state.probe_sem.acquire().await;
+                        detect(&state.cfg, &id, &fp).await
+                    };
+                    match detected {
+                        Some(r) => {
+                            cache_report(&state, &id, r.clone());
+                            r
+                        }
+                        None => CropReport::unknown(&id),
                     }
-                    None => CropReport::unknown(&id),
-                },
+                }
             }
         }
         Err(_) => CropReport::unknown(&id),
