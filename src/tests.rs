@@ -821,6 +821,42 @@ async fn an_uppercase_language_is_the_same_language() {
     );
 }
 
+/// Repeat /meta for ONE title is the common burst — a re-rendered detail screen, a retry, two
+/// installs on the same film. Those all de-dupe onto a single download, so spending a permit each
+/// let three of them exhaust the cap and lock every other title out until that download finished.
+#[tokio::test]
+async fn duplicates_of_one_title_do_not_spend_the_prewarm_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let slow = dir.join("slow-ytdlp");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = slow.to_string_lossy().into_owned();
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        crate::state::default_prewarm(),
+    );
+
+    // The same title, over and over.
+    for _ in 0..10 {
+        (state.prewarm)(state.clone(), "sameVid0001".to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A different title must still be able to start.
+    (state.prewarm)(state.clone(), "otherVid002".to_string());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let running: Vec<String> = state.in_flight.lock().unwrap().keys().cloned().collect();
+    assert!(
+        running.iter().any(|k| k == "otherVid002"),
+        "duplicates of one title locked the cap; in flight: {running:?}"
+    );
+}
+
 /// PREWARM_MAX was a check-then-act count of `in_flight`, but that map is only written after
 /// `fetch_trailer`'s first await — so a browse burst all read the same stale count and all spawned,
 /// queueing speculative downloads ahead of the /play the viewer is actually waiting for.

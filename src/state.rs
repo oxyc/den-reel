@@ -146,6 +146,12 @@ pub fn default_prewarm() -> PrewarmFn {
         if id.is_empty() {
             return;
         }
+        // Already downloading this one? Then there is nothing to prewarm, and taking a permit for
+        // it would spend the cap on a duplicate: three repeat /meta calls for one title used to
+        // exhaust it and lock every other title out until that download finished.
+        if state.in_flight.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
+            return;
+        }
         let Ok(permit) = state.prewarm_sem.clone().try_acquire_owned() else {
             return; // already prewarming our fill; the real /play will fetch it if it is wanted
         };
