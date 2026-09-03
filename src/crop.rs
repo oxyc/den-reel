@@ -16,8 +16,9 @@
 //! this guard never suppresses logo cropping. Net: identical to the old union on such trailers, but it
 //! additionally drops transient logos on genuinely-letterboxed ones.
 //!
-//! Exposed as `GET /crop/<id>.json`. Additive; the /play download+serve hot path is untouched — the
-//! (small) cropdetect cost is only paid when the app actually asks, and the result is cached.
+//! Exposed as `GET /crop/<id>.json`. Detection and the `clap` bake run once per cold download,
+//! inside the download's concurrency slot and before the file is published — so a first play pays
+//! for them, not the first `/crop` call.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -91,6 +92,11 @@ impl CropReport {
     /// Not cached, so a later call retries.
     fn unknown(id: &str) -> CropReport {
         CropReport { id: id.to_string(), source: None, content: None, letterboxed: false, aspect: None }
+    }
+
+    /// Did detection actually produce a rect? An `unknown` must not be cached by anyone.
+    fn is_known(&self) -> bool {
+        self.source.is_some()
     }
 }
 
@@ -398,9 +404,17 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     json(&report)
 }
 
-fn json(report: &CropReport) -> Response<Body> {
+pub(crate) fn json(report: &CropReport) -> Response<Body> {
     let value = to_value(report).unwrap_or_else(|_| serde_json::json!({ "letterboxed": false }));
-    // The detected crop rect is immutable per video (the cached MP4 never changes), so it can be
-    // cached hard + `immutable`; the ETag `json` attaches lets a conditional GET still 304.
-    httputil::json(StatusCode::OK, &value, &[("cache-control", "public, max-age=31536000, immutable")])
+    // A real rect is immutable per video (the cached MP4 never changes), so it caches hard; the
+    // ETag lets a conditional GET still 304. An `unknown` is the opposite — it means ffmpeg failed
+    // or the file was not there — and it was going out with the same year-long `immutable`, so one
+    // hiccup cost that trailer its de-letterboxing until the client's own cache was cleared. Its
+    // own doc says "not cached, so a later call retries"; that was true server-side only.
+    let caching = if report.is_known() {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    httputil::json(StatusCode::OK, &value, &[("cache-control", caching)])
 }

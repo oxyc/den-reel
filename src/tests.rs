@@ -801,6 +801,70 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     );
 }
 
+/// An `unknown` crop means ffmpeg failed or the file was not there — a transient condition its own
+/// doc says "a later call retries". It was served with the same year-long `immutable` as a real
+/// rect, so one hiccup cost that trailer its de-letterboxing until the client cleared its cache.
+#[tokio::test]
+async fn an_unknown_crop_is_not_cached_by_the_client() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = "/nonexistent/yt-dlp".into(); // nothing cached, and the download cannot start
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+
+    let cc_of = |r: hyper::Response<crate::httputil::Body>| {
+        r.headers().get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+    };
+
+    let resp = crate::crop::handle_crop(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), hyper::StatusCode::OK, "an unknown crop still answers 200");
+    let cc = cc_of(resp);
+    assert!(!cc.contains("immutable"), "an unknown crop was cached as if it were a real rect: {cc}");
+
+    // A detected rect is immutable per video and must still cache hard.
+    let known = crate::crop::refine_report(crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    ));
+    let cc = cc_of(crate::crop::json(&known));
+    assert!(cc.contains("immutable"), "a detected rect stopped caching: {cc}");
+}
+
+/// The format ladder degrades in quality order, but the lower rungs were a fixed 720/480 — so a
+/// cap below 720 was matched by a rung LOOSER than itself, and MAX_HEIGHT=480 could fetch and cache
+/// a 720p file whenever the ≤480 avc1 rendition was missing.
+#[test]
+fn the_format_ladder_never_exceeds_the_configured_cap() {
+    let heights_in = |fmt: &str| -> Vec<u32> {
+        fmt.split("height<=")
+            .skip(1)
+            .filter_map(|t| t.split(']').next()?.parse::<u32>().ok())
+            .collect()
+    };
+    for (cap, expect_rungs) in [("1080", vec![1080, 1080, 720, 720, 480, 480]), ("720", vec![720, 720, 480, 480]), ("480", vec![480, 480]), ("360", vec![360, 360])] {
+        std::env::set_var("MAX_HEIGHT", cap);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("MAX_HEIGHT");
+        let cap_n: u32 = cap.parse().unwrap();
+        let got = heights_in(&cfg.ytdlp_format);
+        assert!(
+            got.iter().all(|h| *h <= cap_n),
+            "cap {cap}: ladder reaches above it: {got:?}"
+        );
+        assert_eq!(got, expect_rungs, "cap {cap}");
+    }
+    // The terminal fallback must still pin the hardware-decode codecs.
+    std::env::set_var("MAX_HEIGHT", "1080");
+    let cfg = crate::config::Config::from_env();
+    std::env::remove_var("MAX_HEIGHT");
+    assert!(cfg.ytdlp_format.ends_with("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]"), "{}", cfg.ytdlp_format);
+}
+
 /// The search fallback is the third source of YouTube ids, after TMDB and KinoCheck, and they all
 /// become filenames. It was the one left ungated when the other two were fixed.
 #[cfg(unix)]
@@ -859,6 +923,19 @@ async fn a_bad_install_key_does_not_mark_the_upstream_down() {
         let _ = up.tmdb_candidates("bad-key", "tt0111161", "movie", "en").await;
         crate::upstream::Upstream::recent_failures(&up)
     };
+
+    // KinoCheck is a fallback; its outage does not mean trailers are broken.
+    {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = server("503 Service Unavailable").await;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+        let _ = up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await;
+        assert_eq!(
+            crate::upstream::Upstream::recent_failures(&up),
+            0,
+            "a KinoCheck outage reported TMDB as down"
+        );
+    }
 
     assert_eq!(fails_after("401 Unauthorized").await, 0, "one install's bad key marked TMDB down");
     assert_eq!(fails_after("403 Forbidden").await, 0, "one install's bad key marked TMDB down");

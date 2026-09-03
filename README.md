@@ -130,7 +130,8 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |
 | `CLAP` | `1` | set `0` to disable baking the `clap` letterbox-crop box |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
-| `CACHE_MAX_BYTES` | `8589934592` (8 GB) | LRU eviction threshold |
+| `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold |
+| `CACHE_TTL_DAYS` | `14` | Drop a trailer this long after it was last served |
 | `YTDLP_PLAYER_CLIENTS` | `tv_embedded` | YouTube innertube client(s) for `--extractor-args player_client`. The TV-embedded client returns clean H.264 with non-signature URLs, so it sidesteps BotGuard ("confirm you're not a bot") **and** a broken nsig/JS-runtime — the two ways server-side extraction fails while the `web`/`tv` clients get DRM-wrapped/blocked. Comma-separate to try several (put `tv_embedded` **last** so its clean formats win ties); empty = yt-dlp defaults. |
 
 ## Maintenance
@@ -146,4 +147,4 @@ YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the 
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
 yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
 degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
-+ `cargo test`, then publishes `ghcr.io/oxyc/den-reel` on every push to `main` and on `v*` tags.
++ `cargo test` on every push; it publishes `ghcr.io/oxyc/den-reel` only on a `v*` tag or a manual run.

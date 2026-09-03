@@ -144,11 +144,15 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             let cfg = match userconfig::decode(state.config_keyring.as_ref(), cfg_seg) {
                 Some(c) => c,
                 None => {
+                    // Say something. A key rolled out of REEL_CONFIG_KEYS_PREV makes every install
+                    // 400 at once, and this path logged nothing at all — leaving the operator to
+                    // guess. Length only: the segment carries the key.
+                    eprintln!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len());
                     return httputil::json(
                         StatusCode::BAD_REQUEST,
                         &serde_json::json!({"error": "bad_config"}),
                         &[("cache-control", "no-store")],
-                    )
+                    );
                 }
             };
             if rest == "manifest.json" {

@@ -145,7 +145,9 @@ pub async fn resolve_youtube_ids(
     }
     // A title with no trailer at all is a normal empty (short-cached), not an extraction failure.
     if ids.is_empty() {
-        eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing");
+        // Two different failures, and the log used to call both the second one: if `tmdb_title`
+        // returned None no search ever ran, which means TMDB does not know this id at all.
+        eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
     }
     let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {

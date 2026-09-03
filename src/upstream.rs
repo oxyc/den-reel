@@ -79,6 +79,13 @@ impl HttpUpstream {
         HttpUpstream { cfg, http, fails: AtomicU32::new(0) }
     }
 
+    /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
+    /// trailers are broken, and counting it let `/health` say "TMDB/KinoCheck have been failing"
+    /// while TMDB was answering every request.
+    fn counts_toward_health(&self, url: &str) -> bool {
+        url.starts_with(&self.cfg.tmdb_base)
+    }
+
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Option<Value> {
         let mut req = self.http.get(url);
         for (k, v) in headers {
@@ -90,7 +97,9 @@ impl HttpUpstream {
                 // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
                 // (path only; the api_key lives in the query string and is dropped by redact()).
                 eprintln!("upstream request failed: {} ({e})", redact(url));
-                self.fails.fetch_add(1, Ordering::Relaxed);
+                if self.counts_toward_health(url) {
+                    self.fails.fetch_add(1, Ordering::Relaxed);
+                }
                 return None;
             }
         };
@@ -103,12 +112,14 @@ impl HttpUpstream {
             // keys are per-install, so counting them let one bad key report "TMDB has been failing"
             // for everyone — and, the other way round, a healthy install's traffic cleared the
             // counter so a persistently broken one never showed up at all.
-            if status == 429 || status.is_server_error() {
+            if (status == 429 || status.is_server_error()) && self.counts_toward_health(url) {
                 self.fails.fetch_add(1, Ordering::Relaxed);
             }
             return None;
         }
-        self.fails.store(0, Ordering::Relaxed); // a successful call clears the degraded state
+        if self.counts_toward_health(url) {
+            self.fails.store(0, Ordering::Relaxed); // a successful TMDB call clears the signal
+        }
         // Cap the body (defense-in-depth beyond the 15s timeout): these JSON payloads are small, so a
         // multi-MB response is either broken or hostile — stop reading rather than buffer it all.
         let mut stream = res.bytes_stream();

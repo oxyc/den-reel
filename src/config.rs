@@ -91,15 +91,23 @@ impl Config {
         // 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
         // panel even when a perfectly good 720p existed. The intermediate rungs cost nothing when the top
         // one resolves (yt-dlp stops at the first match) and only matter when it doesn't.
-        let ytdlp_format = format!(
-            "bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/\
-             b[height<={h}][vcodec^=avc1][acodec^=mp4a]/\
-             bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/\
-             b[height<=720][vcodec^=avc1][acodec^=mp4a]/\
-             bv*[height<=480][vcodec^=avc1]+ba[acodec^=mp4a]/\
-             b[height<=480][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]",
-            h = max_height
-        );
+        // Only rungs BELOW the cap. A fixed 720/480 ladder meant MAX_HEIGHT=480 still matched a
+        // 720p rendition — looser than the cap it was asked to honour — whenever the ≤480 avc1
+        // stream was missing. The last rung keeps the avc1+mp4a filter for the same reason the
+        // whole string exists: an unfiltered fallback can hand AVPlayer a VP9/AV1 file.
+        let rung = |h: &str| {
+            format!(
+                "bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1][acodec^=mp4a]/"
+            )
+        };
+        let cap: u32 = max_height.parse().unwrap_or(1080);
+        let mut ytdlp_format = rung(&max_height);
+        for step in [720u32, 480] {
+            if step < cap {
+                ytdlp_format.push_str(&rung(&step.to_string()));
+            }
+        }
+        ytdlp_format.push_str("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]");
         // tv_embedded first (BotGuard/nsig-resistant, clean avc1) with android as fallback for the
         // videos tv_embedded reports "not available"; yt-dlp merges both clients' formats. Empty disables.
         let ytdlp_extractor_args = env::var("YTDLP_PLAYER_CLIENTS")
