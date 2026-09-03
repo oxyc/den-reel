@@ -93,6 +93,13 @@ pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String]) -> Value 
 /// nothing playable (cached shorter, in case transient). `tmdb_key`/`kinocheck_key` are the effective
 /// per-request BYOK credentials (URL config, or env fallback). The cache is keyed by `imdb:lang` only —
 /// the resolved trailer is public and key-independent, so installs with different keys share one entry.
+/// What a resolve produced. `stale` marks a last-known-good answer standing in for a lookup that
+/// could not be made — correct to serve, but not something to pin in a client for a week.
+pub struct Resolved {
+    pub ids: Vec<String>,
+    pub stale: bool,
+}
+
 pub async fn resolve_youtube_ids(
     state: &Arc<AppState>,
     tmdb_key: &str,
@@ -100,7 +107,7 @@ pub async fn resolve_youtube_ids(
     imdb: &str,
     ty: &str,
     lang: &str,
-) -> Vec<String> {
+) -> Resolved {
     // A keyless request gets its OWN namespace. The key is otherwise deliberately credential-free
     // (a resolved trailer is public and key-independent) — true for a lookup that ran, false for one
     // that could not: with no TMDB key only KinoCheck is consulted, and sharing that thinner answer
@@ -114,9 +121,13 @@ pub async fn resolve_youtube_ids(
     };
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let now = (state.clock)();
         if let Some(e) = cache.get(&cache_key) {
-            if e.exp > (state.clock)() {
-                return e.ids.clone();
+            if e.exp > now {
+                // Past when it would normally have expired means these ids are a stand-in written
+                // by a failed lookup, not a fresh answer — the caller caches it in the client for
+                // hours, not a week.
+                return Resolved { ids: e.ids.clone(), stale: now >= e.confirmed + YT_TTL_MS };
             }
         }
     }
@@ -229,24 +240,31 @@ pub async fn resolve_youtube_ids(
                 // it without rewriting stops a slow failing resolve from downgrading a fast good
                 // one's 24h entry to the 60s cooldown.
                 if e.exp > now {
-                    return e.ids.clone();
+                    return Resolved { ids: e.ids.clone(), stale: true };
                 }
                 ids = e.ids.clone();
                 confirmed = e.confirmed;
                 substituted = true;
             }
         }
-        // Bound growth: when the map gets large, sweep expired entries before inserting so a
-        // long-running instance with many distinct lookups doesn't leak unboundedly.
+        // Bound growth. Sweeping only EXPIRED entries is not a bound: once that many are live the
+        // map keeps growing and every later insert pays a full scan under this mutex for nothing.
+        // Drop the nearest-to-expiry until under, so the number is a cap rather than a threshold.
         if cache.len() >= YT_CACHE_MAX {
             cache.retain(|_, e| e.exp > now);
+            if cache.len() >= YT_CACHE_MAX {
+                let mut exps: Vec<u64> = cache.values().map(|e| e.exp).collect();
+                exps.sort_unstable();
+                let cutoff = exps[cache.len() - YT_CACHE_MAX / 2];
+                cache.retain(|_, e| e.exp > cutoff);
+            }
         }
         cache.insert(cache_key, YtEntry { ids: ids.clone(), exp: now + ttl, confirmed });
     }
     if substituted {
         eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
     }
-    ids
+    Resolved { ids, stale: substituted }
 }
 
 pub async fn handle_meta(
@@ -281,7 +299,8 @@ pub async fn handle_meta(
     // Lowercased, not just accepted: the cache key and KinoCheck's language pick are both
     // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.
     let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
-    let yt_ids = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
+    let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
+    let yt_ids = resolved.ids;
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
     // the alternates are downloaded on demand only if that first one fails.
     if let Some(primary) = yt_ids.first() {
@@ -293,7 +312,11 @@ pub async fn handle_meta(
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
-    let extra: &[(&str, &str)] = if has_link {
+    let extra: &[(&str, &str)] = if has_link && resolved.stale {
+        // A last-known-good answer standing in for a lookup we could not make. The server stops
+        // trusting it after a day; pinning it in every client for a week outlives that by six.
+        &[("cache-control", "public, max-age=3600")]
+    } else if has_link {
         &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400")]
     } else {
         &[("cache-control", "no-store")]

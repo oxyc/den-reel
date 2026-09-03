@@ -317,9 +317,9 @@ async fn resolve_returns_first_playable_and_caches() {
     let fake = FakeUpstream::new(&["firstGood11"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("firstGood11"));
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.first().map(String::as_str), Some("firstGood11"));
     let after = fake.calls();
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("firstGood11"));
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.first().map(String::as_str), Some("firstGood11"));
     assert_eq!(fake.calls(), after, "second lookup is a cache hit (no new upstream calls)");
 }
 
@@ -329,7 +329,7 @@ async fn resolve_returns_alternates_after_the_primary_for_fallback() {
     // the next one on a playback failure). No extra probing beyond first_playable.
     let fake = FakeUpstream::new(&["playable1", "playable2"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["playable1".to_string(), "playable2".to_string()]);
 }
 
@@ -340,7 +340,7 @@ async fn resolve_returns_candidates_in_rank_order_without_probing() {
     // validated lazily on /play — so /meta never spawns yt-dlp.
     let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["blockedUS01".to_string(), "worldwide22".to_string()]);
 }
 
@@ -350,7 +350,7 @@ async fn resolve_empty_only_when_no_candidates_at_all() {
     // candidate looked unplayable (that check moved to /play).
     let fake = FakeUpstream::new(&["someCandidate"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["someCandidate".to_string()]);
 }
 
@@ -363,7 +363,7 @@ async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { Some(vec!["searchOne".into(), "searchTwo".into()]) }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
     assert_eq!(ids, vec!["searchOne".to_string(), "searchTwo".to_string()]);
 }
 
@@ -375,7 +375,7 @@ async fn resolve_no_search_when_title_unknown() {
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { Some(vec!["shouldNotBeUsed".into()]) }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await, Vec::<String>::new());
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await.ids, Vec::<String>::new());
 }
 
 // (Landscape preference moved off the server: den-reel returns candidates in rank order and the CLIENT
@@ -1312,18 +1312,18 @@ async fn a_failed_lookup_cools_down_instead_of_caching_no_trailer() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_next();
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
 
     // Within the cooldown the failure is not re-asked — that is what bounds the stampede.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS / 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
     assert_eq!(fake.calls(), after, "a failed lookup is not rate-limited at all");
 
     // Past it — and long before a real negative would have expired — the recovery is visible.
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_FAIL_TTL_MS);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1359,10 +1359,10 @@ async fn a_keyless_answer_does_not_blank_the_title_for_keyed_installs() {
     let fake = FakeUpstream::new(&[], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
 
     fake.set_tmdb(&["realTrailer"]);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1378,10 +1378,10 @@ async fn a_keyless_answer_is_cached_for_a_full_negative_ttl() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
     assert_eq!(fake.calls(), after, "a missing key was priced as a transient blip and re-asked");
 }
 
@@ -1394,18 +1394,18 @@ async fn a_real_empty_answer_is_cached_for_the_full_negative_ttl() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
     let after = fake.calls();
 
     // Well past the failure cooldown — a real answer must not be re-asked on that schedule.
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
     assert_eq!(fake.calls(), after, "a real 'no trailer' was re-asked at the failure cooldown");
 
     // ...and it does expire eventually, so a geo-block or a late-added trailer is picked up.
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_NEG_TTL_MS);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids.first().map(String::as_str), Some("realTrailer"), "the negative cache never expired");
 }
 
@@ -1526,11 +1526,11 @@ async fn a_failed_search_is_not_cached_as_no_trailer() {
         st.clock = clock.as_fn();
     }
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids.is_empty());
 
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1700,12 +1700,12 @@ async fn a_keyless_lookup_does_not_pin_a_fallback_outage_for_an_hour() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_fallback();
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
 
     // Past the cooldown but far short of a real negative: the outage must be re-asked.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
     assert!(
         fake.calls() > after,
         "a keyless install pinned its only source's outage as 'no trailer' for a full hour"
@@ -1721,11 +1721,11 @@ async fn a_keyed_lookup_still_ignores_a_fallback_outage() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_fallback();
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
 
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
     assert_eq!(fake.calls(), after, "a fallback outage shortened a real answer's TTL");
 }
 
@@ -1798,14 +1798,14 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     // A healthy install caches a real answer, which then expires.
-    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids.first().map(String::as_str), Some("goodTrailer1"));
     clock.advance(crate::YT_TTL_MS + 1);
 
     // An install with a wrong key resolves the same title and gets nothing.
     fake.set_tmdb(&[]);
     fake.fail_next();
-    let broken = crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await;
+    let broken = crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         broken.first().map(String::as_str),
         Some("goodTrailer1"),
@@ -1814,7 +1814,7 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
 
     // The healthy install must still see its trailer, and the failure must not be serving as a hit.
     fake.set_tmdb(&["goodTrailer1"]);
-    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("goodTrailer1"),
@@ -1868,18 +1868,18 @@ async fn one_titles_outage_does_not_touch_another_title() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_next();
-    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en").await.ids.is_empty());
 
     // A different title, resolved successfully right after, must be cached at the FULL TTL.
     fake.set_tmdb(&["goodTrailer1"]);
     assert_eq!(
-        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
         vec!["goodTrailer1".to_string()]
     );
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
-        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
         vec!["goodTrailer1".to_string()]
     );
     assert_eq!(fake.calls(), after, "another title's outage downgraded this title's entry");
@@ -1893,7 +1893,7 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     // A persistent outage, browsed repeatedly.
@@ -1901,7 +1901,7 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
     let mut calls = Vec::new();
     for _ in 0..5 {
         fake.fail_next();
-        let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+        let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
         assert_eq!(ids, vec!["goodTrailer1".to_string()], "the last known answer was dropped");
         calls.push(fake.calls());
         clock.advance(crate::YT_FAIL_TTL_MS / 4);
@@ -1921,7 +1921,7 @@ async fn a_stale_answer_stops_being_served_eventually() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     // The trailer is gone upstream, and the lookups keep failing. Browse repeatedly, well past the
@@ -1930,7 +1930,7 @@ async fn a_stale_answer_stops_being_served_eventually() {
     let mut last = vec!["goodTrailer1".to_string()];
     for _ in 0..40 {
         fake.fail_next();
-        last = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+        last = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
         clock.advance(crate::STALE_GRACE_MS / 10);
     }
     assert!(
@@ -1947,12 +1947,12 @@ async fn a_stale_answer_survives_a_long_outage() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     fake.set_tmdb(&[]);
     fake.fail_next();
-    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["goodTrailer1".to_string()], "an outage blanked the title immediately");
 }
 
@@ -1973,14 +1973,14 @@ async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
     fake.fail_next();
     let s_a = state.clone();
     let a = tokio::spawn(async move {
-        crate::addon::resolve_youtube_ids(&s_a, "k", None, "tt0111161", "movie", "en").await
+        crate::addon::resolve_youtube_ids(&s_a, "k", None, "tt0111161", "movie", "en").await.ids
     });
     tokio::task::yield_now().await;
     assert_eq!(fake.calls(), 1, "A did not reach the upstream");
 
     // B: runs to completion while A is parked, inserting a live 24h entry.
     fake.set_tmdb(&["goodTrailer1"]);
-    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["goodTrailer1".to_string()]);
 
     // A resumes and finds B's live entry.
@@ -1991,7 +1991,7 @@ async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
-        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
         vec!["goodTrailer1".to_string()]
     );
     assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
@@ -2006,7 +2006,7 @@ async fn the_cache_sweep_drops_only_expired_entries() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     // A live answer, then enough expired junk to trip the sweep on the next insert.
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
     {
         let mut cache = state.yt_cache.lock().unwrap();
         for i in 0..crate::YT_CACHE_MAX {
@@ -2016,7 +2016,7 @@ async fn the_cache_sweep_drops_only_expired_entries() {
             );
         }
     }
-    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0000001", "movie", "en").await;
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0000001", "movie", "en").await.ids;
 
     let cache = state.yt_cache.lock().unwrap();
     assert!(cache.len() < crate::YT_CACHE_MAX, "the sweep did not run: {}", cache.len());
@@ -2037,11 +2037,91 @@ async fn a_failed_title_lookup_is_not_an_answer() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_title();
-    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
 
     // Past the failure cooldown but well short of a negative TTL: it must be re-asked.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
     assert!(fake.calls() > after, "a failed title lookup was cached as 'this title has no trailer'");
+}
+
+/// A stand-in answer must not be pinned in every client for a week. The server stops trusting it
+/// after a day, so a 7-day max-age outlives the server's own bound by six.
+#[tokio::test]
+async fn a_stale_answer_is_not_cached_in_the_client_for_a_week() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // A fresh answer is cacheable for the full week.
+    let fresh = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert!(!fresh.stale, "a fresh answer was marked stale");
+
+    // ...and the same answer, once it is only standing in for a failed lookup, is not.
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stood_in = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(stood_in.ids, vec!["goodTrailer1".to_string()]);
+    assert!(stood_in.stale, "a stand-in answer was offered as a fresh one");
+
+    // A cache HIT on that stand-in must stay marked too — the client sees the same body either way.
+    let hit = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(hit.ids, vec!["goodTrailer1".to_string()]);
+    assert!(hit.stale, "a cache hit on a stand-in was offered as a fresh answer");
+}
+
+/// YT_CACHE_MAX must be a cap, not a threshold. Sweeping only expired entries means that once that
+/// many are live the map grows anyway, and every later insert pays a full scan under the mutex.
+#[tokio::test]
+async fn the_resolve_cache_is_actually_bounded() {
+    let fake = FakeUpstream::new(&["keepMe00001"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    // Fill past the bound with entries that are all LIVE, so the expiry sweep frees nothing.
+    {
+        let mut cache = state.yt_cache.lock().unwrap();
+        let far = crate::YT_TTL_MS * 10;
+        for i in 0..crate::YT_CACHE_MAX + 50 {
+            cache.insert(
+                format!("tt{i:08}:en"),
+                crate::state::YtEntry { ids: vec!["x".into()], exp: far + i as u64, confirmed: 0 },
+            );
+        }
+    }
+    let _ = crate::addon::resolve_youtube_ids(&state, "k", None, "tt7777777", "movie", "en").await;
+
+    let len = state.yt_cache.lock().unwrap().len();
+    assert!(len < crate::YT_CACHE_MAX, "the map grew past its bound with all entries live: {len}");
+}
+
+/// ...and the response actually says so. The flag only matters if it reaches the header — /meta ships
+/// a trailer link with a 7-day max-age, which for a stand-in outlives the server's own 48h bound.
+#[tokio::test]
+async fn meta_shortens_max_age_for_a_stand_in_answer() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+    let base = spawn_server(state.clone()).await;
+
+    let cc = |r: &reqwest::Response| {
+        r.headers().get("cache-control").unwrap().to_str().unwrap().to_string()
+    };
+
+    let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert!(cc(&fresh).contains("604800"), "a fresh answer lost its long cache: {}", cc(&fresh));
+
+    // Age it out and make the next lookup fail, so the answer becomes a stand-in.
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stale = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    let header = cc(&stale);
+    assert!(
+        !header.contains("604800"),
+        "a stand-in answer was pinned in the client for a week: {header}"
+    );
+    assert!(header.contains("max-age"), "a stand-in answer lost caching entirely: {header}");
 }
