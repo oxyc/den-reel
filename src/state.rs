@@ -58,6 +58,10 @@ pub struct AppState {
     /// Global caps on concurrent subprocess trees, so a burst of distinct ids can't fork-bomb the
     /// box: downloads (yt-dlp+ffmpeg) and probes (yt-dlp --simulate).
     pub download_sem: Arc<Semaphore>,
+    /// Real cap on speculative downloads. Counting `in_flight` instead was check-then-act: the
+    /// entry is only inserted after `fetch_trailer`'s first await, so a burst of /meta all read the
+    /// same stale count and all spawned.
+    pub prewarm_sem: Arc<Semaphore>,
     pub probe_sem: Arc<Semaphore>,
     /// Consecutive resolves that had real trailer candidates but yt-dlp could extract **none** of them
     /// — the signature of a systemic extraction outage (YouTube BotGuard / a broken nsig-JS runtime),
@@ -78,6 +82,7 @@ impl AppState {
             .expect("reqwest client");
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http));
         let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
+        let prewarm_sem = Arc::new(Semaphore::new(crate::PREWARM_MAX));
         // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.
         let config_keyring = match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
             Ok(kr) => kr,
@@ -99,6 +104,7 @@ impl AppState {
             prewarm: default_prewarm(),
             clock: Box::new(default_clock),
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
+            prewarm_sem,
             probe_sem,
             extract_fails: AtomicU32::new(0),
         })
@@ -132,19 +138,21 @@ pub fn default_searcher(cfg: Arc<Config>, sem: Arc<Semaphore>) -> SearchFn {
     })
 }
 
-/// Real prewarm: fire-and-forget a download so the following /play is warm. Bounded by in-flight
-/// size to survive a /meta burst; the later real /play de-dupes onto the same download.
+/// Real prewarm: fire-and-forget a download so the following /play is warm. The permit is held for
+/// the whole task, so a browse burst cannot queue speculative downloads ahead of the /play the
+/// viewer is actually waiting for.
 pub fn default_prewarm() -> PrewarmFn {
     Box::new(|state: Arc<AppState>, id: String| {
         if id.is_empty() {
             return;
         }
-        let busy = state.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len();
-        if busy < crate::PREWARM_MAX {
-            tokio::spawn(async move {
-                let _ = crate::play::fetch_trailer(state, id).await;
-            });
-        }
+        let Ok(permit) = state.prewarm_sem.clone().try_acquire_owned() else {
+            return; // already prewarming our fill; the real /play will fetch it if it is wanted
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = crate::play::fetch_trailer(state, id).await;
+        });
     })
 }
 

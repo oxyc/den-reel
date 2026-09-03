@@ -140,6 +140,7 @@ fn build_state_full(
         prewarm,
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
+        prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
     })
@@ -801,6 +802,59 @@ fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     );
 }
 
+/// `valid_lang` accepts either case by design, but everything downstream is case-sensitive: the
+/// resolve cache keys on the raw string, and KinoCheck's language pick is a `starts_with("de")`.
+/// So "DE" got its own cache entry AND silently fell back to English trailers.
+#[tokio::test]
+async fn an_uppercase_language_is_the_same_language() {
+    let fake = FakeUpstream::new(&["dQw4w9WgXcQ"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let headers = hyper::header::HeaderMap::new();
+
+    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=de").await;
+    let after_lower = fake.calls();
+    let _ = crate::addon::handle_meta(&state, &headers, None, "movie", "tt0111161", "lang=DE").await;
+    assert_eq!(
+        fake.calls(),
+        after_lower,
+        "\"DE\" resolved separately from \"de\" instead of hitting the same cache entry"
+    );
+}
+
+/// PREWARM_MAX was a check-then-act count of `in_flight`, but that map is only written after
+/// `fetch_trailer`'s first await — so a browse burst all read the same stale count and all spawned,
+/// queueing speculative downloads ahead of the /play the viewer is actually waiting for.
+#[tokio::test]
+async fn a_browse_burst_cannot_outrun_the_prewarm_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    // A yt-dlp that just blocks, so a started prewarm stays started and the count is observable.
+    let slow = dir.join("slow-ytdlp");
+    std::fs::write(&slow, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = slow.to_string_lossy().into_owned();
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        crate::state::default_prewarm(),
+    );
+
+    // Fire far more than the cap in one go, exactly as a shelf of /meta calls would.
+    for i in 0..20 {
+        (state.prewarm)(state.clone(), format!("vid{i:0>8}"));
+    }
+    // Let every spawned task get past its first await, which is where it registers itself.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let started = state.in_flight.lock().unwrap().len();
+    assert!(
+        started <= crate::PREWARM_MAX,
+        "{started} prewarms running against a cap of {}",
+        crate::PREWARM_MAX
+    );
+}
+
 /// An `unknown` crop means ffmpeg failed or the file was not there — a transient condition its own
 /// doc says "a later call retries". It was served with the same year-long `immutable` as a real
 /// rect, so one hiccup cost that trailer its de-letterboxing until the client cleared its cache.
@@ -956,7 +1010,11 @@ async fn a_forwarded_proto_is_a_scheme_or_it_is_http() {
     };
     assert_eq!(base("https"), "https://reel.local:8092");
     assert_eq!(base("http"), "http://reel.local:8092");
-    for hostile in ["javascript", "https://attacker.evil", "file", "HTTPS", ""] {
+    // A proxy that title-cases the header still means https; downgrading it to http would hand
+    // every play URL back as plaintext on a TLS-fronted install.
+    assert_eq!(base("HTTPS"), "https://reel.local:8092");
+    assert_eq!(base("Https"), "https://reel.local:8092");
+    for hostile in ["javascript", "https://attacker.evil", "file", ""] {
         assert_eq!(base(hostile), "http://reel.local:8092", "accepted scheme {hostile:?}");
     }
 }

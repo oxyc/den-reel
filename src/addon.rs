@@ -49,7 +49,7 @@ pub(crate) fn self_base(cfg_public: Option<&str>, headers: &HeaderMap, port: u16
     // `javascript://host/play/...` — the same spoofing the Host filter below exists for, on the
     // field next to it.
     let proto = match hdr("x-forwarded-proto").map(|p| p.split(',').next().unwrap_or("").trim()) {
-        Some("https") => "https",
+        Some(p) if p.eq_ignore_ascii_case("https") => "https",
         _ => "http",
     };
     // Only reflect a sane Host charset into the play URL we hand back (a spoofed Host would otherwise
@@ -192,7 +192,9 @@ pub async fn handle_meta(
         .and_then(|c| c.kinocheck_key.as_deref())
         .or(state.cfg.kinocheck_key.as_deref());
     let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
-    let lang = if valid_lang(&raw_lang) { raw_lang } else { "en".to_string() };
+    // Lowercased, not just accepted: the cache key and KinoCheck's language pick are both
+    // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.
+    let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
     let yt_ids = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
     // the alternates are downloaded on demand only if that first one fails.
