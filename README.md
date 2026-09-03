@@ -37,7 +37,11 @@ fetches from us, not from YouTube.
 ## API
 
 ```
-GET /manifest.json                       →  addon manifest (add this URL to Den)
+GET /configure                            →  the page that seals a BYOK key into an install URL
+GET /config-key                           →  the public key /configure seals against
+GET /<config>/manifest.json               →  addon manifest for a sealed install (add THIS to Den)
+GET /<config>/meta/<type>/<imdbId>.json    →  as below, resolved with that install's own key
+GET /manifest.json                       →  manifest with no config (uses the TMDB_KEY fallback)
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
@@ -46,8 +50,8 @@ GET /health                               →  200 {status} — ok, or degraded 
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
 following `/play` is warm. Two knobs:
-- `?prewarm=0` — resolve + validate only, don't pull bytes yet (for a browse-time prefetch that
-  isn't sure the user will watch). Prewarm on the real detail view.
+- `?prewarm=0` — resolve only, don't pull bytes yet (for a browse-time prefetch that isn't sure
+  the user will watch). Prewarm on the real detail view.
 - A **successful** `/meta` sends `Cache-Control: public, max-age=604800` (7d) so clients cache the
   resolution; an empty result (no trailer / geo-blocked / transient) is left uncached to re-check.
 
@@ -108,7 +112,9 @@ curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke 
 In the homelab it runs behind Caddy at `https://trailers.<domain>` (compose profile
 `trailers`); Caddy forwards `Host` + `X-Forwarded-Proto`, so the addon builds correct
 `https://trailers.<domain>/play/…` URLs with no extra config. Add
-`https://trailers.<domain>/manifest.json` to Den (Settings → Plugins, or `dev-addons.json`).
+the URL `/configure` gives you — `https://trailers.<domain>/<config>/manifest.json` — to Den
+(Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while
+`TMDB_KEY` is still set, and resolves with that shared key rather than the install's own.
 
 Without Docker (needs `ffmpeg`, `yt-dlp`, and a JS runtime like `deno` on PATH):
 `TMDB_KEY=… cargo run --release`.
@@ -128,11 +134,11 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
 | `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |
-| `CLAP` | `1` | set `0` to disable baking the `clap` letterbox-crop box |
-| `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
-| `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold |
+| `CLAP` | `1` | set `0`/`false`/`off`/`no` to disable baking the `clap` letterbox-crop box |
+| `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube; below 144 (no rendition can match) it falls back to the default |
+| `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold; below 256 MB (under one trailer) it falls back to the default |
 | `CACHE_TTL_DAYS` | `14` | Drop a trailer this long after it was last served |
-| `YTDLP_PLAYER_CLIENTS` | `tv_embedded` | YouTube innertube client(s) for `--extractor-args player_client`. The TV-embedded client returns clean H.264 with non-signature URLs, so it sidesteps BotGuard ("confirm you're not a bot") **and** a broken nsig/JS-runtime — the two ways server-side extraction fails while the `web`/`tv` clients get DRM-wrapped/blocked. Comma-separate to try several (put `tv_embedded` **last** so its clean formats win ties); empty = yt-dlp defaults. |
+| `YTDLP_PLAYER_CLIENTS` | `tv_embedded,android` | YouTube innertube client(s) for `--extractor-args player_client`. The TV-embedded client returns clean H.264 with non-signature URLs, so it sidesteps BotGuard ("confirm you're not a bot") **and** a broken nsig/JS-runtime — the two ways server-side extraction fails while the `web`/`tv` clients get DRM-wrapped/blocked. Comma-separate to try several — `tv_embedded` goes **first**, with `android` behind it for the videos tv_embedded reports unavailable; yt-dlp merges both clients' formats and the format ladder prefers the clean avc1 either way. Empty = yt-dlp defaults. |
 
 ## Maintenance
 
