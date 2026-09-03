@@ -271,6 +271,12 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
+    // Built ONCE, outside the loop. Constructing it per iteration dropped the Signal each time
+    // accept() won the select, and tokio's signal subscribes at the current watch version — so a
+    // SIGTERM delivered while no Signal existed was simply not seen by the next one.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!(
         "den-reel on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
@@ -294,7 +300,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             // and unreclaimable until the sweep's 30-minute grace, under a pid that no longer
             // exists. Stopping the accept loop drops the runtime, which fires each download's
             // kill-on-drop and process-group kill, and then we remove what this pid was writing.
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 eprintln!("shutting down: stopping accepts, killing in-flight downloads");
                 break;
             }
@@ -313,10 +319,17 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
     // Only the shutdown branch breaks — an accept error continues — so reaching here means SIGTERM.
-    // Drop the state first: that releases the download tasks, whose kill-on-drop and process-group
-    // kill stop the yt-dlp/ffmpeg children before we delete what they were writing. Otherwise a
-    // surviving child recreates the file just after the sweep.
-    drop(state);
+    //
+    // Kill the downloads EXPLICITLY. Dropping the state does not do it: `in_flight` holds a Shared
+    // clone of a future that captures the very Arc<AppState> the map lives in, so the cycle keeps
+    // each Child alive past runtime teardown and neither kill-on-drop nor the group guard fires.
+    // The sweep would then race a yt-dlp that is still writing, and recreate the file it deleted.
+    // In the container this was masked by den-reel being PID 1 — namespace teardown SIGKILLs the
+    // orphans just after — which is not a mechanism to rely on, and is absent outside a container.
+    let killed = crate::ytdlp::kill_live_groups();
+    if killed > 0 {
+        eprintln!("shutdown: killed {killed} in-flight download(s)");
+    }
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     Ok(())
 }

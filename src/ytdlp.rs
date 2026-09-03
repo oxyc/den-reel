@@ -296,6 +296,7 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         let mut child = cmd.spawn().map_err(PlayError::spawn)?;
         let pgid = child.id();
         group_for_work.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        register_group(pgid);
 
         // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
@@ -307,6 +308,7 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         let status = child.wait().await.map_err(PlayError::spawn)?;
         let stderr = drain.await.unwrap_or_default();
         kill_group(pgid);
+        unregister_group(pgid);
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
         if status.success() && wrote {
@@ -330,8 +332,47 @@ struct GroupGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        kill_group(Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0));
+        let pgid = Some(self.0.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0);
+        kill_group(pgid);
+        unregister_group(pgid);
     }
+}
+
+/// Every live download's process group.
+///
+/// The guard above only fires when the download future is DROPPED, and on shutdown it is not:
+/// `in_flight` holds a `Shared` clone of a future that itself captures the `Arc<AppState>` the map
+/// lives in, so the cycle keeps the child alive past runtime teardown. Registering the groups gives
+/// shutdown something it can act on directly, without depending on drop order.
+static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+    std::sync::Mutex::new(None);
+
+fn register_group(pgid: Option<u32>) {
+    if let Some(p) = pgid.filter(|&p| p != 0) {
+        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(Default::default).insert(p);
+    }
+}
+
+fn unregister_group(pgid: Option<u32>) {
+    if let Some(p) = pgid.filter(|&p| p != 0) {
+        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = g.as_mut() {
+            set.remove(&p);
+        }
+    }
+}
+
+/// SIGKILL every download still running. Returns how many groups it signalled.
+pub(crate) fn kill_live_groups() -> usize {
+    let taken = {
+        let mut g = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        g.take().unwrap_or_default()
+    };
+    for p in &taken {
+        kill_group(Some(*p));
+    }
+    taken.len()
 }
 
 #[cfg(unix)]

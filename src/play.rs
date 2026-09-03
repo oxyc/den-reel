@@ -185,13 +185,30 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
             });
         }
     }
-    let mut total: u64 = files.iter().map(|f| f.1).sum::<u64>() + scratch_bytes;
-    if total <= cfg.cache_max_bytes {
+    // Trailers get whatever the cap has left after scratch. Adding scratch into the running total
+    // and then subtracting only trailer bytes meant that once scratch alone cleared the cap the
+    // loop could never satisfy it — so it deleted EVERY published trailer, on every call, including
+    // the one the download that triggered it had just published. That is the death spiral the
+    // cache_max_bytes floor exists to prevent, reintroduced through the other side.
+    //
+    // When scratch alone exceeds the cap, evicting trailers cannot fix it: the space is held by
+    // downloads in flight or by leftovers younger than sweep_partials' grace, and both resolve on
+    // their own. Say so and leave the cache alone.
+    let Some(budget) = cfg.cache_max_bytes.checked_sub(scratch_bytes).filter(|b| *b > 0) else {
+        eprintln!(
+            "warning: in-flight/abandoned scratch ({scratch_bytes} B) fills CACHE_MAX_BYTES ({} B) \
+             on its own; evicting trailers cannot help — sweep_partials reclaims it",
+            cfg.cache_max_bytes
+        );
+        return;
+    };
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= budget {
         return;
     }
     files.sort_by_key(|f| f.2); // oldest atime first
     for (p, size, _) in &files {
-        if total <= cfg.cache_max_bytes {
+        if total <= budget {
             break;
         }
         if std::fs::remove_file(p).is_ok() {

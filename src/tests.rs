@@ -859,12 +859,14 @@ fn clap_params_are_center_relative() {
 #[test]
 fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
     let dir = temp_dir();
-    std::fs::write(dir.join("aaaaaa.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("aaaaaaaaaa1.mp4"), vec![0u8; 100]).unwrap();
     std::fs::write(dir.join(".bbbbbb.123.0.partial.mp4"), vec![0u8; 100]).unwrap();
     let mut cfg = test_cfg(dir.clone());
-    cfg.cache_max_bytes = 1; // force eviction of everything eligible
+    // Scratch counts toward the cap but is not evictable, so leave a budget above it — a cap at or
+    // below the scratch means evicting trailers cannot help, which is the case below.
+    cfg.cache_max_bytes = 150;
     crate::play::evict_if_needed(&cfg);
-    assert!(!dir.join("aaaaaa.mp4").exists(), "completed file should be evicted");
+    assert!(!dir.join("aaaaaaaaaa1.mp4").exists(), "completed file should be evicted");
     assert!(
         dir.join(".bbbbbb.123.0.partial.mp4").exists(),
         "in-progress .partial temp must be skipped by eviction"
@@ -2213,4 +2215,24 @@ async fn crop_detection_is_bounded_by_the_probe_budget() {
         "{running} concurrent ffmpeg passes for {over} requests, over a budget of {}",
         crate::PROBE_CONCURRENCY
     );
+}
+
+/// Scratch counts toward the cap, so when it fills the cap on its own the eviction loop could never
+/// satisfy the target — and deleted every trailer, on every call, including the one the download
+/// that triggered it had just published. That is the death spiral the cap's floor exists to prevent,
+/// arrived at from the other side.
+#[test]
+fn scratch_filling_the_cap_does_not_wipe_the_cache() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("aaaaaaaaaa1.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("bbbbbbbbbb2.mp4"), vec![0u8; 100]).unwrap();
+    // An in-flight download bigger than the whole cap.
+    std::fs::write(dir.join(".ccccccccc11.123.0.partial.mp4.part"), vec![0u8; 500]).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.cache_max_bytes = 400;
+    crate::play::evict_if_needed(&cfg);
+
+    assert!(dir.join("aaaaaaaaaa1.mp4").exists(), "a trailer was evicted to make room for scratch");
+    assert!(dir.join("bbbbbbbbbb2.mp4").exists(), "the cache was wiped by unevictable scratch");
 }
