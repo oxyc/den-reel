@@ -32,6 +32,11 @@ pub type SharedDownload = Shared<BoxFuture<Result<PathBuf, PlayError>>>;
 pub struct YtEntry {
     pub ids: Vec<String>,
     pub exp: u64,
+    /// When these ids were last actually confirmed by an upstream that answered — not when the
+    /// entry was last written. A failed lookup re-serves the last known answer and rewrites `exp`
+    /// to the retry cooldown, so `exp` alone cannot say how old the ANSWER is, and a trailer that
+    /// was removed upstream would be served for as long as anything kept faulting.
+    pub confirmed: u64,
 }
 
 pub struct AppState {

@@ -50,6 +50,12 @@ pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shor
 // A lookup that FAILED, rather than one that answered "nothing": long enough to stop a browse from
 // stampeding a sick upstream, short enough that a recovery is visible in about a minute.
 pub const YT_FAIL_TTL_MS: u64 = 60 * 1000;
+// How long PAST its normal expiry a known-good answer may keep standing in for a failing lookup,
+// measured from when it was last CONFIRMED (re-serving rewrites the expiry, so that is the only
+// clock that still means anything). Serving the last answer beats serving none during an outage,
+// but a trailer that was REMOVED upstream has to stop being handed out eventually — and /meta ships
+// it with a 7-day max-age, so "eventually" cannot mean "while anything is still faulting".
+pub const STALE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 const _: () = assert!(
     YT_FAIL_TTL_MS < YT_NEG_TTL_MS,
     "a failure must be re-asked sooner than a real 'no trailer'"

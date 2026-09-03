@@ -232,8 +232,7 @@ fn cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
 
 /// Why a body read failed, with its cause. Same reason as `transport_fault_line`: "error decoding
 /// response body" is identical for a truncation and for a timeout, and the difference — one is the
-/// upstream dying mid-response, the other is it wedging — is the whole diagnostic. Body errors
-/// never carry a url (reqwest sets one only on the send path), so no redaction is needed here.
+/// upstream dying mid-response, the other is it wedging — is the whole diagnostic.
 pub(crate) fn body_fault_why(e: reqwest::Error) -> String {
     // Body errors carry no url today (reqwest sets one only on the send path), so this is belt and
     // braces — but the function is pub(crate), and a future caller handing it a send-path error

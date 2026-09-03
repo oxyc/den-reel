@@ -1915,3 +1915,72 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
         "each browse during the outage paid a full upstream round: {calls:?}"
     );
 }
+
+/// Serving the last known answer must expire. Re-serving rewrites the entry's expiry, so without an
+/// independent "when was this confirmed" clock a trailer that was REMOVED upstream is handed out
+/// for as long as anything in the process keeps faulting — and /meta ships it with a 7-day max-age.
+#[tokio::test]
+async fn a_stale_answer_stops_being_served_eventually() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    // The trailer is gone upstream, and the lookups keep failing. Browse repeatedly, well past the
+    // grace, so each failure gets the chance to refresh the entry it is serving.
+    fake.set_tmdb(&[]);
+    let mut last = vec!["goodTrailer1".to_string()];
+    for _ in 0..40 {
+        fake.fail_next();
+        last = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+        clock.advance(crate::STALE_GRACE_MS / 10);
+    }
+    assert!(
+        last.is_empty(),
+        "a removed trailer was still being served after {} days of failures",
+        (crate::YT_TTL_MS + 4 * crate::STALE_GRACE_MS) / (24 * 60 * 60 * 1000)
+    );
+}
+
+/// ...but it is still served for a good while: an outage must not blank the catalogue immediately.
+#[tokio::test]
+async fn a_stale_answer_survives_a_long_outage() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+    clock.advance(crate::YT_TTL_MS + 1);
+
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids, vec!["goodTrailer1".to_string()], "an outage blanked the title immediately");
+}
+
+/// A slow failing resolve must not downgrade a fast good one's full-TTL entry to the cooldown.
+#[tokio::test]
+async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
+    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.is_empty());
+
+    // A failing resolve that started before that insert lands now, against a LIVE entry.
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids, vec!["goodTrailer1".to_string()]);
+
+    // The live entry must still be live well past the failure cooldown.
+    let after = fake.calls();
+    clock.advance(crate::YT_FAIL_TTL_MS * 3);
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await,
+        vec!["goodTrailer1".to_string()]
+    );
+    assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
+}

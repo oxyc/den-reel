@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::httputil::{self, query_param, Body};
 use crate::state::{AppState, YtEntry};
-use crate::{MAX_PROBE, YT_CACHE_MAX, YT_FAIL_TTL_MS, YT_NEG_TTL_MS, YT_TTL_MS};
+use crate::{MAX_PROBE, STALE_GRACE_MS, YT_CACHE_MAX, YT_FAIL_TTL_MS, YT_NEG_TTL_MS, YT_TTL_MS};
 
 pub fn manifest() -> Value {
     json!({
@@ -195,11 +195,14 @@ pub async fn resolve_youtube_ids(
             // the one path where no other signal can see it.
             && (!tmdb_key.is_empty()
                 || state.upstream.fallback_faults() == fallback_faults_before);
-    let mut ttl = match (ids.is_empty(), asked_and_got_an_answer) {
+    let ttl = match (ids.is_empty(), asked_and_got_an_answer) {
         (false, _) => YT_TTL_MS,
         (true, true) => YT_NEG_TTL_MS,
         (true, false) => YT_FAIL_TTL_MS,
     };
+    let now = (state.clock)();
+    let mut confirmed = now;
+    let mut substituted = false;
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         // A failure with nothing to show falls back to the last answer we had. The key is
@@ -210,23 +213,35 @@ pub async fn resolve_youtube_ids(
         // if some other resolve faulted inside our window — the fault counter is process-wide, so
         // that says nothing about this lookup. Substituting there served a stale id while holding
         // the current one, and /meta ships it with a 7-day max-age.
+        //
+        // And only while the answer is still worth trusting. Re-serving rewrites `exp` to the retry
+        // cooldown, so without an independent clock a title whose trailer was REMOVED upstream is
+        // handed out forever, for as long as anything in the process keeps faulting.
         if ids.is_empty() && !asked_and_got_an_answer {
-            if let Some(known) = cache.get(&cache_key).map(|e| e.ids.clone()).filter(|v| !v.is_empty()) {
-                eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
-                ids = known;
-                // Cooldown, not the full TTL: still rate-limits the outage, and re-checks in a
-                // minute. Returning early instead skipped the insert, so every browse during an
-                // outage paid a full upstream round — 20 browses, 20 rounds.
-                ttl = YT_FAIL_TTL_MS;
+            if let Some(e) = cache
+                .get(&cache_key)
+                .filter(|e| !e.ids.is_empty() && now < e.confirmed + YT_TTL_MS + STALE_GRACE_MS)
+            {
+                // A live entry is a better answer than ours and already has its own expiry; taking
+                // it without rewriting stops a slow failing resolve from downgrading a fast good
+                // one's 24h entry to the 60s cooldown.
+                if e.exp > now {
+                    return e.ids.clone();
+                }
+                ids = e.ids.clone();
+                confirmed = e.confirmed;
+                substituted = true;
             }
         }
         // Bound growth: when the map gets large, sweep expired entries before inserting so a
         // long-running instance with many distinct lookups doesn't leak unboundedly.
         if cache.len() >= YT_CACHE_MAX {
-            let now = (state.clock)();
             cache.retain(|_, e| e.exp > now);
         }
-        cache.insert(cache_key, YtEntry { ids: ids.clone(), exp: (state.clock)() + ttl });
+        cache.insert(cache_key, YtEntry { ids: ids.clone(), exp: now + ttl, confirmed });
+    }
+    if substituted {
+        eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
     }
     ids
 }
