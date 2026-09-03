@@ -110,6 +110,7 @@ pub async fn resolve_youtube_ids(
             }
         }
     }
+    let faults_before = state.upstream.hard_faults();
     // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
     // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
     let (tmdb, kc) = tokio::join!(
@@ -148,6 +149,17 @@ pub async fn resolve_youtube_ids(
         // Two different failures, and the log used to call both the second one: if `tmdb_title`
         // returned None no search ever ran, which means TMDB does not know this id at all.
         eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
+    }
+    // An empty result is only an ANSWER if we actually got one. Every failure mode — transport
+    // error, a wrong BYOK key's 401, a 429, a 5xx — arrives here as the same empty Vec as a title
+    // with no trailer, and caching that pinned "no trailer" for an hour under a key that
+    // deliberately excludes the credential. So one install with a typo'd key, or a single TMDB
+    // blip, blanked trailers for every install, with /health still green and a log line identical
+    // to a real miss. A keyless request is the same hole from the other side: nothing was asked.
+    let asked_and_got_an_answer =
+        !tmdb_key.is_empty() && state.upstream.hard_faults() == faults_before;
+    if ids.is_empty() && !asked_and_got_an_answer {
+        return ids;
     }
     let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {

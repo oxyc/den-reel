@@ -70,6 +70,12 @@ pub fn json(
     // Attach a strong validator to cacheable 200s so a conditional GET can collapse to a 304.
     if cacheable(status, cc) {
         b = b.header(ETAG, etag_of(&s));
+        // The play URLs in a /meta or /manifest body are built from the forwarded host and scheme
+        // when PUBLIC_BASE_URL is unset, so those headers are part of what the body says — but the
+        // response is `public, max-age=604800`, which invites any shared cache to store one
+        // requester's answer and hand it to everyone. Naming them keeps a cache from serving a
+        // body built for a different authority.
+        b = b.header("vary", "x-forwarded-host, x-forwarded-proto");
     }
     b.body(full(s)).unwrap()
 }

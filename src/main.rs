@@ -40,12 +40,20 @@ use std::sync::Arc;
 
 pub const MAX_PROBE: usize = 6; // cap how many trailer candidates we validate per movie
 pub const SEARCH_MAX: usize = 4; // YouTube-search fallback: how many results to consider (then probe)
-pub const PREWARM_MAX: usize = 3; // cap concurrent prewarm downloads (bounds a burst of /meta calls)
+// Strictly below DOWNLOAD_CONCURRENCY, and that relationship is the point: the prewarm permit and
+// the download permit are different semaphores, so equal caps let three speculative prewarms take
+// every download permit and — the semaphore being FIFO-fair — park the /play the viewer is actually
+// waiting on behind them, for up to DOWNLOAD_TIMEOUT_SECS. One permit stays reserved for real work.
+pub const PREWARM_MAX: usize = 2;
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
 pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
 pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the same way
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
+const _: () = assert!(
+    PREWARM_MAX < DOWNLOAD_CONCURRENCY,
+    "prewarm must leave a download permit for a real /play"
+);
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
 
 /// The /configure page, embedded so the binary is self-contained (seals a BYOK TMDB key into the URL).

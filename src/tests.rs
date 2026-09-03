@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,6 +25,8 @@ struct FakeInner {
     kc: Mutex<Option<String>>,
     title: Mutex<Option<String>>,
     calls: AtomicUsize,
+    faults: AtomicU64,
+    fail: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -37,6 +39,8 @@ impl FakeUpstream {
             kc: Mutex::new(kc.map(|s| s.to_string())),
             title: Mutex::new(None),
             calls: AtomicUsize::new(0),
+            faults: AtomicU64::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     fn set_tmdb(&self, tmdb: &[&str]) {
@@ -48,12 +52,22 @@ impl FakeUpstream {
     fn calls(&self) -> usize {
         self.0.calls.load(Ordering::SeqCst)
     }
+    /// Make the next lookup look like a transport error / 401 / 429 / 5xx: an empty result that is
+    /// NOT an answer. The fault must land DURING the call, which is the only thing that
+    /// distinguishes it from a title that genuinely has no trailer.
+    fn fail_next(&self) {
+        self.0.fail.store(true, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl Upstream for FakeUpstream {
     async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> Vec<String> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
+        if self.0.fail.swap(false, Ordering::SeqCst) {
+            self.0.faults.fetch_add(1, Ordering::SeqCst);
+            return Vec::new();
+        }
         self.0.tmdb.lock().unwrap().clone()
     }
     async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
@@ -61,6 +75,9 @@ impl Upstream for FakeUpstream {
     }
     async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> Option<String> {
         self.0.title.lock().unwrap().clone()
+    }
+    fn hard_faults(&self) -> u64 {
+        self.0.faults.load(Ordering::SeqCst)
     }
 }
 
@@ -1229,4 +1246,146 @@ async fn play_unsatisfiable_range_is_416() {
         .await
         .unwrap();
     assert_eq!(r.status(), 416);
+}
+
+/// A failed lookup and a title with no trailer both arrive as an empty Vec, and the negative cache
+/// pinned either for an hour under a key that excludes the credential — so one install's 401, or one
+/// TMDB blip, blanked that title for every install while /health stayed green.
+#[tokio::test]
+async fn a_failed_lookup_is_not_cached_as_no_trailer() {
+    let fake = FakeUpstream::new(&[], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    fake.fail_next();
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert!(ids.is_empty(), "the failure still yields no ids");
+
+    // The upstream recovers. Nothing should have been remembered from the failure.
+    fake.set_tmdb(&["realTrailer"]);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a failed lookup was cached as 'this title has no trailer'"
+    );
+}
+
+/// The keyless case is the same hole from the other side: with no TMDB key no request is made at
+/// all, and caching that empty result let a config-less /meta blank the title for keyed installs.
+#[tokio::test]
+async fn a_keyless_lookup_is_not_cached_as_no_trailer() {
+    let fake = FakeUpstream::new(&[], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.is_empty());
+
+    fake.set_tmdb(&["realTrailer"]);
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("realTrailer"),
+        "a lookup that never ran was cached as 'this title has no trailer'"
+    );
+}
+
+/// A genuine "no trailer" must still be negative-cached, or every browse re-hits TMDB.
+#[tokio::test]
+async fn a_real_empty_answer_is_still_cached() {
+    let fake = FakeUpstream::new(&[], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    let after = fake.calls();
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.is_empty());
+    assert_eq!(fake.calls(), after, "a real empty answer stopped being cached");
+}
+
+
+/// A cache cap smaller than one trailer parses cleanly and inverts the setting: eviction runs right
+/// after the rename and sees the file it just published, so every /play downloads, deletes its own
+/// output, retries once, and 500s — forever, on every request.
+#[test]
+fn a_cache_cap_too_small_to_hold_a_trailer_falls_back() {
+    for bad in ["0", "4", "1048576"] {
+        std::env::set_var("CACHE_MAX_BYTES", bad);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CACHE_MAX_BYTES");
+        assert_eq!(
+            cfg.cache_max_bytes,
+            4 * 1024 * 1024 * 1024,
+            "CACHE_MAX_BYTES={bad} was accepted; eviction would delete each trailer as it is written"
+        );
+    }
+    // A real, usable cap must still be honoured.
+    std::env::set_var("CACHE_MAX_BYTES", "536870912");
+    let cfg = crate::config::Config::from_env();
+    std::env::remove_var("CACHE_MAX_BYTES");
+    assert_eq!(cfg.cache_max_bytes, 536_870_912, "a usable cap was overridden");
+}
+
+/// CLAP is the documented escape hatch for a mis-cropped trailer. Recognising only "0" meant the
+/// three other obvious spellings silently left baking enabled.
+#[test]
+fn the_clap_escape_hatch_answers_to_more_than_one_spelling() {
+    for off in ["0", "false", "off", "no", "FALSE", " off "] {
+        std::env::set_var("CLAP", off);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CLAP");
+        assert!(!cfg.bake_clap, "CLAP={off:?} left clap baking enabled");
+    }
+    for on in ["1", "true", "yes"] {
+        std::env::set_var("CLAP", on);
+        let cfg = crate::config::Config::from_env();
+        std::env::remove_var("CLAP");
+        assert!(cfg.bake_clap, "CLAP={on:?} disabled clap baking");
+    }
+}
+
+/// A failed download used to unlink only the final temp, leaving yt-dlp's sibling scratch on disk.
+/// Those are dot-prefixed, so the size cap neither counts nor evicts them — real usage exceeded the
+/// cap by every failed download until the hourly sweep's 30-minute grace expired.
+#[tokio::test]
+async fn a_failed_download_leaves_none_of_its_scratch_behind() {
+    let dir = temp_dir();
+    let cfg = test_cfg(dir.clone());
+    let tmp = dir.join(".vidvidvid11.42.0.partial.mp4");
+    for name in [
+        ".vidvidvid11.42.0.partial.mp4",
+        ".vidvidvid11.42.0.partial.mp4.part",
+        ".vidvidvid11.42.0.partial.mp4.f137.mp4.part",
+        ".vidvidvid11.42.0.partial.mp4.f140.m4a.part",
+    ] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    // Another download's scratch, and a published trailer: neither is ours to remove.
+    std::fs::write(dir.join(".vidvidvid11.99.0.partial.mp4.part"), b"x").unwrap();
+    std::fs::write(dir.join("cccccccccc1.mp4"), b"x").unwrap();
+
+    crate::play::remove_temp_set(&cfg, &tmp).await;
+
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".42.0."))
+        .collect();
+    assert!(left.is_empty(), "the failed download left scratch the size cap cannot see: {left:?}");
+    assert!(dir.join(".vidvidvid11.99.0.partial.mp4.part").exists(), "another download's temp was removed");
+    assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was removed");
+}
+
+/// /meta and the manifest embed play URLs built from the forwarded host and scheme, and go out
+/// `public, max-age=604800`. Without naming those inputs, a shared cache may hand one requester's
+/// body — pointing at an authority they chose — to everyone else.
+#[test]
+fn a_cacheable_body_names_the_headers_its_urls_came_from() {
+    let res = crate::httputil::json(
+        hyper::StatusCode::OK,
+        &serde_json::json!({"ok": true}),
+        &[("cache-control", "public, max-age=604800")],
+    );
+    let vary = res.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
+    let vary = vary.unwrap_or_default();
+    assert!(vary.contains("x-forwarded-host"), "cacheable body did not vary on the host it embedded: {vary:?}");
+    assert!(vary.contains("x-forwarded-proto"), "cacheable body did not vary on the scheme it embedded: {vary:?}");
 }

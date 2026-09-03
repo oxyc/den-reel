@@ -1,7 +1,7 @@
 //! ADDON discovery: imdb id → ordered YouTube trailer candidates, via TMDB (primary) and KinoCheck
 //! (fallback). Behind a trait so tests can swap in a fake with no network.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,6 +27,13 @@ pub trait Upstream: Send + Sync {
     async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Option<String>;
     /// Consecutive hard upstream faults, for /health (ADDON-02). Non-HTTP upstreams report 0.
     fn recent_failures(&self) -> u32 {
+        0
+    }
+    /// Monotonic count of hard faults, for callers that must tell "the lookup failed" from "the
+    /// lookup found nothing". Compare it across a call: if it moved, the empty result is not an
+    /// answer. Unlike `recent_failures` this never resets and counts BOTH upstreams — a caching
+    /// decision must not depend on which source broke, or on a later success clearing the signal.
+    fn hard_faults(&self) -> u64 {
         0
     }
 }
@@ -72,11 +79,13 @@ pub struct HttpUpstream {
     /// Consecutive hard upstream faults (transport / 401 / 403 / 429 / 5xx) — surfaced as `degraded`
     /// on /health (ADDON-02). A 404 "not found" is a miss, not a fault, so it doesn't count.
     fails: AtomicU32,
+    /// Never reset, and not restricted to the source /health speaks for. See `hard_faults`.
+    faults: AtomicU64,
 }
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream { cfg, http, fails: AtomicU32::new(0) }
+        HttpUpstream { cfg, http, fails: AtomicU32::new(0), faults: AtomicU64::new(0) }
     }
 
     /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
@@ -97,6 +106,7 @@ impl HttpUpstream {
                 // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
                 // (path only; the api_key lives in the query string and is dropped by redact()).
                 eprintln!("upstream request failed: {} ({e})", redact(url));
+                self.faults.fetch_add(1, Ordering::Relaxed);
                 if self.counts_toward_health(url) {
                     self.fails.fetch_add(1, Ordering::Relaxed);
                 }
@@ -108,6 +118,10 @@ impl HttpUpstream {
             // Surface the faults that mean "misconfigured / throttled / upstream down" — but not 404
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
             eprintln!("upstream {} -> {status}", redact(url));
+            // A 404 is a real "this title is not there"; anything else means we did not get an answer.
+            if status != 404 {
+                self.faults.fetch_add(1, Ordering::Relaxed);
+            }
             // 401/403 is THIS install's key, not the upstream. The counter is process-wide while
             // keys are per-install, so counting them let one bad key report "TMDB has been failing"
             // for everyone — and, the other way round, a healthy install's traffic cleared the
@@ -234,5 +248,8 @@ impl Upstream for HttpUpstream {
 
     fn recent_failures(&self) -> u32 {
         self.fails.load(Ordering::Relaxed)
+    }
+    fn hard_faults(&self) -> u64 {
+        self.faults.load(Ordering::Relaxed)
     }
 }

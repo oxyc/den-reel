@@ -79,8 +79,13 @@ impl Config {
             .unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
         let max_height = env_opt("MAX_HEIGHT").unwrap_or_else(|| DEFAULT_MAX_HEIGHT.to_string());
         // Sized to fit den's ~10 GB container volume with headroom (was 8 GB, which could fill it).
+        // Floored, for the same reason MAX_HEIGHT is: a cap smaller than one trailer parses fine and
+        // inverts the setting. Eviction runs right after the rename and sees the file it just
+        // published, so an unreachable cap deletes every trailer as it is produced — each /play then
+        // downloads for up to 240s, evicts, retries once, and 500s, forever.
         let cache_max_bytes = env_opt("CACHE_MAX_BYTES")
             .and_then(|v| v.parse().ok())
+            .filter(|b| *b >= 256 * 1024 * 1024)
             .unwrap_or(4 * 1024 * 1024 * 1024); // 4 GB
         // Last-access TTL: evict trailers not served within CACHE_TTL_DAYS (default 14). 0 disables it.
         let cache_ttl = Duration::from_secs(
@@ -134,7 +139,12 @@ impl Config {
             ytdlp: env_opt("YTDLP_PATH").unwrap_or_else(|| "yt-dlp".to_string()),
             ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
             mp4box: env_opt("MP4BOX_PATH").unwrap_or_else(|| "MP4Box".to_string()),
-            bake_clap: env_opt("CLAP").as_deref() != Some("0"),
+            // The documented escape hatch for a mis-cropped trailer, so it has to answer to more than
+            // the one spelling: `CLAP=false` silently leaving baking ON is the worst time to be strict.
+            bake_clap: !matches!(
+                env_opt("CLAP").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+                Some("0" | "false" | "off" | "no" | "")
+            ),
             max_height: cap.to_string(), // normalised: a bad value falls back, never propagates
             cache_max_bytes,
             cache_ttl,

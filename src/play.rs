@@ -85,6 +85,21 @@ pub(crate) fn sweep_partials(cfg: &Config) {
     }
 }
 
+/// Remove `tmp` and every scratch file yt-dlp derived from it (`<tmp>.part`, and a
+/// `<tmp>.f<id>.<ext>.part` per merged stream). Unlinking only `tmp` left the rest dot-prefixed on
+/// disk, where the size cap does not count them and cannot evict them — so a run of failing
+/// downloads pushed real usage past the cap until the hourly sweep's 30-min grace expired.
+pub(crate) async fn remove_temp_set(cfg: &Config, tmp: &std::path::Path) {
+    let Some(stem) = tmp.file_name().and_then(|n| n.to_str()).map(String::from) else { return };
+    let _ = tokio::fs::remove_file(tmp).await;
+    let Ok(mut rd) = tokio::fs::read_dir(&cfg.cache_dir).await else { return };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&stem) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
 /// `<vid>.mp4`, the only shape this service publishes.
 fn is_published_trailer(name: &str) -> bool {
     name.strip_suffix(".mp4").is_some_and(crate::is_valid_vid)
@@ -211,7 +226,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     let _permit = state.download_sem.acquire().await;
 
     if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        remove_temp_set(&state.cfg, &tmp).await;
         // /health signal (moved here from the old resolve-time probe): a SYSTEMIC extraction failure
         // (YouTube BotGuard / a broken nsig-JS runtime) bumps the counter; a per-video geo-block/removal
         // does not. A successful download below clears it. `extractor_unavailable` trips past the threshold.
