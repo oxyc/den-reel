@@ -16,6 +16,13 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 240; // download+mux backstop (yt-dlp also ge
 /// is holding it open and killing the group. Long enough for a normal exit, short enough that a
 /// stuck one costs a download slot for seconds rather than the full download timeout.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Long enough to see a writer make progress, short enough to be invisible. Only ever paid when
+/// something is still holding stderr after yt-dlp exits.
+const WRITE_PROBE: Duration = Duration::from_millis(200);
+const _: () = assert!(
+    STDERR_DRAIN_GRACE.as_secs() * 4 < DOWNLOAD_TIMEOUT_SECS,
+    "the stderr grace must stay well inside the download timeout, or it is unreachable"
+);
 
 /// A typed `/play` failure: an HTTP status + a short machine reason + a user-facing message.
 /// Clone-able because the in-flight de-dupe shares one download future across waiters.
@@ -37,6 +44,18 @@ impl PlayError {
             detail: format!("spawn yt-dlp: {e}"),
         }
     }
+    /// yt-dlp exited 0 but we do not trust what is on disk — no file, or something was still
+    /// writing it when the grace expired. A LOCAL failure, deliberately not `extraction_failed`:
+    /// that reason feeds /health's systemic signal, and telling the operator to bump yt-dlp for a
+    /// grace kill or a full disk points at the wrong thing entirely.
+    fn incomplete(detail: String) -> PlayError {
+        PlayError {
+            status: 502,
+            reason: "incomplete_download".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail,
+        }
+    }
     fn timed_out() -> PlayError {
         PlayError {
             status: 504,
@@ -45,6 +64,10 @@ impl PlayError {
             detail: format!("yt-dlp exceeded {DOWNLOAD_TIMEOUT_SECS}s"),
         }
     }
+}
+
+async fn file_len(p: &Path) -> u64 {
+    tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0)
 }
 
 /// Map a yt-dlp failure to an HTTP status + short reason (the cause is in stderr; match the common
@@ -323,21 +346,47 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         //
         // So: give the pipe a moment to close on its own — which is what stock yt-dlp does, and
         // keeps stderr intact — and only force it if something is genuinely holding on.
+        let mut killed_mid_write = false;
         let stderr = match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain).await {
             Ok(r) => r.unwrap_or_default(),
             Err(_) => {
-                eprintln!("yt-dlp {vid}: stderr still held after exit; killing the group");
+                // Something is holding the inherited pipe. Whether that matters depends on what it
+                // is doing: a descendant still producing the OUTPUT must not be killed and its
+                // half-file published, while one merely holding the pipe is harmless and its
+                // download is complete. Sampling the size across a moment answers exactly that,
+                // and only costs anything on this abnormal path.
+                let before = file_len(tmp).await;
+                tokio::time::sleep(WRITE_PROBE).await;
+                killed_mid_write = file_len(tmp).await != before;
+                eprintln!(
+                    "yt-dlp {vid}: stderr still held after exit; killing the group                      (output {})",
+                    if killed_mid_write { "still growing" } else { "settled" }
+                );
                 kill_group(pgid);
                 drain.await.unwrap_or_default()
             }
         };
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
-        if status.success() && wrote {
-            Ok(())
-        } else {
-            Err(classify(status.code(), &stderr))
+        if !status.success() {
+            return Err(classify(status.code(), &stderr));
         }
+        // Exit 0 is yt-dlp's verdict on the EXTRACTION; whether we have a usable file is ours, and
+        // `len > 0` was the only thing between a SIGKILLed writer and a truncated MP4 renamed into
+        // the cache — where it is served `immutable` for a year and never re-fetched, because a
+        // cached file of any size counts as a hit. A forced kill means something was still writing
+        // when the grace expired, so the file cannot be trusted: fail, and let the next request
+        // fetch it properly. Neither case is an extractor failure, so neither moves /health.
+        if killed_mid_write {
+            return Err(PlayError::incomplete(format!(
+                "output still growing {}s after exit; killed mid-write",
+                STDERR_DRAIN_GRACE.as_secs()
+            )));
+        }
+        if !wrote {
+            return Err(PlayError::incomplete("yt-dlp exited 0 with no output file".into()));
+        }
+        Ok(())
     };
     // Dropping the future kills yt-dlp; `guard` kills whatever it forked.
     let guard = GroupGuard(group.clone());

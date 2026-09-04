@@ -2433,3 +2433,55 @@ async fn an_error_written_after_exit_is_still_captured() {
         "a late ERROR line was lost, so a private video read as a broken extractor: {err:?}"
     );
 }
+
+/// A descendant still writing the output when the grace expires gets SIGKILLed mid-write. Publishing
+/// what is on disk then caches a truncated MP4 permanently — served `immutable` for a year, and
+/// never re-fetched, because any cached file with len > 0 counts as a hit.
+#[tokio::test]
+async fn a_download_killed_mid_write_is_not_published() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-writer-outlives");
+    // Exit 0, leaving a descendant that holds stderr AND keeps appending to the output.
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+         head -c 1000 /dev/zero > \"$out\"\n\
+         (i=0; while [ $i -lt 200 ]; do head -c 1000 /dev/zero >> \"$out\"; sleep 0.1; i=$((i+1)); done) &\n\
+         exit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("a half-written file must not be reported as a download");
+
+    assert_eq!(err.reason, "incomplete_download", "a truncated file was published: {err:?}");
+}
+
+/// yt-dlp exiting 0 with no file is a LOCAL failure — a grace kill, a full disk, a bad output path
+/// — never the extractor's verdict. Routing it through classify() produced a bare
+/// `extraction_failed`, and three of those flip /health to `extractor_unavailable`, telling the
+/// operator to bump yt-dlp for something yt-dlp did not do.
+#[tokio::test]
+async fn exit_zero_with_no_file_is_not_blamed_on_the_extractor() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-writes-nothing");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("no output file is a failure");
+
+    assert_ne!(
+        err.reason, "extraction_failed",
+        "a local failure was charged to the extractor's health signal: {err:?}"
+    );
+}
