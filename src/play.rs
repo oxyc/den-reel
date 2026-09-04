@@ -333,6 +333,25 @@ pub fn demote_known_dead(state: &AppState, ids: &mut [String]) {
     ids.sort_by_key(|id| map.get(id).is_some_and(|(_, exp)| *exp > now));
 }
 
+/// Drop a FINISHED download from the in-flight map, so the next `fetch_trailer` starts a new one
+/// instead of being handed the old one's answer.
+///
+/// The evicted-mid-serve retry could not work without this. The driver task clears the entry only
+/// after its own `await` returns, and every waiter wakes on that same completion — so a request that
+/// re-entered on the driver's heels joined the still-present entry, got the same already-resolved
+/// future, was handed the same path that had just been evicted from under it, and fell through to a
+/// 500. The one retry in the serve path was dead code in exactly the case it exists for.
+///
+/// `peek` is what makes this safe to do unconditionally: it is `Some` only once the shared future
+/// has produced a value, so a download that is genuinely still running is never disturbed and
+/// concurrent callers keep de-duplicating onto it.
+fn drop_if_finished(state: &AppState, vid: &str) {
+    let mut map = state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(vid).is_some_and(|(_, shared)| shared.peek().is_some()) {
+        map.remove(vid);
+    }
+}
+
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
 pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
@@ -569,7 +588,12 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
         match fetch_trailer(state.clone(), vid.clone()).await {
             Ok(fp) => match serve_file(range.as_deref(), &fp, &vid).await {
                 Ok(resp) => return resp,
-                Err(()) if attempt == 0 => continue, // evicted mid-serve — retry a fresh fetch
+                // Evicted between fetch and open. Retire the finished entry first, or the retry
+                // joins it and is handed the very path that just vanished.
+                Err(()) if attempt == 0 => {
+                    drop_if_finished(&state, &vid);
+                    continue;
+                }
                 Err(()) => break,
             },
             Err(e) => {

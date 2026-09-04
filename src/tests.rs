@@ -2906,6 +2906,55 @@ async fn a_failed_publish_is_local_and_visible() {
     );
 }
 
+/// The retry for "the file was evicted between fetch and open" could not do anything. The driver
+/// task clears the in-flight entry only after its own await returns, and every waiter wakes on that
+/// same completion — so the retry re-entered, joined the still-present entry, got the same
+/// already-resolved future, was handed the same vanished path, and returned 500. Dead code in
+/// exactly the case it exists for.
+///
+/// Driven by planting a resolved entry pointing at a path that does not exist, which is precisely
+/// what the losing side of that race observes.
+#[tokio::test]
+async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
+    use futures_util::FutureExt;
+
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // A finished download whose file is gone: exactly what the retry is supposed to recover from.
+    let gone = dir.join("evictedvid1.mp4");
+    assert!(!gone.exists(), "the point is that this file is not there");
+    let fut: crate::state::BoxFuture<Result<PathBuf, crate::ytdlp::PlayError>> =
+        Box::pin(async move { Ok(gone) });
+    let shared = fut.shared();
+    let _ = shared.clone().await; // resolve it, so it is a COMPLETED entry
+    state
+        .in_flight
+        .lock()
+        .unwrap()
+        .insert("evictedvid1".to_string(), (0, shared));
+
+    let resp = crate::play::handle_play(state.clone(), &hyper::HeaderMap::new(), "evictedvid1".into()).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "the retry joined the finished download again instead of starting a fresh one"
+    );
+    assert!(dir.join("evictedvid1.mp4").exists(), "the retry never actually re-downloaded");
+}
+
 /// A `/play` verdict was the one thing this service learned and then immediately forgot: the
 /// in-flight entry is cleared however a download ends, so the next request for a video YouTube has
 /// REMOVED spent another of three download permits, and another yt-dlp process, to rediscover it.
