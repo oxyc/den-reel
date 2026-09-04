@@ -212,6 +212,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "blake2",
  "bytes",
  "crypto_box",
  "futures-util",
@@ -222,6 +223,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tokio-util",
 ]

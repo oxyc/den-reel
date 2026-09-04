@@ -45,6 +45,7 @@ GET /manifest.json                       →  manifest with no config (uses the 
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
+     …both take ?s=<tag> when REEL_PLAY_SECRET is set (403 without); one tag opens both
 GET /health                               →  200 {status} — ok, or degraded (see below)
 ```
 
@@ -141,6 +142,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 |---|---|---|
 | `REEL_CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key. Set it and `/configure` seals a BYOK TMDB key into the install URL (`crypto_box_seal`) so no discovery key lives on the server. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
 | `REEL_CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting) |
+| `REEL_PLAY_SECRET` | — | sign the play URLs. Set it and `/meta` emits `…/play/<id>.mp4?s=<tag>` (keyed BLAKE2b over the id), which `/play` **and** `/crop` then require. Without it those two endpoints will extract and cache any YouTube id anyone asks for, which matters the moment the instance is reachable off-LAN. **Unset by default and it must stay that way on an existing install until its clients have re-fetched `/meta`** — those responses carry `max-age=604800`, so turning this on strands unsigned URLs for up to 7 days. Any string; rotating it invalidates outstanding URLs. |
 | `TMDB_KEY` | — | **migration fallback** only: the legacy server-side discovery key, used when a request carries no per-install config. New installs seal their own key; drop this once migrated. |
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
