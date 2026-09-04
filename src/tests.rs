@@ -3131,6 +3131,31 @@ async fn a_removed_video_is_not_re_extracted_on_every_request() {
     assert_eq!(spawn_count(&spawns), 2, "the failure never expired");
 }
 
+/// A /play failure says when it is worth asking again, and the number is not a guess: it is exactly
+/// how long the failure cache will answer this id from memory, so a client that retries sooner gets
+/// the same response with no extraction behind it.
+#[tokio::test]
+async fn a_play_failure_says_when_to_come_back() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-gone");
+    std::fs::write(&yt, "#!/bin/sh\necho 'ERROR: Video unavailable' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir);
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let r = reqwest::get(format!("{base}/play/goneVideo01.mp4")).await.unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(
+        r.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        Some((crate::play::fail_ttl_ms("unavailable") / 1000).to_string().as_str()),
+        "the client was told nothing about when a retry could possibly help"
+    );
+}
+
 /// The TTL has to follow the REASON. One uniform value is wrong in both directions: short enough
 /// not to pin a slow network as a dead trailer means re-extracting a removed video all afternoon;
 /// long enough to stop that means a timeout during one bad minute costs the trailer for hours.
