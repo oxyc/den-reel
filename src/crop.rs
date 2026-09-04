@@ -89,7 +89,8 @@ pub struct CropReport {
 
 impl CropReport {
     /// "Couldn't determine — just play it": returned when the file isn't available or ffmpeg fails.
-    /// Not cached, so a later call retries.
+    /// Never cached as an ANSWER (no client stores it, and `crop_cache` only ever holds real rects);
+    /// the id is parked in `crop_unknown` for a few minutes so the ffmpeg pass isn't re-run per call.
     fn unknown(id: &str) -> CropReport {
         CropReport { id: id.to_string(), source: None, content: None, letterboxed: false, aspect: None }
     }
@@ -468,6 +469,28 @@ pub fn cache_report(state: &Arc<AppState>, id: &str, report: CropReport) {
     c.insert(id.to_string(), report);
 }
 
+/// Did a recent cropdetect over this id already come back with nothing parsable?
+fn unknown_is_fresh(state: &Arc<AppState>, id: &str) -> bool {
+    let now = (state.clock)();
+    let m = state.crop_unknown.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(id).is_some_and(|exp| *exp > now)
+}
+
+/// Remember that it did, so the next call answers "just play it" without another whole-file pass.
+/// Bounded and cleared wholesale like `cache_report` above, and for the same reason: every entry is
+/// an optimisation, and losing one costs a single recomputation.
+fn record_unknown(state: &Arc<AppState>, id: &str) {
+    let now = (state.clock)();
+    let mut m = state.crop_unknown.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= crate::CROP_UNKNOWN_MAX {
+        m.retain(|_, exp| *exp > now);
+        if m.len() >= crate::CROP_UNKNOWN_MAX {
+            m.clear();
+        }
+    }
+    m.insert(id.to_string(), now + crate::CROP_UNKNOWN_TTL_MS);
+}
+
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     if !crate::play::cache_available(&state.cfg).await {
         return httputil::error(
@@ -492,6 +515,10 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
                 // searches — is capped, and this is a whole-file ffmpeg pass per request with no
                 // negative cache behind it, so a trailer that yields no parsable box re-runs it on
                 // every call, at any concurrency. Shares the probe budget: same weight, same purpose.
+                // ...and the permit was only half the fix. A permit bounds how many of these run at
+                // once; it does not stop the same unreadable trailer paying for a whole-file ffmpeg
+                // pass on every single call. Remember the nothing, briefly.
+                None if unknown_is_fresh(&state, &id) => CropReport::unknown(&id),
                 None => {
                     let detected = {
                         let _permit = state.probe_sem.acquire().await;
@@ -502,7 +529,10 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
                             cache_report(&state, &id, r.clone());
                             r
                         }
-                        None => CropReport::unknown(&id),
+                        None => {
+                            record_unknown(&state, &id);
+                            CropReport::unknown(&id)
+                        }
                     }
                 }
             }

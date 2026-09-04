@@ -67,6 +67,12 @@ pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the sam
 // on its own, and losing one costs exactly one repeated download. A homelab sees a few hundred
 // distinct trailers, so 512 covers the working set without reserving memory for a library.
 pub const PLAY_FAIL_MAX: usize = 512;
+// Same shape, same reasoning, for the ids cropdetect could not read. A vid and a timestamp each.
+pub const CROP_UNKNOWN_MAX: usize = 512;
+// How long an unreadable crop stands before ffmpeg is spent on it again. The cached MP4 is immutable,
+// so a second pass over the same bytes usually reaches the same nothing — but the other way to land
+// here is a cropdetect that timed out under load, and that deserves another go before long.
+pub const CROP_UNKNOWN_TTL_MS: u64 = 10 * 60 * 1000;
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
 const _: () = assert!(
     PREWARM_MAX < DOWNLOAD_CONCURRENCY,
