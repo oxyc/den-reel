@@ -196,6 +196,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         ytdlp_extractor_args: Some("youtube:player_client=tv_embedded".into()),
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
+        cache_ok_until: std::sync::atomic::AtomicU64::new(0),
     }
 }
 
@@ -1009,6 +1010,12 @@ async fn cache_available_reflects_dir_usability() {
     cfg_bad.cache_dir = file.join("cache");
     cfg_bad.ytdlp_cache = cfg_bad.cache_dir.join("yt-dlp");
     assert!(!crate::play::cache_available(&cfg_bad).await, "cache under a file is unusable");
+
+    // A positive answer is memoised for a few seconds — `tokio::fs` is spawn_blocking underneath, so
+    // asking per request cost two dispatches to the blocking pool ahead of every cache hit. A
+    // FAILURE is never memoised, or a volume coming back would have to wait out a TTL first.
+    assert!(!crate::play::cache_available(&cfg_bad).await, "a failure was remembered as an answer");
+    assert!(crate::play::cache_available(&cfg_ok).await, "a working volume must still be usable");
 }
 
 #[test]
@@ -2260,6 +2267,18 @@ fn a_parked_resolve_cache_keeps_answers_and_drops_cooldowns() {
     map.insert("tt3:en".into(), crate::state::YtEntry { ids: vec![], exp: now - 1, confirmed: now - 1 });
     // A live "this title really has no trailer", which is worth keeping.
     map.insert("tt4:en".into(), crate::state::YtEntry { ids: vec![], exp: now + 60_000, confirmed: now - 1 });
+    // A `confirmed` that did not come from our clock. Everything downstream ADDS to this value
+    // without checking — the /meta staleness test, and the substitution path on top of that — which
+    // was only ever safe because it could not come from anywhere but a clock reading. Both kinds of
+    // entry, because the empty ones are read by that same staleness test.
+    map.insert(
+        "tt5:en".into(),
+        crate::state::YtEntry { ids: vec!["overflowVid".into()], exp: now + 999, confirmed: u64::MAX - 10 },
+    );
+    map.insert(
+        "tt6:en".into(),
+        crate::state::YtEntry { ids: vec![], exp: now + 60_000, confirmed: u64::MAX - 10 },
+    );
 
     std::fs::create_dir_all(cfg.resolve_cache.parent().unwrap()).unwrap();
     std::fs::write(&cfg.resolve_cache, serde_json::to_vec(&map).unwrap()).unwrap();
@@ -2278,6 +2297,8 @@ fn a_parked_resolve_cache_keeps_answers_and_drops_cooldowns() {
     assert!(!back.contains_key("tt2:en"), "an answer past its confirmation window came back");
     assert!(!back.contains_key("tt3:en"), "a 60-second cooldown came back as a day of 'no trailer'");
     assert!(back.contains_key("tt4:en"), "a live negative answer was dropped, so every browse re-asks");
+    assert!(!back.contains_key("tt5:en"), "a populated entry confirmed in the future was restored");
+    assert!(!back.contains_key("tt6:en"), "an empty entry confirmed in the future was restored");
 }
 
 /// ...and the round trip actually works, through the paths production uses.
@@ -2291,9 +2312,18 @@ fn the_resolve_cache_survives_a_restart() {
         crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
     );
 
-    crate::state::save_resolve_cache(&state);
-    let back = crate::state::load_resolve_cache(&state.cfg, now);
+    // Already dead when we shut down: bytes to write, bytes to read back, and an entry to parse and
+    // immediately discard. It should not reach the file at all.
+    state.yt_cache.lock().unwrap().insert(
+        "tt0000001:en".into(),
+        crate::state::YtEntry { ids: vec![], exp: now.saturating_sub(1), confirmed: now.saturating_sub(1) },
+    );
 
+    crate::state::save_resolve_cache(&state);
+    let raw = std::fs::read_to_string(&state.cfg.resolve_cache).unwrap();
+    assert!(!raw.contains("tt0000001:en"), "an already-expired entry was parked to disk");
+
+    let back = crate::state::load_resolve_cache(&state.cfg, now);
     assert_eq!(
         back.get("tt0111161:en").map(|e| e.ids.clone()),
         Some(vec!["goodTrailer".to_string()]),
