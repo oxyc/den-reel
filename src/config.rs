@@ -26,9 +26,8 @@ pub struct Config {
     pub max_height: String,
     pub cache_max_bytes: u64,
     /// Last-access TTL: a cached trailer not served within this window is evicted regardless of the
-    /// size cap. A serve bumps atime whenever it is more than `TOUCH_MIN_AGE` stale, so a rewatched
-    /// trailer keeps a timestamp within a minute of its last play and survives; only genuinely-stale
-    /// ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
+    /// size cap. atime is bumped on every serve, so a rewatched trailer keeps a fresh timestamp and
+    /// survives; only genuinely-stale ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
     pub cache_ttl: Duration,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,
@@ -76,10 +75,15 @@ pub struct Config {
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
-    /// Until when `play::cache_available` may answer "yes" without touching the disk again (ms since
-    /// epoch, 0 = never asked). It memoises an answer about THIS config's volume, which is why it
-    /// lives here rather than in a static.
+    /// Until when `play::cache_available` may answer "yes" without touching the disk again
+    /// (monotonic ms, 0 = never asked). It memoises an answer about THIS config's volume, which is
+    /// why it lives here rather than in a static.
     pub cache_ok_until: std::sync::atomic::AtomicU64,
+    /// Bumped every time something observes the volume misbehaving. A probe reads it before starting
+    /// and refuses to publish its verdict if it changed while it was in flight — the probe's awaits
+    /// yield the runtime thread, so a download can fail and invalidate the memo in the middle of one,
+    /// and a blind store would then re-arm from an answer taken before the failure existed.
+    pub cache_epoch: std::sync::atomic::AtomicU64,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -188,6 +192,7 @@ impl Config {
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
             cache_ok_until: std::sync::atomic::AtomicU64::new(0),
+            cache_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
