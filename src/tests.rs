@@ -197,6 +197,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
         cache_ok_until: std::sync::atomic::AtomicU64::new(0),
+        cache_epoch: std::sync::atomic::AtomicU64::new(0),
     }
 }
 
@@ -3385,6 +3386,36 @@ async fn meta_demotes_and_stops_prewarming_a_candidate_play_found_dead() {
         vec!["liveSecond1".to_string()],
         "a prewarm permit was spent on a candidate already known to be dead"
     );
+}
+
+/// ...but only when the demotion actually moved something. A list already in the right order — a
+/// live candidate ahead of a dead one — produces the same body the untouched path would, and
+/// shortening its life to an hour makes every client re-ask 168 times more often for an answer that
+/// cannot have changed.
+#[tokio::test]
+async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
+    let fake = FakeUpstream::new(&["liveFirst01", "deadSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "This trailer is no longer available.".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadSecond1", &gone);
+
+    let base = spawn_server(state).await;
+    let resp = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=604800, stale-while-revalidate=86400"),
+        "a response the demotion never touched lost six days of cacheability"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert!(links[0]["trailers"].as_str().unwrap().ends_with("/play/liveFirst01.mp4"));
+    assert!(links[1]["trailers"].as_str().unwrap().ends_with("/play/deadSecond1.mp4"));
 }
 
 /// A directory at a published trailer's path is served by nothing (the cache-hit check rejects it)

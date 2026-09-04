@@ -65,15 +65,21 @@ fn monotonic_ms() -> u64 {
 /// would let one test's verdict about its own temp directory answer another test's question about a
 /// different one.
 pub async fn cache_available(cfg: &Config) -> bool {
-    let now = monotonic_ms();
-    if now < cfg.cache_ok_until.load(Ordering::Relaxed) {
+    if monotonic_ms() < cfg.cache_ok_until.load(Ordering::Relaxed) {
         return true;
     }
+    // Read the epoch BEFORE probing. Both calls below are `spawn_blocking` underneath, so each
+    // yields the single runtime thread — long enough for a download to fail, conclude the volume is
+    // gone and invalidate the memo. Publishing a verdict formed before that failure existed would
+    // re-arm the memo for five seconds and reopen exactly the window the invalidation closes.
+    let epoch = cfg.cache_epoch.load(Ordering::Relaxed);
     let ok = tokio::fs::create_dir_all(&cfg.cache_dir).await.is_ok()
         && tokio::fs::create_dir_all(&cfg.ytdlp_cache).await.is_ok();
     // A failure stores nothing, so it is not remembered and the next request asks again.
-    if ok {
-        cfg.cache_ok_until.store(now + CACHE_OK_TTL_MS, Ordering::Relaxed);
+    // The deadline is measured from AFTER the probe, not before it: a slow mount could otherwise
+    // return an already-expired deadline, and the memo would never take effect at all.
+    if ok && cfg.cache_epoch.load(Ordering::Relaxed) == epoch {
+        cfg.cache_ok_until.store(monotonic_ms() + CACHE_OK_TTL_MS, Ordering::Relaxed);
     }
     ok
 }
@@ -87,28 +93,11 @@ pub async fn cache_available(cfg: &Config) -> bool {
 /// operator to bump yt-dlp over a disk that went away. That mis-routing is the exact thing the
 /// local/extraction split exists to prevent. One observed local failure now costs one request.
 pub(crate) fn invalidate_cache_availability(cfg: &Config) {
+    // Epoch first, then the deadline. A probe suspended in its awaits checks the epoch before
+    // publishing, so bumping it is what stops that probe from undoing this.
+    cfg.cache_epoch.fetch_add(1, Ordering::Relaxed);
     cfg.cache_ok_until.store(0, Ordering::Relaxed);
 }
-
-/// Don't re-stamp a cached file's atime more often than this.
-///
-/// A minute, not the hour the TTL alone would justify — because the TTL is not the only thing
-/// reading this timestamp. `evict_if_needed`'s SIZE-CAP pass sorts by atime and removes oldest
-/// first, and that sort is only meaningful if a file being served right now is stamped more recently
-/// than one that was merely downloaded. The OS will not do it for us: under `relatime` a read does
-/// not refresh atime at all, so this touch is the entire signal.
-///
-/// At an hour the ordering inverted. A trailer streaming since T+3min kept its download-time stamp
-/// while speculative prewarms landing at T+10min got fresher ones, so the next eviction took the
-/// file the viewer was watching and left the idle ones — and the next range request re-downloaded it
-/// mid-playback, under a download permit. A minute is short against anything that creates competing
-/// files and long against AVPlayer's ranging, which is what the gate is here to thin out.
-const TOUCH_MIN_AGE: Duration = Duration::from_secs(60);
-const _: () = assert!(
-    TOUCH_MIN_AGE.as_secs() <= 60,
-    "atime has to stay fresher than the gap between competing downloads, or the size-cap sort \
-     evicts the trailer that is playing"
-);
 
 /// Bump a cached file's atime so the LRU eviction sees it as recently used. Fire-and-forget so the
 /// hot serve path isn't slowed; a rare eviction/serve race is handled by the open-miss refetch in
@@ -275,9 +264,8 @@ pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
         Err(_) => return None,
     }
     // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
-    // bumped when a serve finds it more than TOUCH_MIN_AGE stale (touch_atime), so a rewatched trailer
-    // keeps a timestamp within a minute of its last play and survives; only genuinely-stale ones age
-    // out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
+    // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
+    // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
     if !cfg.cache_ttl.is_zero() {
         if let Some(cutoff) = SystemTime::now().checked_sub(cfg.cache_ttl) {
             files.retain(|(p, _size, atime)| {
@@ -421,9 +409,14 @@ fn clear_failure(state: &AppState, vid: &str) {
 /// take it again to ask a second question about the same map.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Demotion {
-    /// Any candidate in the list is currently known unplayable — so this response's ORDER reflects
-    /// a signal whose shortest life is 60 seconds, and must not be cached for a week.
-    pub any_dead: bool,
+    /// The sort actually MOVED something — so this response's order reflects a signal whose
+    /// shortest life is 60 seconds, and must not be cached for a week.
+    ///
+    /// Not merely "something is dead". A list that is already in the right order — a live candidate
+    /// ahead of a dead one — produces a body byte-for-byte identical to the one the untouched path
+    /// would emit, and downgrading that to `max-age=3600` makes every client re-ask 168 times more
+    /// often for an answer that cannot have changed.
+    pub reordered: bool,
     /// The candidate the client will play first is itself dead, which after the sort means they all
     /// are. Nothing here is worth a speculative download.
     pub head_dead: bool,
@@ -453,11 +446,17 @@ pub fn demote_known_dead(state: &AppState, ids: &mut [String]) -> Demotion {
     }
     let now = (state.clock)();
     let is_dead = |id: &str| map.get(id).is_some_and(|(_, exp)| *exp > now);
-    if !ids.iter().any(|id| is_dead(id)) {
+    let Some(first_dead) = ids.iter().position(|id| is_dead(id)) else {
         return Demotion::default();
+    };
+    // Would the stable sort actually move anything? Only if a live candidate sits behind a dead one.
+    // Everything already in order comes out identical, and saying otherwise costs the response six
+    // days of cacheability for nothing.
+    let reordered = ids[first_dead..].iter().any(|id| !is_dead(id));
+    if reordered {
+        ids.sort_by_key(|id| is_dead(id));
     }
-    ids.sort_by_key(|id| is_dead(id));
-    Demotion { any_dead: true, head_dead: is_dead(&ids[0]) }
+    Demotion { reordered, head_dead: is_dead(&ids[0]) }
 }
 
 /// Drop a FINISHED download from the in-flight map, so the next `fetch_trailer` starts a new one
@@ -500,15 +499,24 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         // is_file, not just non-empty: a directory reports a non-zero length, so anything that left
         // one at a trailer's path was served as a cache hit that serve_file could then never open.
         if md.is_file() && md.len() > 0 {
-            // Only when the timestamp is actually stale. The LRU this feeds has a day-scale TTL, so
-            // re-stamping a file that was touched seconds ago changes no decision — and it is not
-            // free: it is a blocking-pool dispatch plus an open/set_times/close. One playback is
-            // many /play requests (AVPlayer opens with a range and then keeps ranging), so this was
-            // paid several times per trailer watched, to write a value nothing reads at that
-            // resolution. The `md` in hand already carries the answer.
-            if md.accessed().map(|a| a.elapsed().map(|d| d > TOUCH_MIN_AGE).unwrap_or(true)).unwrap_or(true) {
-                touch_atime(fp.clone());
-            }
+            // Unconditionally, and that is load-bearing rather than lazy.
+            //
+            // This touch is the ONLY thing that makes atime mean "recently served" — under relatime
+            // a read does not refresh it — and `evict_if_needed`'s size-cap pass sorts on exactly
+            // that field, oldest first, after every completed download. Stamping `now` on every
+            // request is what makes the file currently streaming the freshest thing on the volume,
+            // and therefore structurally the last candidate for eviction.
+            //
+            // Two attempts to skip it when the stamp was "recent enough" both broke that. The gate
+            // reads "touch only if atime is ALREADY stale", so a trailer downloaded at T and played
+            // at T+5s is never touched at all: it keeps its download-time stamp while prewarms
+            // landing behind it get fresher ones, and the next eviction takes the one being watched.
+            // Any non-zero threshold admits that; the threshold only sets how much traffic it takes.
+            //
+            // It costs a blocking-pool dispatch per request. Removing that cost belongs with the
+            // deferred serve-path work in TASKS.md — one spawn_blocking doing open + fstat +
+            // set_times — not with a rule about when the timestamp may be skipped.
+            touch_atime(fp.clone());
             return Ok(fp);
         }
     }

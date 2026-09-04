@@ -344,7 +344,7 @@ pub async fn handle_meta(
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
-    let extra: &[(&str, &str)] = if has_link && (resolved.stale || demotion.any_dead) {
+    let extra: &[(&str, &str)] = if has_link && (resolved.stale || demotion.reordered) {
         // Two ways to get here, one reason. A last-known-good answer standing in for a lookup we
         // could not make: the server stops trusting it after a day, so pinning it in every client
         // for a week outlives that by six.
