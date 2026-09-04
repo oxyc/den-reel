@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -231,15 +232,22 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     // thing into memory and `from_slice` materialises the whole map, so by the time anything is
     // counted the memory has already been spent.
     //
-    // Sized against what this process can actually write, worked out rather than guessed, because a
-    // cap below that ceiling does not protect anything — it just makes every boot discard the whole
-    // parked cache, permanently, since each shutdown rewrites the same oversized file.
+    // Sized against what this process can actually write, because a cap below that ceiling does not
+    // protect anything — it just makes every boot discard the whole parked cache, permanently, since
+    // each shutdown rewrites the same oversized file.
     //
-    // Worst case at YT_CACHE_MAX: a bounded imdb id (13) plus the longest namespace suffix
-    // (`:en:nokey:nokc`) is a ~30-byte key, and MAX_PROBE ids at 13 bytes each plus two timestamps
-    // is ~140 bytes of body — call it 170 a piece, so ~1.7 MB full. 4 MB is twice that and still far
-    // under what would matter at boot.
-    const MAX_RESOLVE_FILE: u64 = 4 * 1024 * 1024;
+    // Worst case at YT_CACHE_MAX: a bounded imdb id plus the longest namespace suffix
+    // (`:en:nokey:nokc`) is a ~27-byte key, and MAX_PROBE ids at 11 characters plus two timestamps
+    // is ~140 bytes of body — ~169 a piece, so ~1.61 MB when completely full. Two megabytes clears
+    // that by a fifth.
+    //
+    // Not more than that. The cap is the ONLY bound on what boot will materialise — `from_slice`
+    // builds the whole map before any entry count can be applied — and a file this process did not
+    // write can be all minimum-size entries, which JSON expands roughly threefold into the map. So
+    // every byte of slack here is about eight bytes of peak RSS at startup, on a box measured in
+    // single-digit megabytes. Bounding the imdb id is what made a tight cap safe; spending that
+    // safety on headroom nothing needs would be a poor trade.
+    const MAX_RESOLVE_FILE: u64 = 2 * 1024 * 1024;
     match std::fs::metadata(&cfg.resolve_cache) {
         Ok(md) if md.len() > MAX_RESOLVE_FILE => {
             eprintln!(
@@ -331,15 +339,25 @@ pub fn save_resolve_cache(state: &AppState) {
             }
         })
         .collect();
-    let Ok(bytes) = serde_json::to_vec(&live) else { return };
     let n = live.len();
-    drop(live);
-    drop(cache);
     // Write-then-rename, so a kill mid-write cannot leave a half-file that the next boot has to
     // parse. The temp lives in the same directory, which is what makes the rename atomic.
     let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    // Streamed through a BufWriter rather than serialised into a Vec and handed to `fs::write`.
+    // That Vec was the whole document in memory — ~1.6 MB at capacity, and more during its final
+    // doubling, with the old and new buffers briefly both alive — arriving at exactly the moment a
+    // redeploy has the incoming process booting alongside this one. This costs a buffer.
+    let written = (|| -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut w, &live).map_err(std::io::Error::other)?;
+        w.flush()
+    })();
+    drop(live);
+    drop(cache);
+    if let Err(e) = written {
         eprintln!("resolve cache: {e}");
+        let _ = std::fs::remove_file(&tmp); // never leave a half-written temp for the next boot
         return;
     }
     match std::fs::rename(&tmp, path) {

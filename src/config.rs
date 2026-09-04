@@ -26,8 +26,9 @@ pub struct Config {
     pub max_height: String,
     pub cache_max_bytes: u64,
     /// Last-access TTL: a cached trailer not served within this window is evicted regardless of the
-    /// size cap. atime is bumped on every serve, so a rewatched trailer keeps a fresh timestamp and
-    /// survives; only genuinely-stale ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
+    /// size cap. A serve bumps atime whenever it is more than `TOUCH_MIN_AGE` stale, so a rewatched
+    /// trailer keeps a timestamp within a minute of its last play and survives; only genuinely-stale
+    /// ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
     pub cache_ttl: Duration,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,

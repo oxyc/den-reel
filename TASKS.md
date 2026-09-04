@@ -135,10 +135,13 @@ changes its contract for `/crop` (which wants the path, not the handle) and for 
 After the `touch_atime` gate landed, this is the largest remaining cost on the hot path, and it is
 now bigger than everything the `cache_available` memo saved.
 
-**Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold or shutdown path,
-and the code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms`
-then re-locks to fetch; `sign::key_of` re-derives the MAC key per id and per secret (default-off);
-`save_resolve_cache` builds a borrowed map and a full `Vec<u8>` rather than streaming into a writer.
+**Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold path, and the
+code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms` then
+re-locks to fetch; `sign::key_of` re-derives the MAC key per id and per secret (default-off).
+
+An earlier version of this note also filed `save_resolve_cache`'s `to_vec` here. That was a
+mis-triage — it was a multi-megabyte transient allocation at shutdown, not a nanosecond cost, and it
+landed exactly when a redeploy has two processes alive. It now streams through a `BufWriter`.
 
 ## ACCEPTED RISK — `/stats` is served without a gate
 
