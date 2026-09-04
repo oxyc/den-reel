@@ -1,5 +1,20 @@
 # den-reel — audited task list
 
+## Audit status (2026-09-04)
+
+Five review rounds ran, two independent auditors each. Round 6 was launched and **stopped before it
+reported**, so this changeset has had five rounds, not six. Counting only correctness defects and
+hot-path regressions — nits excluded — the rounds found 5, 2, 4, 3 and 3. The loop never hit its
+"two consecutive rounds under two findings" exit.
+
+The reason it did not converge is worth knowing: after round 1, almost every finding was a defect in
+the *previous round's fix*, not in the original work. The `touch_atime` optimisation was wrong twice
+in a row — the second time wrong in kind, not degree — and ended up reverted to the behaviour that
+was already in the repo. Treat anything below dated later than round 3 as less settled than the rest.
+
+What is still open is in the three sections marked STILL OPEN and ACCEPTED RISK.
+
+
 Every item below survived an adversarial audit against the source. File:line anchors are from
 `c89b4a4` (v0.5.0). Items are ordered by value-for-effort, not by dependency — but T3 and T4 share a
 mechanism, and T5's two halves compose, so keep those adjacent.
