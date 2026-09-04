@@ -599,12 +599,18 @@ async fn serve_file(range: Option<&str>, fp: &Path, vid: &str) -> Result<Respons
 }
 
 /// Typed /play failure body (geo_blocked 451 / restricted 403 / unavailable 404 / 502).
+///
+/// Carries `Retry-After`, and it is not a guess: it is exactly how long the failure cache will keep
+/// answering this id from memory. A client that retries sooner gets this same response without an
+/// extraction happening, so telling it the real number is both honest and the thing that stops a
+/// player from hammering a dead trailer.
 fn play_error(vid: &str, e: &PlayError) -> Response<Body> {
     let body = serde_json::json!({ "error": e.reason, "message": e.message, "id": vid });
+    let retry_after = (fail_ttl_ms(&e.reason) / 1000).to_string();
     httputil::json(
         StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY),
         &body,
-        &[],
+        &[("retry-after", &retry_after)],
     )
 }
 
