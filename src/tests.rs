@@ -1393,6 +1393,46 @@ fn a_traversing_id_from_upstream_is_not_a_candidate() {
     );
 }
 
+/// The imdb id becomes an upstream request path AND part of a resolve cache key that is written to
+/// disk at shutdown. Unbounded, a caller could park a 60-digit id in that key and push the file past
+/// the size the loader will read — which does not fail loudly, it just discards the whole parked
+/// cache on every boot from then on, because each shutdown rewrites the same oversized file. /meta
+/// has no gate in front of it.
+#[tokio::test]
+async fn an_imdb_id_is_bounded_before_it_reaches_a_cache_key() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    let base = spawn_server(state.clone()).await;
+
+    let huge = format!("tt{}", "1".repeat(60));
+    let body: serde_json::Value = reqwest::get(format!("{base}/meta/movie/{huge}.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        body["meta"]["links"].as_array().is_some_and(|a| a.is_empty()),
+        "an unbounded id was resolved rather than rejected"
+    );
+    assert_eq!(fake.calls(), 0, "an unbounded id reached the upstream");
+    assert!(
+        state.yt_cache.lock().unwrap().is_empty(),
+        "an unbounded id reached the resolve cache, and from there the file parked at shutdown"
+    );
+
+    // A real one, and a plausibly longer future one, still work.
+    for ok in ["tt0111161", "tt10000000"] {
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/meta/movie/{ok}.json")).await.unwrap().json().await.unwrap();
+        assert!(
+            body["meta"]["links"].as_array().is_some_and(|a| !a.is_empty()),
+            "{ok} was rejected, but it is a real shape"
+        );
+    }
+}
+
 /// A YouTube video id is a base64url-encoded 64-bit value: exactly 11 characters, and it has been
 /// for the life of the service. This gate is the only check standing in front of /play and /crop,
 /// both of which spend a download permit and a yt-dlp process on whatever they are handed, and it is
@@ -2328,6 +2368,42 @@ fn the_resolve_cache_survives_a_restart() {
         back.get("tt0111161:en").map(|e| e.ids.clone()),
         Some(vec!["goodTrailer".to_string()]),
         "the parked cache did not come back"
+    );
+}
+
+/// The saver has to ask "is this still live?" the same way the loader does, and `exp` alone is not
+/// that question for a populated entry. The stale-substitution path rewrites `exp` to a 60-second
+/// retry cooldown while leaving good ids and their original `confirmed` in place — so a save
+/// filtered on `exp` dropped exactly the entries the loader goes out of its way to rescue. A TMDB
+/// blip followed by a redeploy a minute later wiped the answers the blip had been leaning on, which
+/// is this file's whole purpose, failing during an outage.
+///
+/// The other two persistence tests cannot see this seam: one writes its JSON straight to disk and
+/// never calls the saver, the other saves an entry whose `exp` is fresh.
+#[test]
+fn a_stand_in_answer_survives_being_parked() {
+    let dir = temp_dir();
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+
+    // Exactly what addon.rs writes when a failing lookup serves the last known answer: good ids, an
+    // old `confirmed`, and an `exp` that is only the failure cooldown — already elapsed.
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry {
+            ids: vec!["goodTrailer".into()],
+            exp: now.saturating_sub(1),
+            confirmed: now.saturating_sub(60_000),
+        },
+    );
+
+    crate::state::save_resolve_cache(&state);
+    let back = crate::state::load_resolve_cache(&state.cfg, now);
+
+    assert_eq!(
+        back.get("tt0111161:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "a stand-in answer was dropped at save, so a redeploy after an outage re-asks TMDB for everything"
     );
 }
 

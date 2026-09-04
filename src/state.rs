@@ -231,11 +231,15 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     // thing into memory and `from_slice` materialises the whole map, so by the time anything is
     // counted the memory has already been spent.
     //
-    // Sized against what this process can actually write — YT_CACHE_MAX entries at roughly a
-    // hundred bytes each, so a megabyte or so — rather than a round number that felt safe. The
-    // difference is not cosmetic: the smallest legal entry is about 36 bytes, so a 16 MB cap admits
-    // ~465k of them and some 50 MB of parsed map, on a box budgeted at a few MB resident.
-    const MAX_RESOLVE_FILE: u64 = 2 * 1024 * 1024;
+    // Sized against what this process can actually write, worked out rather than guessed, because a
+    // cap below that ceiling does not protect anything — it just makes every boot discard the whole
+    // parked cache, permanently, since each shutdown rewrites the same oversized file.
+    //
+    // Worst case at YT_CACHE_MAX: a bounded imdb id (13) plus the longest namespace suffix
+    // (`:en:nokey:nokc`) is a ~30-byte key, and MAX_PROBE ids at 13 bytes each plus two timestamps
+    // is ~140 bytes of body — call it 170 a piece, so ~1.7 MB full. 4 MB is twice that and still far
+    // under what would matter at boot.
+    const MAX_RESOLVE_FILE: u64 = 4 * 1024 * 1024;
     match std::fs::metadata(&cfg.resolve_cache) {
         Ok(md) if md.len() > MAX_RESOLVE_FILE => {
             eprintln!(
@@ -253,6 +257,10 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
         eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
         return out;
     };
+    // The raw bytes are dead the moment they are parsed, and holding them would keep a second full
+    // copy of the file alive beside the map for the whole restore — at boot, on a box measured in
+    // single-digit megabytes.
+    drop(bytes);
     for (k, e) in parsed {
         if out.len() >= crate::YT_CACHE_MAX {
             break;
@@ -302,11 +310,27 @@ pub fn save_resolve_cache(state: &AppState) {
         eprintln!("resolve cache: {} is not writable ({e})", dir.display());
         return;
     }
-    // Only what is still live. An entry that has already expired is bytes to write now, bytes to
-    // read at boot, and an entry to parse and immediately discard — three costs for nothing.
+    // Only what is still live — an entry already dead is bytes to write now, bytes to read at boot,
+    // and an entry to parse and immediately discard.
+    //
+    // "Live" has to be asked the same way the loader asks it, and `exp` alone is not that question.
+    // A populated entry is admitted on `confirmed`, because the stale-substitution path rewrites
+    // `exp` to a 60-second retry cooldown while leaving perfectly good ids and their original
+    // `confirmed` in place. Filtering on `exp` here dropped exactly those entries — so a TMDB blip
+    // followed by a redeploy more than a minute later wiped the answers the blip had been leaning
+    // on, which is the failure this whole file exists to prevent, arriving during an outage.
     let now = (state.clock)();
     let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
-    let live: HashMap<&String, &YtEntry> = cache.iter().filter(|(_, e)| e.exp > now).collect();
+    let live: HashMap<&String, &YtEntry> = cache
+        .iter()
+        .filter(|(_, e)| {
+            if e.ids.is_empty() {
+                e.exp > now
+            } else {
+                now < e.confirmed.saturating_add(crate::YT_TTL_MS)
+            }
+        })
+        .collect();
     let Ok(bytes) = serde_json::to_vec(&live) else { return };
     let n = live.len();
     drop(live);
