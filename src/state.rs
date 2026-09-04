@@ -54,6 +54,10 @@ pub struct AppState {
     pub dl_gen: AtomicU64,
     /// vid -> detected content rectangle (from ffmpeg cropdetect), so /crop is computed once.
     pub crop_cache: Mutex<HashMap<String, crate::crop::CropReport>>,
+    /// vid -> when to run cropdetect again after it produced nothing parsable. Only the SUCCESSFUL
+    /// side was cached above, and the comment where the pass is spawned says what that costs: a
+    /// whole-file ffmpeg read on every call, forever, for exactly the trailers it cannot read.
+    pub crop_unknown: Mutex<HashMap<String, u64>>,
     /// vid -> (why it failed, when to try again). A `/play` verdict was the one thing this service
     /// learned and then threw away: the in-flight entry is cleared however a download ends, so the
     /// next request for a video YouTube has REMOVED spent another of three download permits, and
@@ -114,6 +118,7 @@ impl AppState {
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
+            crop_unknown: Mutex::new(HashMap::new()),
             play_fails: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),

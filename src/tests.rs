@@ -234,6 +234,7 @@ fn build_state_full(
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
         crop_cache: Mutex::new(HashMap::new()),
+        crop_unknown: Mutex::new(HashMap::new()),
         play_fails: Mutex::new(HashMap::new()),
         upstream,
         prober,
@@ -2257,6 +2258,38 @@ async fn body_fault_why_redacts_even_a_send_path_error() {
     let logged = crate::upstream::body_fault_why(send_err);
     assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
     assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+}
+
+/// The probe permit bounded how many cropdetect passes run at once. It did nothing about the same
+/// unreadable trailer paying for a whole-file ffmpeg pass on every single call — which is the most
+/// expensive thing this service does per request, and only the SUCCESSFUL side was ever cached.
+#[tokio::test]
+async fn an_unreadable_crop_is_not_re_detected_on_every_call() {
+    let dir = temp_dir();
+    let runs = dir.join("ffmpeg-runs");
+    let fake = dir.join("failing-ffmpeg");
+    std::fs::write(&fake, format!("#!/bin/sh\necho x >> {}\nexit 1\n", runs.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ffmpeg = fake.to_string_lossy().into_owned();
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+    seed_cache(&dir, "unreadable1", 100);
+
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    // However many spawns one detection costs internally — this test is about repetition, not that.
+    let first = spawn_count(&runs);
+    assert!(first > 0, "the fake ffmpeg never ran, so this test proves nothing");
+
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    assert_eq!(spawn_count(&runs), first, "an unreadable trailer re-ran the whole-file ffmpeg pass");
+
+    // Short-lived on purpose: the other way to land here is a cropdetect that timed out under load.
+    clock.advance(crate::CROP_UNKNOWN_TTL_MS + 1);
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable1".into()).await;
+    assert!(spawn_count(&runs) > first, "the unknown never expired");
 }
 
 /// /crop's ffmpeg pass takes a probe permit. It was the only subprocess spawn without one, and it
