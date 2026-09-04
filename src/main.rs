@@ -121,6 +121,50 @@ fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32, l
     }
 }
 
+/// The `/stats` body. Every number is either an atomic load or the length of a map we hold briefly —
+/// no I/O, no directory walk.
+fn stats_body(state: &Arc<AppState>) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    fn len<K, V>(m: &std::sync::Mutex<std::collections::HashMap<K, V>>) -> usize {
+        m.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    let trailer_bytes = state.cache_trailer_bytes.load(Relaxed);
+    let scratch_bytes = state.cache_scratch_bytes.load(Relaxed);
+    let cap = state.cfg.cache_max_bytes;
+    let measured_at = state.cache_measured_at.load(Relaxed);
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "cache": {
+            // From the last eviction pass, not from this request. 0 means no pass has run yet, which
+            // on a fresh process lasts until the first download or the first hourly tick.
+            "measured_at_ms": measured_at,
+            "trailers": state.cache_trailer_count.load(Relaxed),
+            "trailer_bytes": trailer_bytes,
+            "scratch_bytes": scratch_bytes,
+            "max_bytes": cap,
+            // What a new trailer can still take. Scratch counts against the cap, so this is the
+            // number that actually decides whether the next download evicts something.
+            "free_bytes": cap.saturating_sub(trailer_bytes + scratch_bytes),
+        },
+        "downloads": {
+            "in_flight": len(&state.in_flight),
+            "limit": DOWNLOAD_CONCURRENCY,
+            "prewarm_available": state.prewarm_sem.available_permits(),
+            "probe_available": state.probe_sem.available_permits(),
+        },
+        "resolve_cache": { "entries": len(&state.yt_cache), "max": YT_CACHE_MAX },
+        "crop_cache": { "entries": len(&state.crop_cache), "unreadable": len(&state.crop_unknown) },
+        // Ids /play has found unplayable and is not re-extracting yet.
+        "play_failures": { "entries": len(&state.play_fails), "max": PLAY_FAIL_MAX },
+        // The same three counters /health turns into a one-word verdict.
+        "consecutive_failures": {
+            "upstream": state.upstream.recent_failures(),
+            "extract": state.extract_fails.load(Relaxed),
+            "local": state.local_fails.load(Relaxed),
+        },
+    })
+}
+
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
@@ -144,6 +188,17 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         let local_fails = state.local_fails.load(std::sync::atomic::Ordering::Relaxed);
         let body = health_body(tmdb_available, state.upstream.recent_failures(), extract_fails, local_fails);
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
+    }
+    // Operational detail /health has no room for. /health answers one question — can this instance
+    // serve trailers — and answers it in three words; everything behind that verdict (how full the
+    // volume is, how many downloads are in flight, how much of the resolve cache is standing) was
+    // visible only by reading logs.
+    //
+    // Deliberately does NOT walk the cache directory: the figures come from the eviction pass, which
+    // already walks it after every download and once an hour. An ops endpoint that stats a few
+    // thousand files per request is a way to make a busy box busier.
+    if path == "/stats" {
+        return httputil::json(StatusCode::OK, &stats_body(&state), &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {
         return httputil::json(
@@ -318,11 +373,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             loop {
                 tick.tick().await;
                 let cfg = state.cfg.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let measured = tokio::task::spawn_blocking(move || {
                     crate::play::sweep_partials(&cfg);
-                    crate::play::evict_if_needed(&cfg);
+                    crate::play::evict_if_needed(&cfg)
                 })
                 .await;
+                if let Ok(Some(u)) = measured {
+                    state.record_cache_usage(u);
+                }
             }
         });
     }
