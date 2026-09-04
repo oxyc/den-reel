@@ -227,14 +227,30 @@ pub fn default_prewarm() -> PrewarmFn {
 /// So: populated entries live by `confirmed`, empty ones by their own `exp`.
 pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     let mut out = HashMap::new();
+    // Bound the FILE before reading it, because the entry cap below cannot: `read` pulls the whole
+    // thing into memory and `from_slice` materialises the whole map, so by the time anything is
+    // counted the memory has already been spent. YT_CACHE_MAX entries serialise to something over a
+    // megabyte, so this is generous headroom and still a bound — and this file lives on a volume we
+    // do not otherwise police, at a point in boot that runs before the listener binds.
+    const MAX_RESOLVE_FILE: u64 = 16 * 1024 * 1024;
+    match std::fs::metadata(&cfg.resolve_cache) {
+        Ok(md) if md.len() > MAX_RESOLVE_FILE => {
+            eprintln!(
+                "resolve cache at {} is {} bytes, over the {MAX_RESOLVE_FILE} limit; starting empty",
+                cfg.resolve_cache.display(),
+                md.len()
+            );
+            return out;
+        }
+        Ok(_) => {}
+        Err(_) => return out, // no parked cache, which is the normal first boot
+    }
     let Ok(bytes) = std::fs::read(&cfg.resolve_cache) else { return out };
     let Ok(parsed) = serde_json::from_slice::<HashMap<String, YtEntry>>(&bytes) else {
         eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
         return out;
     };
     for (k, e) in parsed {
-        // Bounded on the way IN. This file is on a volume we do not otherwise police, and a map
-        // sized by whatever is on disk is not a bound.
         if out.len() >= crate::YT_CACHE_MAX {
             break;
         }
@@ -242,10 +258,16 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
             if e.exp > now {
                 out.insert(k, e);
             }
-        } else if now < e.confirmed + crate::YT_TTL_MS {
+            continue;
+        }
+        // checked_add: `confirmed` is a u64 straight off disk, and a value near u64::MAX would
+        // panic here in a debug build — at boot, before anything is serving. An entry whose
+        // arithmetic does not fit is not an entry worth keeping.
+        let Some(earned) = e.confirmed.checked_add(crate::YT_TTL_MS) else { continue };
+        if now < earned {
             // Restore the expiry a confirmed answer is entitled to, rather than whatever cooldown
             // the last failing lookup happened to leave behind.
-            out.insert(k, YtEntry { ids: e.ids, exp: e.confirmed + crate::YT_TTL_MS, confirmed: e.confirmed });
+            out.insert(k, YtEntry { ids: e.ids, exp: earned, confirmed: e.confirmed });
         }
     }
     if !out.is_empty() {

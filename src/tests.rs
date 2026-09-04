@@ -190,6 +190,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         config_key: String::new(),
         config_keys_prev: String::new(),
         play_secret: None,
+        play_secrets_prev: Vec::new(),
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=tv_embedded".into()),
@@ -379,10 +380,18 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
     let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
     assert_eq!(r.status(), 200, "the URL /meta hands out must actually play");
 
-    // /crop is a second door to the same download, so it is gated too — and by the same tag, since
-    // the signature covers the id rather than the path and both endpoints authorise the same work.
+    // /crop is a second door to the same download, so it is gated too — by the same tag, since the
+    // signature covers the id rather than the path. But it DEGRADES rather than refusing: nothing
+    // this server emits is a signed crop URL (the tag rides on the play URL and the client has to
+    // carry it across), so a 403 here would turn a client that does not into de-letterboxing that
+    // silently vanishes. The answer is the same "just play it" every other failing path returns —
+    // and it reaches none of the download the gate exists to protect.
     let r = client.get(format!("{base}/crop/cachedVid07.json")).send().await.unwrap();
-    assert_eq!(r.status(), 403, "/crop let an unsigned caller trigger the download");
+    assert_eq!(r.status(), 200, "an unsigned /crop should degrade, not break de-letterboxing");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["letterboxed"], false, "an unsigned caller gets the play-it-whole answer");
+    assert!(body.get("content").is_none(), "an unsigned caller must not get a detected rect");
+
     let r = client.get(format!("{base}/crop/cachedVid07.json?s={tag}")).send().await.unwrap();
     assert_eq!(r.status(), 200, "the play URL's tag must open /crop for the same id");
 }
@@ -2489,6 +2498,43 @@ async fn body_fault_why_redacts_even_a_send_path_error() {
     assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
 }
 
+/// ...and the check has to sit BEFORE the fetch. `record_unknown` only proves the file existed when
+/// detection ran, and eviction is ordinary on a full volume — so with the check after the fetch, a
+/// /crop inside the ten-minute window could take a download permit and pull a whole trailer down to
+/// return a constant that does not depend on it.
+#[tokio::test]
+async fn an_unreadable_crop_does_not_re_download_the_trailer() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let downloads = dir.join("dl-count");
+    let yt = dir.join("yt-counting");
+    std::fs::write(&yt, format!("#!/bin/sh\necho x >> {}\nexit 1\n", downloads.display())).unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ff = dir.join("failing-ffmpeg");
+    std::fs::write(&ff, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&ff, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.ffmpeg = ff.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    seed_cache(&dir, "unreadable2", 100);
+    let _ = crate::crop::handle_crop(state.clone(), "unreadable2".into()).await;
+    assert_eq!(spawn_count(&downloads), 0, "the file was cached; nothing should have downloaded");
+
+    // Eviction takes the file while the "unreadable" verdict is still standing.
+    std::fs::remove_file(dir.join("unreadable2.mp4")).unwrap();
+    let resp = crate::crop::handle_crop(state.clone(), "unreadable2".into()).await;
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        spawn_count(&downloads),
+        0,
+        "/crop spent a download permit and a yt-dlp run to return a constant"
+    );
+}
+
 /// The probe permit bounded how many cropdetect passes run at once. It did nothing about the same
 /// unreadable trailer paying for a whole-file ffmpeg pass on every single call — which is the most
 /// expensive thing this service does per request, and only the SUCCESSFUL side was ever cached.
@@ -3144,15 +3190,28 @@ async fn a_play_failure_says_when_to_come_back() {
 
     let mut cfg = test_cfg(dir);
     cfg.ytdlp = yt.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
     let base = spawn_server(state).await;
+    let ttl = crate::play::fail_ttl_ms("unavailable");
 
     let r = reqwest::get(format!("{base}/play/goneVideo01.mp4")).await.unwrap();
     assert_eq!(r.status(), 404);
+    let retry_after = |r: &reqwest::Response| -> u64 {
+        r.headers().get("retry-after").unwrap().to_str().unwrap().parse().unwrap()
+    };
+    assert_eq!(retry_after(&r), ttl / 1000, "the first answer is the whole window");
+
+    // Ten minutes later the window is ten minutes shorter, and the header has to say so. Quoting
+    // the full TTL again would tell a client asking near the end to wait another whole window —
+    // up to twice the real cooldown, and unbounded if it keeps polling.
+    clock.advance(600_000);
+    let r = reqwest::get(format!("{base}/play/goneVideo01.mp4")).await.unwrap();
+    assert_eq!(r.status(), 404);
     assert_eq!(
-        r.headers().get("retry-after").and_then(|v| v.to_str().ok()),
-        Some((crate::play::fail_ttl_ms("unavailable") / 1000).to_string().as_str()),
-        "the client was told nothing about when a retry could possibly help"
+        retry_after(&r),
+        (ttl - 600_000) / 1000,
+        "a cached failure quoted the full TTL again instead of what is left of it"
     );
 }
 
@@ -3195,13 +3254,17 @@ async fn meta_demotes_and_stops_prewarming_a_candidate_play_found_dead() {
     crate::play::record_failure(&state, "deadFirst01", &gone);
 
     let base = spawn_server(state).await;
-    let body: serde_json::Value = reqwest::get(format!("{base}/meta/movie/tt0111161.json"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
 
+    // An order shaped by a /play failure must not be pinned in every client for a week. The signal
+    // behind it lives 60 seconds at the short end, after which this server has forgotten it.
+    assert_eq!(
+        resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=3600"),
+        "a demoted ordering went out with the full 7-day max-age"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
     let links = body["meta"]["links"].as_array().unwrap();
     assert!(
         links[0]["trailers"].as_str().unwrap().ends_with("/play/liveSecond1.mp4"),

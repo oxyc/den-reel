@@ -277,8 +277,16 @@ fn usage(files: &[(PathBuf, u64, SystemTime)], scratch_bytes: u64) -> CacheUsage
 /// long enough to stop a hot loop while the operator fixes the disk.
 pub(crate) fn fail_ttl_ms(reason: &str) -> u64 {
     match reason {
-        // The video is gone or shut to us. Nothing we retry changes it.
-        "unavailable" | "restricted" => 6 * 60 * 60 * 1000,
+        // The video is gone or shut to us. Nothing we retry changes that — but an hour, not the six
+        // this wants to be, because of what happens if the classification is wrong. `classify` routes
+        // anything whose stderr says "video unavailable" here, and that string is not exclusive to a
+        // removed video: it is also what a REJECTED EXTRACTOR gets told, which is a whole-library
+        // event rather than a per-video one. This bucket is also the one /health is explicitly built
+        // to ignore, and nothing flushes the map short of a restart — so a misread here is a green
+        // /health over an empty service for as long as the TTL says. An hour still removes
+        // essentially every repeat extraction within a browsing session; six would price one
+        // misclassification at most of an evening.
+        "unavailable" | "restricted" => 60 * 60 * 1000,
         // A region block can lift, and the client has alternates to try meanwhile.
         "geo_blocked" => 30 * 60 * 1000,
         // A systemic extractor outage ends when yt-dlp is bumped — which is a redeploy, so this map
@@ -335,12 +343,16 @@ fn clear_failure(state: &AppState, vid: &str) {
     map.remove(vid);
 }
 
-/// Is this id currently known to be unplayable? Used by `/meta` to not spend a prewarm permit on a
-/// candidate the last request already found dead.
-pub fn is_known_dead(state: &AppState, vid: &str) -> bool {
-    let now = (state.clock)();
-    let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(vid).is_some_and(|(_, exp)| *exp > now)
+/// What `demote_known_dead` learned while it was holding the lock, so the caller does not have to
+/// take it again to ask a second question about the same map.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Demotion {
+    /// Any candidate in the list is currently known unplayable — so this response's ORDER reflects
+    /// a signal whose shortest life is 60 seconds, and must not be cached for a week.
+    pub any_dead: bool,
+    /// The candidate the client will play first is itself dead, which after the sort means they all
+    /// are. Nothing here is worth a speculative download.
+    pub head_dead: bool,
 }
 
 /// Move candidates we currently know are unplayable behind the ones that might work, preserving
@@ -351,18 +363,25 @@ pub fn is_known_dead(state: &AppState, vid: &str) -> bool {
 /// time. Applied at RESPONSE time rather than at resolve time on purpose: the resolve is cached for
 /// 24h, while a geo-block can lift inside that, so the stored order must stay the upstream's.
 ///
-/// One lock for the whole list, and an early return when nothing has ever failed — which is the
-/// normal case, and the one that must cost nothing.
-pub fn demote_known_dead(state: &AppState, ids: &mut [String]) {
-    if ids.len() < 2 {
-        return;
+/// One lock for the whole thing, and an early return when nothing has ever failed — which is the
+/// normal case, and the one that must cost nothing. The answers the caller needs come back with it
+/// rather than being asked for separately, which is a second lock and a second clock read on a path
+/// that runs per request.
+pub fn demote_known_dead(state: &AppState, ids: &mut [String]) -> Demotion {
+    if ids.is_empty() {
+        return Demotion::default();
     }
     let now = (state.clock)();
     let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
     if map.is_empty() {
-        return;
+        return Demotion::default();
     }
-    ids.sort_by_key(|id| map.get(id).is_some_and(|(_, exp)| *exp > now));
+    let is_dead = |id: &str| map.get(id).is_some_and(|(_, exp)| *exp > now);
+    if !ids.iter().any(|id| is_dead(id)) {
+        return Demotion::default();
+    }
+    ids.sort_by_key(|id| is_dead(id));
+    Demotion { any_dead: true, head_dead: is_dead(&ids[0]) }
 }
 
 /// Drop a FINISHED download from the in-flight map, so the next `fetch_trailer` starts a new one
@@ -598,15 +617,28 @@ async fn serve_file(range: Option<&str>, fp: &Path, vid: &str) -> Result<Respons
     Ok(resp)
 }
 
+/// What is LEFT of this id's failure window, in ms. `None` when nothing is standing — the entry was
+/// dropped under `PLAY_FAIL_MAX` pressure, or this is a reason we do not cache.
+fn remaining_fail_ms(state: &AppState, vid: &str) -> Option<u64> {
+    let now = (state.clock)();
+    let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(vid).map(|(_, exp)| exp.saturating_sub(now)).filter(|r| *r > 0)
+}
+
 /// Typed /play failure body (geo_blocked 451 / restricted 403 / unavailable 404 / 502).
 ///
-/// Carries `Retry-After`, and it is not a guess: it is exactly how long the failure cache will keep
-/// answering this id from memory. A client that retries sooner gets this same response without an
-/// extraction happening, so telling it the real number is both honest and the thing that stops a
-/// player from hammering a dead trailer.
-fn play_error(vid: &str, e: &PlayError) -> Response<Body> {
+/// `Retry-After` is what is LEFT of the failure window, not the full TTL. The full TTL is only
+/// correct for the first response — the one where the extraction actually happened. Every later
+/// request is answered from the cache, and recomputing the whole TTL there tells a client asking at
+/// 5h59m of a 6h window to wait another six hours: up to twice the real cooldown, and unbounded if
+/// it keeps polling. The remainder is right there in the entry, so use it.
+fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response<Body> {
     let body = serde_json::json!({ "error": e.reason, "message": e.message, "id": vid });
-    let retry_after = (fail_ttl_ms(&e.reason) / 1000).to_string();
+    // No entry means nothing is being cached for this id, so the full TTL is the honest estimate of
+    // when asking again could help. Never zero: a client reading `Retry-After: 0` will come straight
+    // back, which is the one answer that is never useful here.
+    let ms = remaining_fail_ms(state, vid).unwrap_or_else(|| fail_ttl_ms(&e.reason));
+    let retry_after = (ms / 1000).max(1).to_string();
     httputil::json(
         StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY),
         &body,
@@ -638,7 +670,7 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
             },
             Err(e) => {
                 eprintln!("[{vid}] {}", e.detail);
-                return play_error(&vid, &e);
+                return play_error(&state, &vid, &e);
             }
         }
     }

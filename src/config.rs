@@ -49,6 +49,11 @@ pub struct Config {
     /// be: `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
     /// turning this on unconditionally would break every install for that week.
     pub play_secret: Option<String>,
+    /// `REEL_PLAY_SECRET_PREV` — comma-separated prior secrets, accepted when VERIFYING and never
+    /// used to sign. Same rotation shape as `config_keys_prev`, and needed for the same reason:
+    /// `/meta` ships `max-age=604800`, so a client can present a tag made with the previous secret
+    /// for up to a week after it is rotated. Without this, rotating means a week of 403s.
+    pub play_secrets_prev: Vec<String>,
     pub public_base_url: Option<String>,
     /// The yt-dlp format string we serve — H.264(avc1) + AAC(mp4a), ≤max_height (avc1's ceiling on
     /// YouTube), faststart-muxable. Forced so trailers play on AVPlayer's HARDWARE decode path
@@ -169,6 +174,9 @@ impl Config {
             config_key: env_opt("REEL_CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("REEL_CONFIG_KEYS_PREV").unwrap_or_default(),
             play_secret: env_opt("REEL_PLAY_SECRET"),
+            play_secrets_prev: env_opt("REEL_PLAY_SECRET_PREV")
+                .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default(),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,

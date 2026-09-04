@@ -272,8 +272,13 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // crop hint: /crop/<id>.json → detected content rect so the app can trim baked-in letterbox.
     if let Some(id) = path.strip_prefix("/crop/").and_then(|r| r.strip_suffix(".json")) {
         if is_valid_vid(id) {
-            if let Some(denied) = signature_check(&state, id, query) {
-                return denied;
+            // An unsigned /crop degrades instead of refusing. Nothing this server emits carries a
+            // signed crop URL — the tag rides on the play URL, and it is the client that has to
+            // carry it across — so a hard 403 here would turn "the app did not propagate `s`" into
+            // de-letterboxing that silently disappears, with no error to report and /health green.
+            // The gate exists to protect the DOWNLOAD, and `unsigned_response` reaches none of it.
+            if signature_check(&state, id, query).is_some() {
+                return crop::unsigned_response(id);
             }
             return crop::handle_crop(state, id.to_string()).await;
         }
@@ -308,7 +313,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 /// client can carry the `s` it was handed on the play URL straight over to `/crop`.
 fn signature_check(state: &Arc<AppState>, vid: &str, query: &str) -> Option<Response<Body>> {
     let secret = state.cfg.play_secret.as_deref()?;
-    if sign::verify(secret, vid, query_param(query, "s").as_deref()) {
+    if sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, query_param(query, "s").as_deref()) {
         return None;
     }
     // Deliberately terse, and no hint about what a correct tag would look like.

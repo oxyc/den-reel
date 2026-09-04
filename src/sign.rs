@@ -66,6 +66,18 @@ pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
     presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
+/// Verify against the current secret, then against any prior one still in rotation.
+///
+/// Rotating the secret would otherwise 403 every play URL a client is holding — and `/meta` tells
+/// clients to hold them for a week — so a rotation without this is a week-long outage. Exactly the
+/// problem `REEL_CONFIG_KEYS_PREV` already exists to solve for the sealing key.
+///
+/// The scan is not constant-time *across* the set, only within each comparison. What that leaks is
+/// how many secrets are configured, which is not a secret.
+pub fn verify_any(current: &str, prev: &[String], vid: &str, presented: Option<&str>) -> bool {
+    verify(current, vid, presented) || prev.iter().any(|s| verify(s, vid, presented))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +102,22 @@ mod tests {
         assert!(!verify("other", "dSdWpY2Bxsc", Some(&good)), "a tag from another secret must not pass");
         // Truncation must not pass either — the length check is part of the comparison.
         assert!(!verify("s3cret", "dSdWpY2Bxsc", Some(&good[..8])));
+    }
+
+    /// A rotated secret must not 403 the play URLs clients were told to cache for a week.
+    #[test]
+    fn a_prior_secret_still_verifies() {
+        let old_tag = tag("old-secret", "dSdWpY2Bxsc");
+        let prev = vec!["old-secret".to_string()];
+
+        assert!(!verify("new-secret", "dSdWpY2Bxsc", Some(&old_tag)), "the premise: it does not verify alone");
+        assert!(verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some(&old_tag)), "rotation costs a week of 403s");
+        assert!(
+            verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some(&tag("new-secret", "dSdWpY2Bxsc"))),
+            "the current secret must still be the one that signs"
+        );
+        assert!(!verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some("deadbeefdeadbeefdeadbeef")));
+        assert!(!verify_any("new-secret", &[], "dSdWpY2Bxsc", Some(&old_tag)), "an empty rotation set accepts nothing extra");
     }
 
     /// A secret longer than BLAKE2b's 64-byte key limit must be usable, not a startup error.
