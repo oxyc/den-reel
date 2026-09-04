@@ -147,7 +147,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
 | `PORT` | `8092` | |
-| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: anything in it that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. |
+| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: any top-level *file* that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. Subdirectories are left alone — den-reel keeps yt-dlp's player cache in `yt-dlp/` and parks its resolve cache in `state/` across restarts. |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
 | `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |
