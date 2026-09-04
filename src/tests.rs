@@ -176,6 +176,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
     Config {
         port: 8092,
         ytdlp_cache: cache_dir.join("yt-dlp"),
+        resolve_cache: cache_dir.join("state").join("resolve.json"),
         cache_dir,
         ytdlp: "yt-dlp".into(),
         ffmpeg: "ffmpeg".into(),
@@ -2178,6 +2179,100 @@ async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
         vec!["goodTrailer".to_string()]
     );
     assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
+}
+
+/// A redeploy made the next browse re-ask TMDB for every title on screen. Parking the map fixes
+/// that, but the two kinds of entry have to be validated by DIFFERENT clocks, and getting it
+/// backwards is worse than not persisting at all.
+#[test]
+fn a_parked_resolve_cache_keeps_answers_and_drops_cooldowns() {
+    let dir = temp_dir();
+    let cfg = test_cfg(dir);
+    let now = 1_000_000_000_000u64;
+    let mut map: HashMap<String, crate::state::YtEntry> = HashMap::new();
+
+    // A good answer whose `exp` was rewritten to a retry cooldown by a failing lookup that
+    // substituted it. The ids are still confirmed, so it must come back — and come back with the
+    // expiry a confirmed answer earns, not the cooldown.
+    map.insert(
+        "tt1:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now - 1, confirmed: now - 1000 },
+    );
+    // A confirmed answer that is simply too old to trust.
+    map.insert(
+        "tt2:en".into(),
+        crate::state::YtEntry {
+            ids: vec!["staleTrailr".into()],
+            exp: now + 999,
+            confirmed: now - crate::YT_TTL_MS - 1,
+        },
+    );
+    // A 60-second failure cooldown that has already passed. `confirmed` is set to now on EVERY
+    // write, empties included, so validating this one by `confirmed` would promote it into a
+    // 24-hour "this title has no trailer" — the exact inversion YT_FAIL_TTL_MS < YT_NEG_TTL_MS
+    // exists to prevent.
+    map.insert("tt3:en".into(), crate::state::YtEntry { ids: vec![], exp: now - 1, confirmed: now - 1 });
+    // A live "this title really has no trailer", which is worth keeping.
+    map.insert("tt4:en".into(), crate::state::YtEntry { ids: vec![], exp: now + 60_000, confirmed: now - 1 });
+
+    std::fs::create_dir_all(cfg.resolve_cache.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.resolve_cache, serde_json::to_vec(&map).unwrap()).unwrap();
+    let back = crate::state::load_resolve_cache(&cfg, now);
+
+    assert_eq!(
+        back.get("tt1:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "a confirmed answer was dropped because a failing lookup had left a cooldown on it"
+    );
+    assert_eq!(
+        back["tt1:en"].exp,
+        back["tt1:en"].confirmed + crate::YT_TTL_MS,
+        "the restored answer kept the cooldown instead of the expiry it had earned"
+    );
+    assert!(!back.contains_key("tt2:en"), "an answer past its confirmation window came back");
+    assert!(!back.contains_key("tt3:en"), "a 60-second cooldown came back as a day of 'no trailer'");
+    assert!(back.contains_key("tt4:en"), "a live negative answer was dropped, so every browse re-asks");
+}
+
+/// ...and the round trip actually works, through the paths production uses.
+#[test]
+fn the_resolve_cache_survives_a_restart() {
+    let dir = temp_dir();
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
+    );
+
+    crate::state::save_resolve_cache(&state);
+    let back = crate::state::load_resolve_cache(&state.cfg, now);
+
+    assert_eq!(
+        back.get("tt0111161:en").map(|e| e.ids.clone()),
+        Some(vec!["goodTrailer".to_string()]),
+        "the parked cache did not come back"
+    );
+}
+
+/// The parked file lives in a SUBDIRECTORY of the cache, and that is not cosmetic: the sweep deletes
+/// every top-level file that is not `<vid>.mp4` as abandoned scratch.
+#[test]
+fn the_parked_resolve_cache_is_not_swept_away() {
+    let dir = temp_dir();
+    let state = build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let now = (state.clock)();
+    state.yt_cache.lock().unwrap().insert(
+        "tt0111161:en".into(),
+        crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
+    );
+    crate::state::save_resolve_cache(&state);
+    assert!(state.cfg.resolve_cache.exists(), "nothing was written, so this proves nothing");
+
+    crate::play::sweep_partials(&state.cfg);
+    crate::play::evict_if_needed(&state.cfg);
+
+    assert!(state.cfg.resolve_cache.exists(), "the sweep reaped the resolve cache it is meant to ignore");
 }
 
 /// The size sweep drops entries by expiry. Keying it off any other field wipes the whole cache on

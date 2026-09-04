@@ -31,6 +31,11 @@ pub struct Config {
     pub cache_ttl: Duration,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,
+    /// Where the resolve cache is parked across a restart. In a SUBDIRECTORY of the media cache, and
+    /// that is not cosmetic: `sweep_partials` treats every top-level file that is not `<vid>.mp4` as
+    /// abandoned scratch and deletes it, so a `resolve.json` next to the trailers would be reaped
+    /// within the hour. Both cleanup passes skip directories.
+    pub resolve_cache: PathBuf,
     /// Legacy server-side discovery keys — a MIGRATION FALLBACK used only when a request carries no
     /// per-install config. New installs seal a BYOK TMDB (+ optional KinoCheck) key into the URL.
     pub tmdb_key: Option<String>,
@@ -101,6 +106,7 @@ impl Config {
                 * 24 * 60 * 60,
         );
         let ytdlp_cache = cache_dir.join("yt-dlp");
+        let resolve_cache = cache_dir.join("state").join("resolve.json");
         // The ladder degrades in QUALITY ORDER. It used to fall from the ≤max_height rungs straight to itag
         // 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
         // panel even when a perfectly good 720p existed. The intermediate rungs cost nothing when the top
@@ -157,6 +163,7 @@ impl Config {
             cache_max_bytes,
             cache_ttl,
             ytdlp_cache,
+            resolve_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("REEL_CONFIG_KEY").unwrap_or_default(),

@@ -299,6 +299,15 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let state = AppState::new(cfg);
     let cfg_for_shutdown = state.cfg.clone();
 
+    // Pick up where the last process left off. A resolve is a TMDB round-trip per title, and a
+    // redeploy otherwise makes the next browse pay for every title on screen again.
+    {
+        let restored = state::load_resolve_cache(&state.cfg, (state.clock)());
+        if !restored.is_empty() {
+            *state.yt_cache.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        }
+    }
+
     // Periodic cache sweep so the last-access TTL is enforced during idle stretches too — eviction
     // otherwise only runs after a download. Hourly is ample for a day-scale TTL, and interval's first
     // tick fires immediately so a cache left stale over a long downtime is trimmed on boot.
@@ -377,6 +386,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         eprintln!("shutdown: killed {killed} in-flight download(s)");
     }
     crate::play::sweep_own_temps(&cfg_for_shutdown);
+    state::save_resolve_cache(&state);
     Ok(())
 }
 

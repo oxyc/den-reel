@@ -29,6 +29,10 @@ pub type SharedDownload = Shared<BoxFuture<Result<PathBuf, PlayError>>>;
 
 /// Resolved (or negatively-cached) trailer ytIds — best-playable first, then unprobed alternates the
 /// client falls back to on a playback failure. Empty = "no trailer". `exp` is ms since epoch.
+///
+/// Serializable so the map survives a redeploy (`load_resolve_cache` / `save_resolve_cache`). Both
+/// timestamps are epoch-milliseconds, so they still mean something in the next process.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct YtEntry {
     pub ids: Vec<String>,
     pub exp: u64,
@@ -45,7 +49,9 @@ pub struct AppState {
     /// disabled (legacy plaintext still works); the current key's public half is served at `/config-key`.
     pub config_keyring: Option<Keyring>,
     /// Cache the STABLE ytId (the expensive lookup); playback is just our /play proxy for it.
-    /// In-memory (24h TTL) — cheap to rebuild on restart, no external store needed. "" = "no trailer".
+    /// In-memory (24h TTL), parked to `cfg.resolve_cache` at shutdown and read back at boot so a
+    /// redeploy does not make the next browse re-ask TMDB for every title on screen. Empty ids =
+    /// "no trailer".
     pub yt_cache: Mutex<HashMap<String, YtEntry>>,
     /// vid -> (generation, shared download future), so concurrent /play (and prewarm) share one
     /// yt-dlp run. The generation lets the creator clear its own entry without clobbering a newer one.
@@ -183,6 +189,78 @@ pub fn default_prewarm() -> PrewarmFn {
             let _ = crate::play::fetch_trailer(state, id).await;
         });
     })
+}
+
+/// Read the resolve cache left by the previous process, dropping whatever no longer holds.
+///
+/// The two kinds of entry are validated by DIFFERENT clocks, and getting that wrong is worse than
+/// not persisting at all. A populated entry means "an upstream vouched for these ids at
+/// `confirmed`", and `exp` cannot speak for it: the stale-substitution path rewrites `exp` to a
+/// retry cooldown while leaving the ids and `confirmed` alone, so a perfectly good 24h answer can be
+/// carrying a 60-second expiry. An EMPTY entry is the opposite — `confirmed` is set to `now` on
+/// every write including the failures, so honouring it there would promote a 60-second
+/// `YT_FAIL_TTL_MS` cooldown into a 24-hour "this title has no trailer", which is precisely what the
+/// `YT_FAIL_TTL_MS < YT_NEG_TTL_MS` assertion exists to prevent.
+///
+/// So: populated entries live by `confirmed`, empty ones by their own `exp`.
+pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
+    let mut out = HashMap::new();
+    let Ok(bytes) = std::fs::read(&cfg.resolve_cache) else { return out };
+    let Ok(parsed) = serde_json::from_slice::<HashMap<String, YtEntry>>(&bytes) else {
+        eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
+        return out;
+    };
+    for (k, e) in parsed {
+        // Bounded on the way IN. This file is on a volume we do not otherwise police, and a map
+        // sized by whatever is on disk is not a bound.
+        if out.len() >= crate::YT_CACHE_MAX {
+            break;
+        }
+        if e.ids.is_empty() {
+            if e.exp > now {
+                out.insert(k, e);
+            }
+        } else if now < e.confirmed + crate::YT_TTL_MS {
+            // Restore the expiry a confirmed answer is entitled to, rather than whatever cooldown
+            // the last failing lookup happened to leave behind.
+            out.insert(k, YtEntry { ids: e.ids, exp: e.confirmed + crate::YT_TTL_MS, confirmed: e.confirmed });
+        }
+    }
+    if !out.is_empty() {
+        println!("resolve cache: {} entr{} still good", out.len(), if out.len() == 1 { "y" } else { "ies" });
+    }
+    out
+}
+
+/// Park the resolve cache on the way out, so a redeploy does not make the next browse re-ask TMDB
+/// for every title on screen. Best-effort by design: this is a cache, and failing to write it is not
+/// worth delaying a shutdown over — but say so, because a volume that cannot be written is worth
+/// knowing about for other reasons.
+pub fn save_resolve_cache(state: &AppState) {
+    let path = &state.cfg.resolve_cache;
+    let Some(dir) = path.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("resolve cache: {} is not writable ({e})", dir.display());
+        return;
+    }
+    let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(bytes) = serde_json::to_vec(&*cache) else { return };
+    let n = cache.len();
+    drop(cache);
+    // Write-then-rename, so a kill mid-write cannot leave a half-file that the next boot has to
+    // parse. The temp lives in the same directory, which is what makes the rename atomic.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        eprintln!("resolve cache: {e}");
+        return;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => eprintln!("shutdown: parked {n} resolve cache entr{}", if n == 1 { "y" } else { "ies" }),
+        Err(e) => {
+            eprintln!("resolve cache: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 }
 
 pub fn default_clock() -> u64 {
