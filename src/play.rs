@@ -233,6 +233,106 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
     }
 }
 
+/// How long a failed `/play` stands before we spend another download permit on the same id.
+///
+/// Reason-aware because a single TTL is wrong in both directions. "Removed by the uploader" is a
+/// fact about the world that will not change this afternoon, and re-asking it every request costs a
+/// yt-dlp process and one of three permits. A timeout is the opposite: it is the reason that burns a
+/// permit for the full DOWNLOAD_TIMEOUT_SECS, and also the one most likely to be a slow network
+/// rather than a dead video — pinning it for hours would turn a bad minute into a dead trailer.
+///
+/// So: facts cache long, verdicts about YouTube's mood cache briefly, and a local fault caches just
+/// long enough to stop a hot loop while the operator fixes the disk.
+pub(crate) fn fail_ttl_ms(reason: &str) -> u64 {
+    match reason {
+        // The video is gone or shut to us. Nothing we retry changes it.
+        "unavailable" | "restricted" => 6 * 60 * 60 * 1000,
+        // A region block can lift, and the client has alternates to try meanwhile.
+        "geo_blocked" => 30 * 60 * 1000,
+        // A systemic extractor outage ends when yt-dlp is bumped — which is a redeploy, so this map
+        // is gone anyway. Kept short so a recovery inside one process is visible quickly.
+        "extraction_failed" => 5 * 60 * 1000,
+        // Ours, not YouTube's: a full volume, a killed bake. Retrying fast helps nobody, but the fix
+        // can land without a restart, so do not sit on it.
+        "incomplete_download" => 2 * 60 * 1000,
+        // Long enough to stop one stuck id monopolising a permit every request, short enough that a
+        // network that comes back is served within the minute.
+        "timeout" => 60 * 1000,
+        // A shape we do not recognise: assume the least and re-ask soon.
+        _ => 60 * 1000,
+    }
+}
+
+/// The still-standing failure for `vid`, if any. Cheap: one lock, one lookup, off the hot path for
+/// every cache hit (which returns before this).
+fn cached_failure(state: &AppState, vid: &str, now: u64) -> Option<PlayError> {
+    let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(vid).filter(|(_, exp)| *exp > now).map(|(e, _)| e.clone())
+}
+
+/// Remember why this id failed, so the next request answers from memory instead of from yt-dlp.
+///
+/// The stderr tail is dropped on the way in. It was already logged once, in full, by the request
+/// that actually failed; keeping it would re-log a stale extractor message on every subsequent hit
+/// and hold up to 300 bytes per entry for the privilege.
+pub(crate) fn record_failure(state: &AppState, vid: &str, e: &PlayError) {
+    let now = (state.clock)();
+    let ttl = fail_ttl_ms(&e.reason);
+    let mut map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= crate::PLAY_FAIL_MAX {
+        map.retain(|_, (_, exp)| *exp > now);
+        // Still full of live entries. This map is an optimisation, not an answer — dropping it costs
+        // one repeated download per id and nothing else — so take the O(n) clear rather than carry
+        // machinery to evict the nearest-to-expiry.
+        if map.len() >= crate::PLAY_FAIL_MAX {
+            map.clear();
+        }
+    }
+    let compact = PlayError {
+        status: e.status,
+        reason: e.reason.clone(),
+        message: e.message.clone(),
+        detail: format!("cached {} for {}ms", e.reason, ttl),
+    };
+    map.insert(vid.to_string(), (compact, now + ttl));
+}
+
+/// Forget a failure once the id has actually produced a trailer.
+fn clear_failure(state: &AppState, vid: &str) {
+    let mut map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(vid);
+}
+
+/// Is this id currently known to be unplayable? Used by `/meta` to not spend a prewarm permit on a
+/// candidate the last request already found dead.
+pub fn is_known_dead(state: &AppState, vid: &str) -> bool {
+    let now = (state.clock)();
+    let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(vid).is_some_and(|(_, exp)| *exp > now)
+}
+
+/// Move candidates we currently know are unplayable behind the ones that might work, preserving
+/// relative order otherwise (`sort_by_key` is stable, and `false` sorts before `true`).
+///
+/// This is the only playability signal the discovery path has — `/meta` deliberately does not probe,
+/// so a dead candidate stays first in TMDB's rank order and every client rediscovers it one at a
+/// time. Applied at RESPONSE time rather than at resolve time on purpose: the resolve is cached for
+/// 24h, while a geo-block can lift inside that, so the stored order must stay the upstream's.
+///
+/// One lock for the whole list, and an early return when nothing has ever failed — which is the
+/// normal case, and the one that must cost nothing.
+pub fn demote_known_dead(state: &AppState, ids: &mut [String]) {
+    if ids.len() < 2 {
+        return;
+    }
+    let now = (state.clock)();
+    let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return;
+    }
+    ids.sort_by_key(|id| map.get(id).is_some_and(|(_, exp)| *exp > now));
+}
+
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
 pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
@@ -256,6 +356,14 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         }
     }
 
+    // A failure we already paid for. AFTER the disk check, so a file that arrived by any other route
+    // still wins, and BEFORE the in-flight join, so a request for a removed video costs a hash
+    // lookup instead of a download permit and a yt-dlp process. Joining a download that is genuinely
+    // running is still the right thing, which is why this sits between the two.
+    if let Some(e) = cached_failure(&state, &vid, (state.clock)()) {
+        return Err(e);
+    }
+
     // Each created download gets a unique generation and a DETACHED driver task that owns it: the
     // driver polls the download to completion and clears the map entry regardless of any requester's
     // lifetime. So a client disconnecting mid-download can't orphan the entry (which would wedge the
@@ -270,7 +378,20 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
             let fut: BoxFuture<Result<PathBuf, PlayError>> = {
                 let st = state.clone();
                 let v = vid.clone();
-                Box::pin(async move { download_cached(st, v, gen).await })
+                // Record the verdict INSIDE the shared future, not in the driver task below. Both
+                // are woken by the same completion, so a waiter that re-entered on the driver's
+                // heels could miss a record that had not run yet — and re-enter is exactly what the
+                // evicted-mid-serve retry does. Here it is ordered: anyone who can observe the
+                // result can observe the record. Runs once, because `Shared` polls the inner future
+                // once however many waiters there are.
+                Box::pin(async move {
+                    let out = download_cached(st.clone(), v.clone(), gen).await;
+                    match &out {
+                        Ok(_) => clear_failure(&st, &v),
+                        Err(e) => record_failure(&st, &v, e),
+                    }
+                    out
+                })
             };
             let shared = fut.shared();
             map.insert(vid.clone(), (gen, shared.clone()));
