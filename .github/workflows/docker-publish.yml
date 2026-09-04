@@ -28,8 +28,11 @@ jobs:
 
   # On a PR (e.g. an automated yt-dlp bump) — build the image WITHOUT pushing. This is the merge gate:
   # it runs the SHA-verified yt-dlp download + full image assembly, so a bad checksum or broken build
-  # fails the check. Single-arch (amd64) for speed; the arm64 SHA is verified by the publish build below
-  # on merge. Note: this proves the image builds, NOT that YouTube extraction still works (that canary
+  # fails the check. Single-arch (amd64) for speed: arm64 is emulated and slow, and the PR gate has to
+  # return in minutes. The arm64 half is therefore exercised only at RELEASE time (the publish job
+  # below), which is the earliest an arm64-specific break — a bad ARM64 checksum, a stage that doesn't
+  # cross-build — can surface. Accepted deliberately; the alternative is a multi-hour PR check.
+  # Note: this proves the image builds, NOT that YouTube extraction still works (that canary
   # can't run on datacenter IPs) — extraction breakage is caught operationally via /health.
   build-pr:
     needs: test
@@ -89,13 +92,24 @@ jobs:
             type=sha
             type=raw,value=latest
 
+      # arm64 is built under emulation. Every stage compiles from source on the target arch — the Rust
+      # binary (fat LTO) and GPAC/MP4Box — so there is nothing to cross-build without reworking the
+      # Dockerfile. That makes this job slow (tens of minutes), which is affordable precisely because
+      # it runs on a v* tag or a manual dispatch, never on a push or a PR. If it ever becomes the
+      # bottleneck, the fix is a per-arch matrix on native runners (ubuntu-24.04-arm) merged with
+      # `buildx imagetools create` — more workflow, no emulation.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v4
 
+      # BOTH arches. This job published whatever the runner happened to be (amd64) for its whole
+      # existence, while the Dockerfile carried arm64 branches and pinned ARM64 checksums that nothing
+      # ever executed — so an arm64 host pulling :latest found no matching manifest at all.
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
