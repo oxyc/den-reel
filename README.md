@@ -97,7 +97,14 @@ so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see th
 403 {"error":"restricted", …}   # private / age-restricted
 404 {"error":"unavailable", …}  # removed
 502 {"error":"extraction_failed", …}
+502 {"error":"incomplete_download", …}  # yt-dlp was fine; no usable file came out of it
+504 {"error":"timeout", …}
 ```
+
+`incomplete_download` is deliberately distinct from `extraction_failed`: yt-dlp extracted, but no
+trailer reached the cache — it exited 0 with no file, or the `clap` bake was killed part-way through
+its in-place rewrite and the result cannot be trusted. Nothing about yt-dlp or the player clients
+will help, so it feeds `downloads_failing` rather than `extractor_unavailable`.
 
 ## Run
 
@@ -146,7 +153,10 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 `tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
 fallback and its outage is deliberately invisible here), or
 `extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
-YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` or tune `YTDLP_PLAYER_CLIENTS`).
+YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` or tune `YTDLP_PLAYER_CLIENTS`),
+or `downloads_failing` (yt-dlp extracts fine but no file is produced — check the cache volume and
+MP4Box). The two are separate because the remedy is: an outage where every download fails locally
+would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full disk.
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
 answering while every trailer silently comes back empty.
 

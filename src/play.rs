@@ -295,19 +295,33 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         if e.reason == "extraction_failed" {
             state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // A local failure is not the extractor's fault, but it is still a total outage from the
+        // viewer's side, and it used to move nothing at all.
+        if e.reason == "incomplete_download" {
+            state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err(e);
     }
     state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed); // extraction worked → clear the signal
 
     // Detect the content rect (cached for /crop) and bake a `clap` box — on the TEMP file, BEFORE
-    // publishing. So the file that appears at `fp` is already final and immutable: no request can
-    // serve it mid-clap-write, and a crash/kill during the bake leaves the temp (not a corrupt
-    // cached file). Best-effort — a play must never break because crop detection did.
+    // publishing, so no request can serve it mid-write. Best-effort: a play must not break because
+    // crop detection did, and a bake that never ran leaves the file exactly as it was.
+    //
+    // A bake that was KILLED part-way is different, and the distinction was being thrown away with
+    // the return value. MP4Box rewrites in place, on the same inode, so an interrupted one leaves a
+    // half-rewritten trailer — which was then renamed into the cache and served immutable for a
+    // year, never re-fetched. Better to lose the download and re-fetch than to cache that.
     if let Some(report) = crate::crop::detect(&state.cfg, &vid, &tmp).await {
         crate::crop::cache_report(&state, &vid, report.clone());
-        crate::crop::bake_clap(&state.cfg, &tmp, &report).await;
+        if crate::crop::bake_clap(&state.cfg, &tmp, &report).await == crate::crop::Bake::Damaged {
+            remove_temp_set(&state.cfg, &tmp).await;
+            state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PlayError::bake_interrupted());
+        }
     }
 
+    state.local_fails.store(0, std::sync::atomic::Ordering::Relaxed); // a trailer got produced
     tokio::fs::rename(&tmp, &fp).await.map_err(|e| {
         let _ = std::fs::remove_file(&tmp); // by here yt-dlp has merged and cleaned its own siblings
         PlayError {

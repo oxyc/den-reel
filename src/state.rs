@@ -74,6 +74,11 @@ pub struct AppState {
     /// on any resolve that DOES yield a playable trailer, so only a real run of failures accumulates.
     /// Surfaced as `degraded: extractor_unavailable` past the threshold (ADDON-02).
     pub extract_fails: AtomicU32,
+    /// Consecutive downloads that failed for a LOCAL reason — exit 0 with no file, a bake killed
+    /// mid-rewrite. Separate from `extract_fails` because the fix is different: nothing about
+    /// yt-dlp or the player clients will help. Without it these were invisible, and an instance
+    /// failing every single download reported `ok`.
+    pub local_fails: AtomicU32,
 }
 
 impl AppState {
@@ -112,6 +117,7 @@ impl AppState {
             prewarm_sem,
             probe_sem,
             extract_fails: AtomicU32::new(0),
+            local_fails: AtomicU32::new(0),
         })
     }
 }

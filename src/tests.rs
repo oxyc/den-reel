@@ -240,6 +240,7 @@ fn build_state_full(
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
+        local_fails: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
@@ -320,29 +321,29 @@ fn classify_defaults_to_502() {
 fn health_reports_degraded_and_ok_states() {
     // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
     assert_eq!(
-        crate::health_body(false, 0, 0),
+        crate::health_body(false, 0, 0, 0),
         json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     );
     // A missing key wins even if upstreams / the extractor are also failing.
-    assert_eq!(crate::health_body(false, 99, 99)["reason"], "tmdb_key_missing");
+    assert_eq!(crate::health_body(false, 99, 99, 0)["reason"], "tmdb_key_missing");
 
     // Key present but upstreams have been failing (>= threshold) → degraded (wins over the extractor).
     assert_eq!(
-        crate::health_body(true, 3, 99),
+        crate::health_body(true, 3, 99, 0),
         json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     );
-    assert_eq!(crate::health_body(true, 4, 0)["reason"], "upstream_unavailable");
+    assert_eq!(crate::health_body(true, 4, 0, 0)["reason"], "upstream_unavailable");
 
     // Upstreams fine but yt-dlp can't extract anything (>= threshold) → degraded (the silent-outage gap).
     assert_eq!(
-        crate::health_body(true, 0, 3)["reason"],
+        crate::health_body(true, 0, 3, 0)["reason"],
         json!("extractor_unavailable")
     );
-    assert_eq!(crate::health_body(true, 0, 2), json!({"status": "ok"})); // below threshold → ok
+    assert_eq!(crate::health_body(true, 0, 2, 0), json!({"status": "ok"})); // below threshold → ok
 
     // Key present, everything below the threshold → ok.
-    assert_eq!(crate::health_body(true, 0, 0), json!({"status": "ok"}));
-    assert_eq!(crate::health_body(true, 2, 2), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 0, 0, 0), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 2, 2, 0), json!({"status": "ok"}));
 }
 
 // --- resolve logic ----------------------------------------------------------
@@ -747,7 +748,8 @@ async fn clap_pipeline_bakes_box_end_to_end() {
     let report = crate::crop::detect(&cfg, "clapvid0001", &fp).await.expect("detect returned a rect");
     assert!(report.letterboxed, "132px bars should read as letterboxed");
     assert_eq!(report.content.as_ref().unwrap().h, 816);
-    assert!(crate::crop::bake_clap(&cfg, &fp, &report).await, "MP4Box should write the clap box");
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Baked,
+               "MP4Box should write the clap box");
 
     // ffprobe reads the clap back as frame cropping — 132px top & bottom.
     let out = std::process::Command::new("ffprobe")
@@ -784,7 +786,8 @@ async fn clap_pipeline_crops_transient_logo_end_to_end() {
     // The logo appears in a minority of keyframes, so the typical box is still the 816 letterbox and
     // the logo is cropped away — a union would have reported a taller box here and kept the bar.
     assert_eq!(report.content.as_ref().unwrap().h, 816, "a transient logo must not hold the bar open");
-    assert!(crate::crop::bake_clap(&cfg, &fp, &report).await, "MP4Box should write the clap box");
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Baked,
+               "MP4Box should write the clap box");
 
     let out = std::process::Command::new("ffprobe")
         .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
@@ -820,7 +823,8 @@ async fn detect_does_not_crop_mixed_framing_end_to_end() {
     assert!(!report.letterboxed, "a trailer with genuine full-frame shots must not be cropped");
     assert_eq!(report.content.as_ref().unwrap().h, 1080, "full frame kept, not sliced to the letterbox");
     // And nothing is baked, so an AVPlayer sees the full frame.
-    assert!(!crate::crop::bake_clap(&cfg, &fp, &report).await, "no clap baked for a full-frame report");
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped,
+               "no clap baked for a full-frame report");
 }
 
 // A PORTRAIT trailer (landscape clip padded into a tall frame) must NOT be letterbox-cropped — that
@@ -846,7 +850,8 @@ async fn detect_does_not_crop_portrait_end_to_end() {
     let report = crate::crop::detect(&cfg, "portrait0001", &fp).await.expect("detect returned a report");
     assert!(!report.letterboxed, "a portrait source must not be letterbox-cropped");
     assert_eq!(report.content.as_ref().unwrap().h, 1280, "full portrait frame kept, not a thin strip");
-    assert!(!crate::crop::bake_clap(&cfg, &fp, &report).await, "no clap baked for a portrait trailer");
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped,
+               "no clap baked for a portrait trailer");
 }
 
 #[tokio::test]
@@ -2434,32 +2439,47 @@ async fn an_error_written_after_exit_is_still_captured() {
     );
 }
 
-/// A descendant still writing the output when the grace expires gets SIGKILLed mid-write. Publishing
-/// what is on disk then caches a truncated MP4 permanently — served `immutable` for a year, and
-/// never re-fetched, because any cached file with len > 0 counts as a hit.
+/// MP4Box rewrites the trailer IN PLACE, on the same inode, so a bake that was killed part-way
+/// leaves a half-rewritten file — which then gets renamed into the cache and served immutable for a
+/// year, never re-fetched. Whether the bake ran at all is therefore the load-bearing distinction,
+/// and it was being thrown away with a bool: "disabled" and "killed mid-rewrite" were both `false`.
 #[tokio::test]
-async fn a_download_killed_mid_write_is_not_published() {
+async fn a_bake_that_ran_and_failed_is_not_the_same_as_one_that_never_ran() {
     let dir = temp_dir();
-    let fake = dir.join("ytdlp-writer-outlives");
-    // Exit 0, leaving a descendant that holds stderr AND keeps appending to the output.
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
-         head -c 1000 /dev/zero > \"$out\"\n\
-         (i=0; while [ $i -lt 200 ]; do head -c 1000 /dev/zero >> \"$out\"; sleep 0.1; i=$((i+1)); done) &\n\
-         exit 0\n",
-    )
-    .unwrap();
+    let fp = dir.join("bakevid0001.mp4");
+    std::fs::write(&fp, vec![0u8; 2048]).unwrap();
+    let report = crate::crop::report_from(
+        "bakevid0001",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let failing = dir.join("mp4box-fails");
+    std::fs::write(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut cfg = test_cfg(dir.clone());
-    cfg.ytdlp = fake.to_string_lossy().into_owned();
-    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
-        .await
-        .expect_err("a half-written file must not be reported as a download");
+    cfg.mp4box = failing.to_string_lossy().into_owned();
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Damaged,
+        "a bake that RAN and failed may have half-rewritten the file"
+    );
 
-    assert_eq!(err.reason, "incomplete_download", "a truncated file was published: {err:?}");
+    // A binary that cannot start never touched the file, so the download is still publishable.
+    let mut cfg = test_cfg(dir.clone());
+    cfg.mp4box = dir.join("no-such-mp4box").to_string_lossy().into_owned();
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "a missing MP4Box must not condemn a perfectly good download"
+    );
+
+    // ...and so does baking being switched off.
+    let mut cfg = test_cfg(dir.clone());
+    cfg.bake_clap = false;
+    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped);
 }
 
 /// yt-dlp exiting 0 with no file is a LOCAL failure — a grace kill, a full disk, a bad output path
@@ -2483,5 +2503,88 @@ async fn exit_zero_with_no_file_is_not_blamed_on_the_extractor() {
     assert_ne!(
         err.reason, "extraction_failed",
         "a local failure was charged to the extractor's health signal: {err:?}"
+    );
+}
+
+/// A total outage has to show up somewhere. Local failures — no output file, a bake killed
+/// mid-rewrite — are not the extractor's fault, so they must not say "bump yt-dlp"; but they used
+/// to move nothing at all, and an instance failing every single download reported `ok`.
+#[test]
+fn downloads_failing_locally_degrade_health_under_their_own_reason() {
+    let t = crate::HEALTH_FAIL_THRESHOLD;
+    let ok = crate::health_body(true, 0, 0, 0);
+    assert_eq!(ok["status"], "ok");
+
+    let local = crate::health_body(true, 0, 0, t);
+    assert_eq!(local["status"], "degraded", "every download failing still reported ok");
+    assert_eq!(local["reason"], "downloads_failing");
+    let detail = local["detail"].as_str().unwrap_or_default();
+    assert!(!detail.contains("yt-dlp can't extract"), "local failures blamed the extractor: {detail}");
+
+    // An extractor outage still wins: it is the more specific diagnosis.
+    let both = crate::health_body(true, 0, t, t);
+    assert_eq!(both["reason"], "extractor_unavailable");
+}
+
+/// A bake that never started leaves the trailer untouched; one that started and stopped part-way
+/// may have half-rewritten it in place. Collapsing those two into "failed" is what published a
+/// corrupt file, so the mapping is asserted directly — the timeout arm is otherwise 30s away.
+#[test]
+fn only_a_bake_that_never_started_leaves_a_publishable_file() {
+    use crate::crop::{bake_outcome, Bake, BakeRun};
+    assert_eq!(bake_outcome(BakeRun::Exited(true)), Bake::Baked);
+    assert_eq!(bake_outcome(BakeRun::NeverStarted), Bake::Skipped);
+    assert_eq!(bake_outcome(BakeRun::Exited(false)), Bake::Damaged);
+    assert_eq!(
+        bake_outcome(BakeRun::Killed),
+        Bake::Damaged,
+        "a bake killed mid-rewrite was treated as if it had never touched the file"
+    );
+}
+
+/// The gate itself: a bake that may have half-rewritten the file must not be renamed into the cache.
+/// Once published it is served `immutable` for a year and never re-fetched, because any cached file
+/// with len > 0 counts as a hit — so a single interrupted bake is permanent.
+#[tokio::test]
+async fn a_damaged_bake_is_not_renamed_into_the_cache() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let sh = |p: &std::path::Path, body: &str| {
+        std::fs::write(p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // yt-dlp: write the output and exit 0.
+    let yt = dir.join("yt");
+    sh(&yt, "out=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 4096 /dev/zero > \"$out\"");
+    // ffmpeg: report a letterboxed rect so a clap is worth baking.
+    let ff = dir.join("ff");
+    sh(&ff, "echo '  Stream #0:0: Video: h264, yuv420p, 1920x1080 [SAR 1:1]' >&2\ni=0; while [ $i -lt 12 ]; do echo 'crop=1920:800:0:140' >&2; i=$((i+1)); done");
+    // MP4Box: ran, and failed — so the trailer may be mid-rewrite.
+    let mp = dir.join("mp");
+    sh(&mp, "echo boom >&2; exit 1");
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.ffmpeg = ff.to_string_lossy().into_owned();
+    cfg.mp4box = mp.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "bakevid0002".into())
+        .await
+        .expect_err("a possibly-corrupt trailer must not be published");
+    assert_eq!(err.reason, "incomplete_download", "{err:?}");
+    assert!(
+        !dir.join("bakevid0002.mp4").exists(),
+        "a half-rewritten trailer was published to the cache"
+    );
+    // ...and it has to be visible. An instance failing every download this way reported `ok`.
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "a local download failure moved no health signal at all"
+    );
+    assert_eq!(
+        state.extract_fails.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a local failure was charged to the extractor"
     );
 }

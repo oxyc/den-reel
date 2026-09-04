@@ -86,7 +86,7 @@ const HEALTH_FAIL_THRESHOLD: u32 = 3;
 /// so no install can supply one), or when TMDB has been failing
 /// (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`. `/health` is addon-level (no
 /// per-install config), so a keyring being present is enough to consider trailers workable.
-fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32) -> serde_json::Value {
+fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32, local_fails: u32) -> serde_json::Value {
     if !tmdb_available {
         serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
@@ -95,6 +95,10 @@ fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32) -
         // Trailers resolve upstream but yt-dlp can't extract any of them here — YouTube BotGuard or a
         // stale yt-dlp / broken nsig-JS runtime. Bump YTDLP_VERSION (Dockerfile) or tune YTDLP_PLAYER_CLIENTS.
         serde_json::json!({"status": "degraded", "reason": "extractor_unavailable", "detail": "yt-dlp can't extract YouTube here — bump yt-dlp or set YTDLP_PLAYER_CLIENTS"})
+    } else if local_fails >= HEALTH_FAIL_THRESHOLD {
+        // Downloads are failing for a reason that is ours, not YouTube's — no output file, or a
+        // clap bake killed part-way. Named separately because "bump yt-dlp" is the wrong advice.
+        serde_json::json!({"status": "degraded", "reason": "downloads_failing", "detail": "yt-dlp extracts fine but no trailer file is being produced — check the cache volume and MP4Box"})
     } else {
         serde_json::json!({"status": "ok"})
     }
@@ -120,7 +124,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         // fallback: its outage does not mean trailers are broken, so it does not move this.
         let tmdb_available = state.cfg.tmdb_key.is_some() || state.config_keyring.is_some();
         let extract_fails = state.extract_fails.load(std::sync::atomic::Ordering::Relaxed);
-        let body = health_body(tmdb_available, state.upstream.recent_failures(), extract_fails);
+        let local_fails = state.local_fails.load(std::sync::atomic::Ordering::Relaxed);
+        let body = health_body(tmdb_available, state.upstream.recent_failures(), extract_fails, local_fails);
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {

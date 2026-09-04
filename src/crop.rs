@@ -343,12 +343,28 @@ pub fn clap_params(report: &CropReport) -> Option<(u32, u32, i64, i64)> {
 /// faststart preserved) so the billboard AVPlayer crops the letterbox. Best-effort: any failure is
 /// logged and ignored — the un-clap'd file still plays fine (clients that don't read clap just show
 /// the full frame). No-op when disabled or not letterboxed.
-pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
+/// What a bake did to the file, which is not the same question as whether it worked.
+///
+/// MP4Box rewrites IN PLACE — verified against GPAC 26.02, same inode before and after, with the
+/// content change landing as a burst near the end of a 1.5s run on a 200 MB file. So a bake that
+/// was killed (its 30s timeout, or a redeploy) can leave the trailer half-rewritten, and the
+/// caller renames that into the cache where it is served immutable for a year and never
+/// re-fetched. A bake that never ran leaves the file exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bake {
+    /// Disabled, not letterboxed, or MP4Box could not be started: the file is untouched.
+    Skipped,
+    Baked,
+    /// MP4Box ran and did not finish cleanly. The file may be mid-rewrite — do not publish it.
+    Damaged,
+}
+
+pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
     if !cfg.bake_clap {
-        return false;
+        return Bake::Skipped;
     }
     let Some((w, h, ho, vo)) = clap_params(report) else {
-        return false;
+        return Bake::Skipped;
     };
     let spec = format!("1={w},1,{h},1,{ho},2,{vo},2");
     let mut cmd = Command::new(&cfg.mp4box);
@@ -371,7 +387,7 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
     )
     .await
     {
-        Ok(Ok(o)) if o.status.success() => true,
+        Ok(Ok(o)) if o.status.success() => bake_outcome(BakeRun::Exited(true)),
         Ok(Ok(o)) => {
             eprintln!(
                 "bake_clap {}: exit {:?} — {}",
@@ -379,12 +395,36 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
                 o.status.code(),
                 crate::ytdlp::stderr_tail(&o.stderr)
             );
-            false
+            bake_outcome(BakeRun::Exited(false))
         }
-        other => {
-            eprintln!("bake_clap {}: {other:?}", fp.display());
-            false
+        Ok(Err(e)) => {
+            eprintln!("bake_clap {}: could not start MP4Box — {e}", fp.display());
+            bake_outcome(BakeRun::NeverStarted)
         }
+        Err(_) => {
+            eprintln!("bake_clap {}: exceeded {BAKE_TIMEOUT_SECS}s and was killed mid-rewrite", fp.display());
+            bake_outcome(BakeRun::Killed)
+        }
+    }
+}
+
+/// How a bake ended, before deciding what that means for the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BakeRun {
+    Exited(bool),
+    /// MP4Box could not be spawned at all.
+    NeverStarted,
+    /// Timed out, so it was SIGKILLed — possibly part-way through the in-place rewrite.
+    Killed,
+}
+
+/// The whole point of the enum: "it didn't run" and "it ran and stopped half way" are both
+/// failures, and only one of them leaves a file worth publishing.
+pub(crate) fn bake_outcome(run: BakeRun) -> Bake {
+    match run {
+        BakeRun::Exited(true) => Bake::Baked,
+        BakeRun::NeverStarted => Bake::Skipped,
+        BakeRun::Exited(false) | BakeRun::Killed => Bake::Damaged,
     }
 }
 
