@@ -25,7 +25,7 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Resolve latest eligible deno release
         id: rel
@@ -81,7 +81,7 @@ jobs:
       - name: Open PR
         id: cpr
         if: steps.rel.outputs.proceed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.YTDLP_PR_TOKEN }}
           branch: deno-bump/${{ steps.rel.outputs.version }}
