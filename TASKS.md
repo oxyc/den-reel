@@ -118,6 +118,28 @@ the 500 at `play.rs:460`.
 Make the retry force a fresh download rather than joining a completed entry. Do not fix it by
 sleeping or spinning.
 
+## STILL OPEN — the cached-serve path takes 3–4 blocking-pool dispatches where 1 would do
+
+Raised by the round-3 performance audit and deliberately **not** taken, because it is a refactor of
+the most delicate code in the service rather than a fix.
+
+Serving an already-cached `/play` currently pays: `tokio::fs::metadata` in `fetch_trailer`
+(`play.rs`, the cache-hit check), `File::open` in `serve_file`, and `file.metadata()` right after it
+— three `spawn_blocking` round-trips, each a full task handoff on a current-thread runtime, plus a
+fourth for `seek` on a Range request. The stat largely duplicates what the open and fstat establish.
+
+Collapsing them means `fetch_trailer` handing back an open `File` instead of a `PathBuf`, which
+changes its contract for `/crop` (which wants the path, not the handle) and for the eviction retry in
+`handle_play`. That is worth doing, with its own test pass — not as a late edit in an audit loop.
+
+After the `touch_atime` gate landed, this is the largest remaining cost on the hot path, and it is
+now bigger than everything the `cache_available` memo saved.
+
+**Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold or shutdown path,
+and the code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms`
+then re-locks to fetch; `sign::key_of` re-derives the MAC key per id and per secret (default-off);
+`save_resolve_cache` builds a borrowed map and a full `Vec<u8>` rather than streaming into a writer.
+
 ## ACCEPTED RISK — `/stats` is served without a gate
 
 Raised by three independent audit passes; resolved deliberately, not overlooked. `/stats` reports

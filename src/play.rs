@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::config::Config;
 use crate::httputil::{self, parse_range, Body, RangeReq};
-use crate::state::{default_clock, AppState, BoxFuture, SharedDownload};
+use crate::state::{AppState, BoxFuture, SharedDownload};
 use crate::ytdlp::{self, PlayError};
 
 /// Read buffer for streaming a cached file out. 256 KiB (vs ReaderStream's 4 KiB default) — one
@@ -31,6 +31,19 @@ fn cache_path(cfg: &Config, vid: &str) -> PathBuf {
 
 /// How long a POSITIVE cache-availability answer stands before we probe the volume again.
 const CACHE_OK_TTL_MS: u64 = 5_000;
+
+/// Milliseconds since this process started. MONOTONIC, unlike `default_clock`.
+///
+/// The memo below is an absolute deadline, and comparing one against the wall clock means a
+/// backward step — chrony past its slew threshold, a VM restored from a snapshot, a host correcting
+/// after a dead RTC battery — holds the deadline in the future for the size of the step rather than
+/// for five seconds. What that suppresses is not merely a check: `create_dir_all` is also the repair,
+/// so a directory one call would have recreated stays missing, and none of those requests observe a
+/// failure that would clear the memo. `Instant` cannot step.
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 
 /// Is the on-disk cache usable? `create_dir_all` is idempotent, so this doubles as a self-healing
 /// check — a volume that comes back after boot recovers without a restart. `/play` and `/crop` gate
@@ -52,7 +65,7 @@ const CACHE_OK_TTL_MS: u64 = 5_000;
 /// would let one test's verdict about its own temp directory answer another test's question about a
 /// different one.
 pub async fn cache_available(cfg: &Config) -> bool {
-    let now = default_clock();
+    let now = monotonic_ms();
     if now < cfg.cache_ok_until.load(Ordering::Relaxed) {
         return true;
     }
@@ -64,6 +77,22 @@ pub async fn cache_available(cfg: &Config) -> bool {
     }
     ok
 }
+
+/// Drop the memo, so the next `/play` or `/crop` probes the volume for real.
+///
+/// Called when a download fails for a reason that is OURS rather than YouTube's. Without it the memo
+/// converted a volume that vanished into up to five seconds of requests that sail past the 503 gate
+/// into `download_cached`, and each of those does lasting damage: the failure is pinned per-id for
+/// two to five minutes, and the counter it moves reports as `extractor_unavailable` — sending the
+/// operator to bump yt-dlp over a disk that went away. That mis-routing is the exact thing the
+/// local/extraction split exists to prevent. One observed local failure now costs one request.
+pub(crate) fn invalidate_cache_availability(cfg: &Config) {
+    cfg.cache_ok_until.store(0, Ordering::Relaxed);
+}
+
+/// Don't re-stamp a cached file's atime more often than this. The eviction TTL it feeds is measured
+/// in days (`CACHE_TTL_DAYS`), so an hour's resolution decides every case the same way.
+const TOUCH_MIN_AGE: Duration = Duration::from_secs(3600);
 
 /// Bump a cached file's atime so the LRU eviction sees it as recently used. Fire-and-forget so the
 /// hot serve path isn't slowed; a rare eviction/serve race is handled by the open-miss refetch in
@@ -454,7 +483,15 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         // is_file, not just non-empty: a directory reports a non-zero length, so anything that left
         // one at a trailer's path was served as a cache hit that serve_file could then never open.
         if md.is_file() && md.len() > 0 {
-            touch_atime(fp.clone()); // bump atime for LRU
+            // Only when the timestamp is actually stale. The LRU this feeds has a day-scale TTL, so
+            // re-stamping a file that was touched seconds ago changes no decision — and it is not
+            // free: it is a blocking-pool dispatch plus an open/set_times/close. One playback is
+            // many /play requests (AVPlayer opens with a range and then keeps ranging), so this was
+            // paid several times per trailer watched, to write a value nothing reads at that
+            // resolution. The `md` in hand already carries the answer.
+            if md.accessed().map(|a| a.elapsed().map(|d| d > TOUCH_MIN_AGE).unwrap_or(true)).unwrap_or(true) {
+                touch_atime(fp.clone());
+            }
             return Ok(fp);
         }
     }
@@ -541,6 +578,12 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
 
     if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
         remove_temp_set(&state.cfg, &tmp).await;
+        // Re-probe the volume on the next request. Deliberately on ANY failure, not just the ones
+        // classified local: a cache dir that has gone away makes yt-dlp fail on its own `-o` path
+        // with a message `classify` does not recognise, so the very case this exists to catch
+        // arrives wearing `extraction_failed`. Getting it wrong the other way costs one pair of
+        // idempotent create_dir_all calls after a failed download, which is nothing.
+        invalidate_cache_availability(&state.cfg);
         // /health signal (moved here from the old resolve-time probe): a SYSTEMIC extraction failure
         // (YouTube BotGuard / a broken nsig-JS runtime) bumps the counter; a per-video geo-block/removal
         // does not. A successful download below clears it. `extractor_unavailable` trips past the threshold.
@@ -569,6 +612,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         if crate::crop::bake_clap(&state.cfg, &tmp, &report).await == crate::crop::Bake::Damaged {
             remove_temp_set(&state.cfg, &tmp).await;
             state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            invalidate_cache_availability(&state.cfg);
             return Err(PlayError::bake_interrupted());
         }
     }
@@ -581,6 +625,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         // here rather than in download_to, an instance failing EVERY download at the rename moved
         // no counter at all and reported ok.
         state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        invalidate_cache_availability(&state.cfg);
         PlayError::incomplete(format!("rename {}: {e}", tmp.display()))
     })?;
     // Cleared only once a trailer is actually in the cache — before the rename it was cleared by a

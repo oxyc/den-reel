@@ -30,8 +30,15 @@ pub fn manifest() -> Value {
     })
 }
 
+/// `tt` + digits, and a BOUNDED number of them. The longest real IMDb id is 8 digits; 11 leaves
+/// room for a decade of growth and still bounds everything downstream that this string becomes —
+/// the upstream request path, and the resolve cache key it is interpolated into. Unbounded, a
+/// caller could put a 60-digit id in a cache key and inflate the parked cache past the size the
+/// loader will read, which silently disables persistence from then on. `/meta` has no gate in
+/// front of it, so "nobody would do that" is not a bound.
 fn is_imdb(id: &str) -> bool {
-    id.strip_prefix("tt").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    id.strip_prefix("tt")
+        .is_some_and(|d| (1..=11).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `^[a-z]{2}$` (case-insensitive), else the caller falls back to "en".
