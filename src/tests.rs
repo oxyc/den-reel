@@ -2444,7 +2444,7 @@ async fn an_error_written_after_exit_is_still_captured() {
 /// year, never re-fetched. Whether the bake ran at all is therefore the load-bearing distinction,
 /// and it was being thrown away with a bool: "disabled" and "killed mid-rewrite" were both `false`.
 #[tokio::test]
-async fn a_bake_that_ran_and_failed_is_not_the_same_as_one_that_never_ran() {
+async fn a_refusal_that_never_wrote_is_not_damage() {
     let dir = temp_dir();
     let fp = dir.join("bakevid0001.mp4");
     std::fs::write(&fp, vec![0u8; 2048]).unwrap();
@@ -2455,16 +2455,31 @@ async fn a_bake_that_ran_and_failed_is_not_the_same_as_one_that_never_ran() {
     );
 
     use std::os::unix::fs::PermissionsExt;
-    let failing = dir.join("mp4box-fails");
-    std::fs::write(&failing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Refused without touching the file — what a real MP4Box does for a bad flag, a missing track,
+    // a read-only target or an unparseable MP4. The trailer is fine.
+    let refusing = dir.join("mp4box-refuses");
+    std::fs::write(&refusing, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut cfg = test_cfg(dir.clone());
-    cfg.mp4box = failing.to_string_lossy().into_owned();
+    cfg.mp4box = refusing.to_string_lossy().into_owned();
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "a refusal that never wrote cost us the trailer"
+    );
+
+    // Failed PART WAY through the rewrite — ENOSPC, EIO. This one really did damage it.
+    let mangling = dir.join("mp4box-mangles");
+    std::fs::write(&mangling, "#!/bin/sh\nf=\"${@: -1}\"\nhead -c 64 /dev/zero >> \"$f\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&mangling, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.mp4box = mangling.to_string_lossy().into_owned();
     assert_eq!(
         crate::crop::bake_clap(&cfg, &fp, &report).await,
         crate::crop::Bake::Damaged,
-        "a bake that RAN and failed may have half-rewritten the file"
+        "a bake that wrote and then failed left a half-rewritten file"
     );
 
     // A binary that cannot start never touched the file, so the download is still publishable.
@@ -2526,15 +2541,25 @@ fn downloads_failing_locally_degrade_health_under_their_own_reason() {
     assert_eq!(both["reason"], "extractor_unavailable");
 }
 
-/// A bake that never started leaves the trailer untouched; one that started and stopped part-way
-/// may have half-rewritten it in place. Collapsing those two into "failed" is what published a
-/// corrupt file, so the mapping is asserted directly — the timeout arm is otherwise 30s away.
+/// An exit code does not say whether the file was written. MP4Box validates its arguments and its
+/// input before opening the target, so every refusal mode — unknown flag, no such track, read-only
+/// target, unparseable MP4 — leaves it byte-identical; treating those as damage deleted perfectly
+/// good trailers. Only a run that actually touched the file and did not finish is unpublishable.
 #[test]
-fn only_a_bake_that_never_started_leaves_a_publishable_file() {
+fn only_a_bake_that_actually_wrote_condemns_the_file() {
     use crate::crop::{bake_outcome, Bake, BakeRun};
-    assert_eq!(bake_outcome(BakeRun::Exited(true)), Bake::Baked);
+    assert_eq!(bake_outcome(BakeRun::Ok), Bake::Baked);
     assert_eq!(bake_outcome(BakeRun::NeverStarted), Bake::Skipped);
-    assert_eq!(bake_outcome(BakeRun::Exited(false)), Bake::Damaged);
+    assert_eq!(
+        bake_outcome(BakeRun::Refused { touched: false }),
+        Bake::Skipped,
+        "MP4Box refusing left the file byte-identical; losing the trailer over that is the worse bug"
+    );
+    assert_eq!(
+        bake_outcome(BakeRun::Refused { touched: true }),
+        Bake::Damaged,
+        "it exited non-zero AFTER writing — that file is half-rewritten"
+    );
     assert_eq!(
         bake_outcome(BakeRun::Killed),
         Bake::Damaged,
@@ -2561,7 +2586,7 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
     sh(&ff, "echo '  Stream #0:0: Video: h264, yuv420p, 1920x1080 [SAR 1:1]' >&2\ni=0; while [ $i -lt 12 ]; do echo 'crop=1920:800:0:140' >&2; i=$((i+1)); done");
     // MP4Box: ran, and failed — so the trailer may be mid-rewrite.
     let mp = dir.join("mp");
-    sh(&mp, "echo boom >&2; exit 1");
+    sh(&mp, "f=\"${@: -1}\"; head -c 64 /dev/zero >> \"$f\"; echo boom >&2; exit 1");
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
@@ -2573,6 +2598,11 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
         .await
         .expect_err("a possibly-corrupt trailer must not be published");
     assert_eq!(err.reason, "incomplete_download", "{err:?}");
+    // Name the failure, or this passes just as well when yt-dlp wrote nothing and the bake never ran.
+    assert!(
+        err.detail.contains("bake"),
+        "this asserts a blocked bake, but the failure was something else: {err:?}"
+    );
     assert!(
         !dir.join("bakevid0002.mp4").exists(),
         "a half-rewritten trailer was published to the cache"
@@ -2586,5 +2616,94 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
         state.extract_fails.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "a local failure was charged to the extractor"
+    );
+}
+
+/// The headline local failure — yt-dlp exits 0 and no file appears (a full or read-only cache
+/// volume) — must move the health counter. It had no coverage at all: only the bake path did.
+#[tokio::test]
+async fn a_download_that_produces_no_file_degrades_health_locally() {
+    let dir = temp_dir();
+    let fake = dir.join("yt-writes-nothing");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "nofilevid01".into())
+        .await
+        .expect_err("no output file is a failure");
+    assert_eq!(err.reason, "incomplete_download", "{err:?}");
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the full-disk case moved no health signal"
+    );
+}
+
+/// ...and it has to clear once a trailer is actually produced, or /health stays degraded forever
+/// after the volume is fixed.
+#[tokio::test]
+async fn a_produced_trailer_clears_the_local_failure_signal() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    state.local_fails.store(5, std::sync::atomic::Ordering::Relaxed);
+
+    crate::play::fetch_trailer(state.clone(), "goodvid0001".into())
+        .await
+        .expect("the download should succeed");
+    assert_eq!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "/health stayed degraded after downloads recovered"
+    );
+}
+
+/// A rename failure is ours — a full or read-only volume, or the destination already there as a
+/// directory — not the extractor's. It was reported as `extraction_failed`, and because both
+/// counters are cleared just before it and the error is built here rather than in download_to, an
+/// instance failing EVERY download at the rename moved no counter and reported ok.
+#[tokio::test]
+async fn a_failed_publish_is_local_and_visible() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let yt = dir.join("yt-writes");
+    std::fs::write(
+        &yt,
+        "#!/bin/sh\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The destination is a non-empty directory, so the rename cannot succeed.
+    let blocked = dir.join("blockedvid1.mp4");
+    std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let err = crate::play::fetch_trailer(state.clone(), "blockedvid1".into())
+        .await
+        .expect_err("the rename cannot succeed");
+    assert_eq!(err.reason, "incomplete_download", "a full volume was blamed on the extractor: {err:?}");
+    assert!(
+        state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "every download failing at the rename still reported ok"
     );
 }

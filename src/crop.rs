@@ -339,26 +339,26 @@ pub fn clap_params(report: &CropReport) -> Option<(u32, u32, i64, i64)> {
     Some((c.w, c.h, ho, vo))
 }
 
-/// Bake a `clap` box into the cached MP4 in place (MP4Box, ~13 ms, +40 bytes, no re-encode,
-/// faststart preserved) so the billboard AVPlayer crops the letterbox. Best-effort: any failure is
-/// logged and ignored — the un-clap'd file still plays fine (clients that don't read clap just show
-/// the full frame). No-op when disabled or not letterboxed.
-/// What a bake did to the file, which is not the same question as whether it worked.
+/// What a bake did to the FILE, which is not the same question as whether it worked.
 ///
-/// MP4Box rewrites IN PLACE — verified against GPAC 26.02, same inode before and after, with the
-/// content change landing as a burst near the end of a 1.5s run on a 200 MB file. So a bake that
-/// was killed (its 30s timeout, or a redeploy) can leave the trailer half-rewritten, and the
-/// caller renames that into the cache where it is served immutable for a year and never
-/// re-fetched. A bake that never ran leaves the file exactly as it was.
+/// MP4Box rewrites in place — verified against GPAC 26.02, same inode before and after, the content
+/// change landing as a burst near the end of a 1.5s run on a 200 MB file. So a bake killed part-way
+/// leaves a half-rewritten trailer, which the caller must not rename into the cache: it is served
+/// immutable for a year and never re-fetched. A bake that refused, or never ran, leaves the file
+/// exactly as it was, and losing that trailer over a cosmetic step would be the worse bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bake {
-    /// Disabled, not letterboxed, or MP4Box could not be started: the file is untouched.
+    /// The file is untouched: disabled, not letterboxed, MP4Box missing, or it refused.
     Skipped,
     Baked,
-    /// MP4Box ran and did not finish cleanly. The file may be mid-rewrite — do not publish it.
+    /// It was written to and not finished. Do not publish.
     Damaged,
 }
 
+/// Bake a `clap` box into the cached MP4 in place (MP4Box, ~13 ms, +40 bytes, no re-encode,
+/// faststart preserved) so the billboard AVPlayer crops the letterbox. Best-effort for everything
+/// except a half-written file — clients that don't read clap just show the full frame, so a trailer
+/// without the box is worth far more than no trailer. No-op when disabled or not letterboxed.
 pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
     if !cfg.bake_clap {
         return Bake::Skipped;
@@ -378,6 +378,7 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let before = file_stamp(fp).await;
     // output(), not status(): a piped stderr nobody reads can wedge the child on a full pipe.
     // Grouped and registered for the same reason as detect: a bake orphaned by a redeploy keeps
     // rewriting the trailer with no timeout behind it.
@@ -387,15 +388,17 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
     )
     .await
     {
-        Ok(Ok(o)) if o.status.success() => bake_outcome(BakeRun::Exited(true)),
+        Ok(Ok(o)) if o.status.success() => bake_outcome(BakeRun::Ok),
         Ok(Ok(o)) => {
+            let touched = file_stamp(fp).await != before;
             eprintln!(
-                "bake_clap {}: exit {:?} — {}",
+                "bake_clap {}: exit {:?}{} — {}",
                 fp.display(),
                 o.status.code(),
+                if touched { " AFTER writing" } else { " without touching the file" },
                 crate::ytdlp::stderr_tail(&o.stderr)
             );
-            bake_outcome(BakeRun::Exited(false))
+            bake_outcome(BakeRun::Refused { touched })
         }
         Ok(Err(e)) => {
             eprintln!("bake_clap {}: could not start MP4Box — {e}", fp.display());
@@ -411,21 +414,34 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
 /// How a bake ended, before deciding what that means for the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BakeRun {
-    Exited(bool),
+    /// Exited cleanly.
+    Ok,
+    /// Exited non-zero. `touched` says whether the file changed while it ran — which is the actual
+    /// question, and not one an exit code answers: MP4Box validates its arguments and the input
+    /// before opening the file for writing, so every refusal mode (unknown flag, no such track,
+    /// read-only target, unparseable MP4) leaves it byte-identical. Assuming otherwise deleted
+    /// perfectly good trailers. But a write that fails PART WAY — ENOSPC, EIO — also exits
+    /// non-zero, and that one really is damage, so the file itself has to be asked.
+    Refused { touched: bool },
     /// MP4Box could not be spawned at all.
     NeverStarted,
     /// Timed out, so it was SIGKILLed — possibly part-way through the in-place rewrite.
     Killed,
 }
 
-/// The whole point of the enum: "it didn't run" and "it ran and stopped half way" are both
-/// failures, and only one of them leaves a file worth publishing.
+/// Only a file that was actually written to and not finished is unpublishable.
 pub(crate) fn bake_outcome(run: BakeRun) -> Bake {
     match run {
-        BakeRun::Exited(true) => Bake::Baked,
-        BakeRun::NeverStarted => Bake::Skipped,
-        BakeRun::Exited(false) | BakeRun::Killed => Bake::Damaged,
+        BakeRun::Ok => Bake::Baked,
+        BakeRun::NeverStarted | BakeRun::Refused { touched: false } => Bake::Skipped,
+        BakeRun::Refused { touched: true } | BakeRun::Killed => Bake::Damaged,
     }
+}
+
+/// Size + mtime, the cheap evidence of whether something wrote to the file.
+async fn file_stamp(p: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let md = tokio::fs::metadata(p).await.ok()?;
+    Some((md.len(), md.modified().ok()?))
 }
 
 /// Insert a crop report into the cache, bounding growth (crop has no TTL, so cap the size).

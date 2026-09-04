@@ -45,7 +45,7 @@ impl PlayError {
     /// writing it when the grace expired. A LOCAL failure, deliberately not `extraction_failed`:
     /// that reason feeds /health's systemic signal, and telling the operator to bump yt-dlp for a
     /// grace kill or a full disk points at the wrong thing entirely.
-    fn incomplete(detail: String) -> PlayError {
+    pub(crate) fn incomplete(detail: String) -> PlayError {
         PlayError {
             status: 502,
             reason: "incomplete_download".into(),

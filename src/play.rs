@@ -232,7 +232,9 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
     }
     let fp = cache_path(&state.cfg, &vid);
     if let Ok(md) = tokio::fs::metadata(&fp).await {
-        if md.len() > 0 {
+        // is_file, not just non-empty: a directory reports a non-zero length, so anything that left
+        // one at a trailer's path was served as a cache hit that serve_file could then never open.
+        if md.is_file() && md.len() > 0 {
             touch_atime(fp.clone()); // bump atime for LRU
             return Ok(fp);
         }
@@ -321,16 +323,19 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         }
     }
 
-    state.local_fails.store(0, std::sync::atomic::Ordering::Relaxed); // a trailer got produced
     tokio::fs::rename(&tmp, &fp).await.map_err(|e| {
         let _ = std::fs::remove_file(&tmp); // by here yt-dlp has merged and cleaned its own siblings
-        PlayError {
-            status: 502,
-            reason: "extraction_failed".into(),
-            message: "Could not fetch this trailer.".into(),
-            detail: format!("rename {}: {e}", tmp.display()),
-        }
+        // A rename failure is ours — a full or read-only volume, {vid}.mp4 already there as a
+        // directory — not the extractor's. Calling it `extraction_failed` sent the operator after
+        // yt-dlp, and because the extraction counter was cleared just above and this error is built
+        // here rather than in download_to, an instance failing EVERY download at the rename moved
+        // no counter at all and reported ok.
+        state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PlayError::incomplete(format!("rename {}: {e}", tmp.display()))
     })?;
+    // Cleared only once a trailer is actually in the cache — before the rename it was cleared by a
+    // download that could still fail.
+    state.local_fails.store(0, std::sync::atomic::Ordering::Relaxed);
 
     let cfg = state.cfg.clone();
     let _ = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await;
