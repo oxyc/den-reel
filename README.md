@@ -101,6 +101,14 @@ so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see th
 504 {"error":"timeout", …}
 ```
 
+A failure is **remembered**, for a while that depends on why: "removed"/"restricted" for 6h,
+`geo_blocked` 30m, `extraction_failed` 5m, `incomplete_download` 2m, `timeout` 60s. Without that,
+every request for a video YouTube has removed spent another of three download slots, and another
+yt-dlp run, to rediscover it. `/meta` uses the same knowledge — a candidate `/play` has found dead is
+moved **behind** the ones that might work (never dropped: a region block can lift) and is not
+prewarmed. The TTLs differ because the reasons do: a removal is a fact, a timeout is usually our
+network. A restart clears all of it.
+
 `incomplete_download` is deliberately distinct from `extraction_failed`: yt-dlp extracted, but no
 trailer reached the cache — it exited 0 with no file, or the `clap` bake was killed part-way through
 its in-place rewrite and the result cannot be trusted. Nothing about yt-dlp or the player clients

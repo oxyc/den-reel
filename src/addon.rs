@@ -311,11 +311,19 @@ pub async fn handle_meta(
     // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.
     let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
     let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
-    let yt_ids = resolved.ids;
+    let mut yt_ids = resolved.ids;
+    // What /play learned, applied to what /meta hands out. Discovery does not probe, so without this
+    // a candidate that is geo-blocked or removed keeps its upstream rank forever and every client
+    // rediscovers it — one download permit and one yt-dlp process at a time.
+    crate::play::demote_known_dead(state, &mut yt_ids);
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
-    // the alternates are downloaded on demand only if that first one fails.
+    // the alternates are downloaded on demand only if that first one fails. After the demotion above,
+    // a primary that is STILL known dead means every candidate is — so there is nothing worth
+    // speculatively fetching, and the permit is better left for a /play someone is waiting on.
     if let Some(primary) = yt_ids.first() {
-        if query_param(query, "prewarm").as_deref() != Some("0") {
+        if query_param(query, "prewarm").as_deref() != Some("0")
+            && !crate::play::is_known_dead(state, primary)
+        {
             (state.prewarm)(state.clone(), primary.clone());
         }
     }

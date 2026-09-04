@@ -62,6 +62,11 @@ const _: () = assert!(
 );
 pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
 pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the same way
+// Bound the /play failure cache. Far smaller than the two above on purpose: those hold answers worth
+// keeping, this holds a reason to not re-spawn yt-dlp for a minute or six hours, every entry expires
+// on its own, and losing one costs exactly one repeated download. A homelab sees a few hundred
+// distinct trailers, so 512 covers the working set without reserving memory for a library.
+pub const PLAY_FAIL_MAX: usize = 512;
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
 const _: () = assert!(
     PREWARM_MAX < DOWNLOAD_CONCURRENCY,

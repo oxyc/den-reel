@@ -234,6 +234,7 @@ fn build_state_full(
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
         crop_cache: Mutex::new(HashMap::new()),
+        play_fails: Mutex::new(HashMap::new()),
         upstream,
         prober,
         searcher,
@@ -252,6 +253,20 @@ fn build_state_clock(cache_dir: PathBuf, upstream: Box<dyn Upstream>, clock: cra
     let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
     state.clock = clock;
     Arc::new(state)
+}
+
+/// Both at once: a real `Config` (so a test can point `ytdlp` at a fake) and a driven clock (so a
+/// TTL can be asserted by advancing time rather than sleeping).
+fn build_state_cfg_clock(cfg: Config, upstream: Box<dyn Upstream>, clock: crate::state::ClockFn) -> Arc<AppState> {
+    let state = build_state_cfg(cfg, upstream, always_playable(), noop_prewarm());
+    let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
+    state.clock = clock;
+    Arc::new(state)
+}
+
+/// How many times the fake yt-dlp was actually run (it appends a line per invocation).
+fn spawn_count(p: &std::path::Path) -> usize {
+    std::fs::read_to_string(p).map(|s| s.lines().count()).unwrap_or(0)
 }
 
 /// Start the real router on an ephemeral port; returns the base URL.
@@ -2758,6 +2773,112 @@ async fn a_failed_publish_is_local_and_visible() {
     assert!(
         state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "every download failing at the rename still reported ok"
+    );
+}
+
+/// A `/play` verdict was the one thing this service learned and then immediately forgot: the
+/// in-flight entry is cleared however a download ends, so the next request for a video YouTube has
+/// REMOVED spent another of three download permits, and another yt-dlp process, to rediscover it.
+#[tokio::test]
+async fn a_removed_video_is_not_re_extracted_on_every_request() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    let spawns = dir.join("spawns");
+    let yt = dir.join("yt-dead");
+    std::fs::write(
+        &yt,
+        format!(
+            "#!/bin/sh\necho x >> {}\necho 'ERROR: Video unavailable' >&2\nexit 1\n",
+            spawns.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+
+    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into())
+        .await
+        .expect_err("the video is gone");
+    assert_eq!(err.reason, "unavailable");
+    assert_eq!(spawn_count(&spawns), 1, "the first request extracts");
+
+    // Same answer, and it must cost nothing.
+    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into())
+        .await
+        .expect_err("still gone");
+    assert_eq!(err.reason, "unavailable", "the cached failure lost its reason");
+    assert_eq!(spawn_count(&spawns), 1, "a removed video was re-extracted on the next request");
+
+    // ...but it is a cache, not a tombstone.
+    clock.advance(crate::play::fail_ttl_ms("unavailable") + 1);
+    let _ = crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await;
+    assert_eq!(spawn_count(&spawns), 2, "the failure never expired");
+}
+
+/// The TTL has to follow the REASON. One uniform value is wrong in both directions: short enough
+/// not to pin a slow network as a dead trailer means re-extracting a removed video all afternoon;
+/// long enough to stop that means a timeout during one bad minute costs the trailer for hours.
+#[test]
+fn a_failure_ttl_follows_the_reason() {
+    let ttl = crate::play::fail_ttl_ms;
+    assert!(
+        ttl("unavailable") > ttl("geo_blocked"),
+        "a removal is a fact about the world; a region block can lift"
+    );
+    assert!(
+        ttl("geo_blocked") > ttl("timeout"),
+        "a timeout is the reason most likely to be our network rather than the video"
+    );
+    assert!(ttl("timeout") > 0, "a stuck id must not be free to take a download permit every request");
+    assert_eq!(ttl("something-new"), ttl("timeout"), "an unrecognised reason assumes the least");
+}
+
+/// Discovery does not probe, so a candidate that is geo-blocked or removed keeps its upstream rank
+/// forever and every client rediscovers it. /play is the only thing that finds out; /meta should
+/// listen — and should not spend a speculative download on an id it already knows is dead.
+#[tokio::test]
+async fn meta_demotes_and_stops_prewarming_a_candidate_play_found_dead() {
+    let warmed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let rec = warmed.clone();
+    let prewarm: PrewarmFn = Box::new(move |_state, id| rec.lock().unwrap().push(id));
+    let fake = FakeUpstream::new(&["deadFirst01", "liveSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), prewarm);
+
+    // Exactly what a failed /play leaves behind.
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "This trailer is no longer available.".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadFirst01", &gone);
+
+    let base = spawn_server(state).await;
+    let body: serde_json::Value = reqwest::get(format!("{base}/meta/movie/tt0111161.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert!(
+        links[0]["trailers"].as_str().unwrap().ends_with("/play/liveSecond1.mp4"),
+        "the dead candidate was still handed out first: {links:?}"
+    );
+    assert!(
+        links[1]["trailers"].as_str().unwrap().ends_with("/play/deadFirst01.mp4"),
+        "the dead candidate was dropped rather than demoted — it may come back"
+    );
+    assert_eq!(
+        *warmed.lock().unwrap(),
+        vec!["liveSecond1".to_string()],
+        "a prewarm permit was spent on a candidate already known to be dead"
     );
 }
 

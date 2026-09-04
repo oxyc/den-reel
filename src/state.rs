@@ -54,6 +54,12 @@ pub struct AppState {
     pub dl_gen: AtomicU64,
     /// vid -> detected content rectangle (from ffmpeg cropdetect), so /crop is computed once.
     pub crop_cache: Mutex<HashMap<String, crate::crop::CropReport>>,
+    /// vid -> (why it failed, when to try again). A `/play` verdict was the one thing this service
+    /// learned and then threw away: the in-flight entry is cleared however a download ends, so the
+    /// next request for a video YouTube has REMOVED spent another of three download permits, and
+    /// another yt-dlp process, discovering the same thing. The TTL is reason-aware
+    /// (`play::fail_ttl_ms`) — "removed" is a fact, "timed out" is a mood.
+    pub play_fails: Mutex<HashMap<String, (PlayError, u64)>>,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
@@ -108,6 +114,7 @@ impl AppState {
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
+            play_fails: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),
