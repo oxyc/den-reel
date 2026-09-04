@@ -45,7 +45,8 @@ GET /manifest.json                       →  manifest with no config (uses the 
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
-     …both take ?s=<tag> when REEL_PLAY_SECRET is set (403 without); one tag opens both
+     …/play requires ?s=<tag> when REEL_PLAY_SECRET is set (403 without); the same tag
+       opens /crop, which without it answers "play the full frame" instead of refusing
 GET /health                               →  200 {status} — ok, or degraded (see below)
 GET /stats                                →  cache usage, in-flight downloads, cache sizes, counters
 ```
@@ -103,13 +104,20 @@ so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see th
 504 {"error":"timeout", …}
 ```
 
-A failure is **remembered**, for a while that depends on why: "removed"/"restricted" for 6h,
-`geo_blocked` 30m, `extraction_failed` 5m, `incomplete_download` 2m, `timeout` 60s. Without that,
-every request for a video YouTube has removed spent another of three download slots, and another
-yt-dlp run, to rediscover it. `/meta` uses the same knowledge — a candidate `/play` has found dead is
-moved **behind** the ones that might work (never dropped: a region block can lift) and is not
-prewarmed. The TTLs differ because the reasons do: a removal is a fact, a timeout is usually our
-network. A restart clears all of it.
+A failure is **remembered**, for a while that depends on why: `unavailable`/`restricted` 1h,
+`geo_blocked` 30m, `extraction_failed` 5m, `incomplete_download` 2m, `timeout` 60s — and the
+response says so in `Retry-After`, counting down as the window elapses. Without this, every request
+for a video YouTube has removed spent another of three download slots, and another yt-dlp run, to
+rediscover it. `/meta` uses the same knowledge: a candidate `/play` has found dead is moved
+**behind** the ones that might work (never dropped — a region block can lift) and is not prewarmed;
+a response whose order was shaped that way drops to `max-age=3600`, because the signal behind it can
+be 60 seconds old and the usual 7 days would outlive it by a factor of ten thousand.
+
+The TTLs differ because the reasons do: a removal is a fact, a timeout is usually our network. Even
+"removed" is capped at an hour rather than the day it deserves — yt-dlp says "video unavailable"
+both for a removed video and for an extractor that has been rejected outright, and that bucket is
+the one `/health` deliberately ignores, so a misread must not be able to empty the library for an
+evening. A restart clears all of it.
 
 `incomplete_download` is deliberately distinct from `extraction_failed`: yt-dlp extracted, but no
 trailer reached the cache — it exited 0 with no file, or the `clap` bake was killed part-way through
@@ -143,7 +151,8 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 |---|---|---|
 | `REEL_CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key. Set it and `/configure` seals a BYOK TMDB key into the install URL (`crypto_box_seal`) so no discovery key lives on the server. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
 | `REEL_CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting) |
-| `REEL_PLAY_SECRET` | — | sign the play URLs. Set it and `/meta` emits `…/play/<id>.mp4?s=<tag>` (keyed BLAKE2b over the id), which `/play` **and** `/crop` then require. Without it those two endpoints will extract and cache any YouTube id anyone asks for, which matters the moment the instance is reachable off-LAN. **Unset by default and it must stay that way on an existing install until its clients have re-fetched `/meta`** — those responses carry `max-age=604800`, so turning this on strands unsigned URLs for up to 7 days. Any string; rotating it invalidates outstanding URLs. |
+| `REEL_PLAY_SECRET` | — | sign the play URLs. Set it and `/meta` emits `…/play/<id>.mp4?s=<tag>` (keyed BLAKE2b over the id), which `/play` then requires. Without it, `/play` and `/crop` will extract and cache any YouTube id anyone asks for, which matters the moment the instance is reachable off-LAN. **Unset by default, and it must stay unset on an existing install until its clients have re-fetched `/meta`** — those responses carry `max-age=604800`, so turning it on strands already-issued unsigned URLs for up to 7 days. Any string. `/crop` takes the same tag (it covers the id, not the path, so a client can carry the one from the play URL across) but an unsigned `/crop` is answered `letterboxed:false` rather than refused — it is a hint, and the download behind it is what the gate protects. |
+| `REEL_PLAY_SECRET_PREV` | — | comma-separated prior play secrets, accepted when verifying and never used to sign. Rotate through it for the same reason `REEL_CONFIG_KEYS_PREV` exists: clients hold signed URLs for up to 7 days, so rotating without it is a week of 403s. |
 | `TMDB_KEY` | — | **migration fallback** only: the legacy server-side discovery key, used when a request carries no per-install config. New installs seal their own key; drop this once migrated. |
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
@@ -177,6 +186,11 @@ concurrency cap, the size of each in-memory cache, and the three consecutive-fai
 `/health` collapses into one word. The cache figures come from the eviction pass — which runs after
 every download and hourly — not from a directory walk per request, so `measured_at_ms` says how
 fresh they are and reads `0` until the first pass on a new process.
+
+`/stats` is **operational detail, served without a gate** — block it at the reverse proxy on an
+instance that is reachable off-LAN. It is a smaller step than it looks: the version it reports is
+already public in `/manifest.json`, and `/health` already tells an anonymous caller whether
+extraction is currently broken. What it adds is volume occupancy and in-flight counts.
 
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent

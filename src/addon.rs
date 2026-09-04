@@ -323,15 +323,13 @@ pub async fn handle_meta(
     // What /play learned, applied to what /meta hands out. Discovery does not probe, so without this
     // a candidate that is geo-blocked or removed keeps its upstream rank forever and every client
     // rediscovers it — one download permit and one yt-dlp process at a time.
-    crate::play::demote_known_dead(state, &mut yt_ids);
+    let demotion = crate::play::demote_known_dead(state, &mut yt_ids);
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
     // the alternates are downloaded on demand only if that first one fails. After the demotion above,
     // a primary that is STILL known dead means every candidate is — so there is nothing worth
     // speculatively fetching, and the permit is better left for a /play someone is waiting on.
     if let Some(primary) = yt_ids.first() {
-        if query_param(query, "prewarm").as_deref() != Some("0")
-            && !crate::play::is_known_dead(state, primary)
-        {
+        if query_param(query, "prewarm").as_deref() != Some("0") && !demotion.head_dead {
             (state.prewarm)(state.clone(), primary.clone());
         }
     }
@@ -339,9 +337,16 @@ pub async fn handle_meta(
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
-    let extra: &[(&str, &str)] = if has_link && resolved.stale {
-        // A last-known-good answer standing in for a lookup we could not make. The server stops
-        // trusting it after a day; pinning it in every client for a week outlives that by six.
+    let extra: &[(&str, &str)] = if has_link && (resolved.stale || demotion.any_dead) {
+        // Two ways to get here, one reason. A last-known-good answer standing in for a lookup we
+        // could not make: the server stops trusting it after a day, so pinning it in every client
+        // for a week outlives that by six.
+        //
+        // And an order that reflects a /play failure. That signal lives 60 seconds for a timeout —
+        // after which this server has forgotten it entirely — while the body it shaped would be
+        // held by every client that fetched inside that window for seven days. The demotion is
+        // deliberately applied per response rather than baked into the 24h resolve entry, on the
+        // grounds that a block can lift; a week in the client's cache defeats exactly that.
         &[("cache-control", "public, max-age=3600")]
     } else if has_link {
         &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400")]

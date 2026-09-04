@@ -491,6 +491,20 @@ fn record_unknown(state: &Arc<AppState>, id: &str) {
     m.insert(id.to_string(), now + crate::CROP_UNKNOWN_TTL_MS);
 }
 
+/// The answer for a caller that did not present a signature: "just play the full frame".
+///
+/// Not a 403, deliberately. `/crop` is a HINT — every failing path in `handle_crop` already answers
+/// `unknown` and the app plays normally — so refusing it outright would turn a missing tag into
+/// silently lost de-letterboxing, with no error the app could report and nothing in `/health`. What
+/// the gate is actually for is the download behind this endpoint, and returning here reaches none of
+/// it: no fetch, no ffmpeg, no cache write. An unsigned caller gets a constant.
+///
+/// The trailers that matter most are unaffected either way: a letterbox detected at download time is
+/// baked into the file as a `clap` box, which AVPlayer honours with no `/crop` call at all.
+pub fn unsigned_response(id: &str) -> Response<Body> {
+    json(&CropReport::unknown(id))
+}
+
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     if !crate::play::cache_available(&state.cfg).await {
         return httputil::error(
@@ -501,6 +515,17 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     }
     if let Some(cached) = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() {
         return json(&cached);
+    }
+    // A recent pass over this file produced nothing parsable, so the answer is already decided:
+    // `unknown`, identical to what every other failing path here returns.
+    //
+    // Checked BEFORE the fetch, not after. Behind it sits a whole trailer download — and this is
+    // reachable with the file gone, because `record_unknown` only proves the file existed ten
+    // minutes ago and eviction is ordinary behaviour on a full volume. Fetching to produce a value
+    // that does not depend on what was fetched is the expensive half of the problem the permit
+    // below does not solve. /play still downloads what it needs; nothing here has to.
+    if unknown_is_fresh(&state, &id) {
+        return json(&CropReport::unknown(&id));
     }
     // Ensure the file (de-dupes with a concurrent /play), then detect. If either fails, answer
     // "unknown" so the app just plays normally — and don't cache that, so it retries later.
@@ -515,10 +540,6 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
                 // searches — is capped, and this is a whole-file ffmpeg pass per request with no
                 // negative cache behind it, so a trailer that yields no parsable box re-runs it on
                 // every call, at any concurrency. Shares the probe budget: same weight, same purpose.
-                // ...and the permit was only half the fix. A permit bounds how many of these run at
-                // once; it does not stop the same unreadable trailer paying for a whole-file ffmpeg
-                // pass on every single call. Remember the nothing, briefly.
-                None if unknown_is_fresh(&state, &id) => CropReport::unknown(&id),
                 None => {
                     let detected = {
                         let _permit = state.probe_sem.acquire().await;
