@@ -53,6 +53,9 @@ impl FakeUpstream {
     fn set_tmdb(&self, tmdb: &[&str]) {
         *self.0.tmdb.lock().unwrap() = tmdb.iter().map(|s| s.to_string()).collect();
     }
+    fn set_kc(&self, kc: Option<&str>) {
+        *self.0.kc.lock().unwrap() = kc.map(|s| s.to_string());
+    }
     fn set_title(&self, title: &str) {
         *self.0.title.lock().unwrap() = Some(title.to_string());
     }
@@ -1414,6 +1417,29 @@ async fn a_keyless_answer_does_not_blank_the_title_for_keyed_installs() {
     );
 }
 
+/// The same asymmetry on the OTHER credential. An install with no KinoCheck key can ask a narrower
+/// question too — KinoCheck answers keyless requests until it rate-limits or rejects one — and its
+/// thinner candidate list was published under the shared key, where an install that DOES have a key
+/// then read it for a full YT_TTL_MS. It costs an alternate rather than a primary, which is exactly
+/// why it went unnoticed: the trailer still plays, there is just nothing to fall back to.
+#[tokio::test]
+async fn a_kinocheck_keyless_answer_does_not_blank_the_alternate_for_keyed_installs() {
+    let fake = FakeUpstream::new(&["primaryVid1"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    assert_eq!(ids, vec!["primaryVid1"], "no KinoCheck key, so no fallback candidate");
+
+    // Now the source that install could not ask has something to say.
+    fake.set_kc(Some("kcAltVid111"));
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", Some("kc-key"), "tt0111161", "movie", "en").await.ids;
+    assert_eq!(
+        ids,
+        vec!["primaryVid1", "kcAltVid111"],
+        "a KinoCheck-keyless answer was cached as the keyed one, losing the fallback trailer"
+    );
+}
+
 /// ...and the keyless answer is still cached in its own right, at the FULL negative TTL. Treating a
 /// missing key as a transient failure meant re-asking KinoCheck every 60s, forever, per title.
 #[tokio::test]
@@ -2064,8 +2090,10 @@ async fn the_cache_sweep_drops_only_expired_entries() {
 
     let cache = state.yt_cache.lock().unwrap();
     assert!(cache.len() < crate::YT_CACHE_MAX, "the sweep did not run: {}", cache.len());
+    // `:nokc` because the resolve above passes no KinoCheck key — the key names which sources the
+    // request could ask. This test is about the sweep; the suffix is just what the key looks like.
     assert_eq!(
-        cache.get("tt0111161:en").map(|e| e.ids.clone()),
+        cache.get("tt0111161:en:nokc").map(|e| e.ids.clone()),
         Some(vec!["keepMe00001".to_string()]),
         "the sweep dropped a live entry"
     );
