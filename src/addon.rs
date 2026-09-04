@@ -72,15 +72,23 @@ fn is_sane_host(h: &str) -> bool {
 
 /// Build the Fusion `meta` payload — one `links[]` entry per resolved trailer, best-first, so the client
 /// can fall back to the next on a playback failure. Empty ids → no links.
-pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String]) -> Value {
+///
+/// `secret` is `REEL_PLAY_SECRET` when the operator has set it: the play URL then carries the tag
+/// that `/play` and `/crop` will demand (see `sign.rs`). `None` — the default — emits exactly the
+/// bare URL this has always emitted.
+pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String], secret: Option<&str>) -> Value {
     let base = base.trim_end_matches('/');
     let links: Vec<Value> = yt_ids
         .iter()
         .map(|id| {
+            let url = match secret {
+                Some(s) => format!("{base}/play/{id}.mp4?s={}", crate::sign::tag(s, id)),
+                None => format!("{base}/play/{id}.mp4"),
+            };
             json!({
                 "name": "Trailer",
                 "category": "Trailer",
-                "trailers": format!("{base}/play/{id}.mp4"),
+                "trailers": url,
                 "provider": "Den Reel",
             })
         })
@@ -293,7 +301,7 @@ pub async fn handle_meta(
     if !is_imdb(imdb) {
         return httputil::json(
             StatusCode::OK,
-            &build_meta(ty, imdb, &base, &[]),
+            &build_meta(ty, imdb, &base, &[], state.cfg.play_secret.as_deref()),
             &[("cache-control", "no-store")],
         );
     }
@@ -327,7 +335,7 @@ pub async fn handle_meta(
             (state.prewarm)(state.clone(), primary.clone());
         }
     }
-    let payload = build_meta(ty, imdb, &base, &yt_ids);
+    let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref());
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());

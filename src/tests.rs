@@ -188,6 +188,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         kinocheck_key: None,
         config_key: String::new(),
         config_keys_prev: String::new(),
+        play_secret: None,
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=tv_embedded".into()),
@@ -312,11 +313,86 @@ fn pick_candidates_orders_and_dedupes() {
 
 #[test]
 fn build_meta_produces_same_host_play_url() {
-    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", &["abc123DEF".to_string()]);
+    let out = crate::addon::build_meta(
+        "movie",
+        "tt0111161",
+        "https://trailers.example.com/",
+        &["abc123DEF01".to_string()],
+        None,
+    );
     assert_eq!(
         out["meta"]["links"][0]["trailers"],
-        "https://trailers.example.com/play/abc123DEF.mp4"
+        "https://trailers.example.com/play/abc123DEF01.mp4"
     );
+}
+
+/// With a secret configured the play URL carries the tag /play and /crop will demand — and without
+/// one it is byte-for-byte the URL it has always been, because every install in the field is
+/// holding unsigned URLs with a week of `max-age` on them.
+#[test]
+fn a_signed_install_hands_out_signed_play_urls() {
+    let signed = crate::addon::build_meta(
+        "movie",
+        "tt0111161",
+        "https://trailers.example.com",
+        &["abc123DEF01".to_string()],
+        Some("s3cret"),
+    );
+    let url = signed["meta"]["links"][0]["trailers"].as_str().unwrap();
+    let expected = format!(
+        "https://trailers.example.com/play/abc123DEF01.mp4?s={}",
+        crate::sign::tag("s3cret", "abc123DEF01")
+    );
+    assert_eq!(url, expected);
+}
+
+/// The only thing standing in front of /play and /crop was "is this eleven characters", and both
+/// spend a download permit, a yt-dlp process and cache space on whatever they are handed. An
+/// instance reachable beyond the LAN — which is exactly what the README's trailers.<domain>
+/// deployment is — was a YouTube extraction service for anyone who found it.
+#[tokio::test]
+async fn a_signed_install_refuses_unsigned_play_and_crop() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "an unsigned /play was served");
+
+    let r = client
+        .get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a wrong tag was accepted");
+
+    let tag = crate::sign::tag("s3cret", "cachedVid07");
+    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "the URL /meta hands out must actually play");
+
+    // /crop is a second door to the same download, so it is gated too — and by the same tag, since
+    // the signature covers the id rather than the path and both endpoints authorise the same work.
+    let r = client.get(format!("{base}/crop/cachedVid07.json")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "/crop let an unsigned caller trigger the download");
+    let r = client.get(format!("{base}/crop/cachedVid07.json?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "the play URL's tag must open /crop for the same id");
+}
+
+/// ...and with no secret configured, nothing changes: every install in the field is holding unsigned
+/// play URLs that /meta told it to cache for a week.
+#[tokio::test]
+async fn an_unsigned_install_is_completely_unchanged() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid08", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let r = reqwest::get(format!("{base}/play/cachedVid08.mp4")).await.unwrap();
+    assert_eq!(r.status(), 200, "signing is opt-in and this install did not opt in");
 }
 
 #[test]

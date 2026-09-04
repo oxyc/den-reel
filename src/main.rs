@@ -18,6 +18,7 @@ mod crop;
 mod httputil;
 mod play;
 mod seal;
+mod sign;
 mod state;
 mod upstream;
 mod userconfig;
@@ -216,6 +217,9 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // crop hint: /crop/<id>.json → detected content rect so the app can trim baked-in letterbox.
     if let Some(id) = path.strip_prefix("/crop/").and_then(|r| r.strip_suffix(".json")) {
         if is_valid_vid(id) {
+            if let Some(denied) = signature_check(&state, id, query) {
+                return denied;
+            }
             return crop::handle_crop(state, id.to_string()).await;
         }
     }
@@ -235,7 +239,29 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         Some(v) if is_valid_vid(&v) => v,
         _ => return httputil::text(StatusCode::BAD_REQUEST, "bad video id"),
     };
+    if let Some(denied) = signature_check(&state, &vid, query) {
+        return denied;
+    }
     play::handle_play(state, &parts.headers, vid).await
+}
+
+/// Gate the two routes that spend a download on whatever id they are given. `None` means carry on —
+/// which is every request when `REEL_PLAY_SECRET` is unset, the default. `Some(response)` is the
+/// refusal.
+///
+/// Both endpoints authorise the same work for the same id, and the tag covers the id alone, so a
+/// client can carry the `s` it was handed on the play URL straight over to `/crop`.
+fn signature_check(state: &Arc<AppState>, vid: &str, query: &str) -> Option<Response<Body>> {
+    let secret = state.cfg.play_secret.as_deref()?;
+    if sign::verify(secret, vid, query_param(query, "s").as_deref()) {
+        return None;
+    }
+    // Deliberately terse, and no hint about what a correct tag would look like.
+    Some(httputil::json(
+        StatusCode::FORBIDDEN,
+        &serde_json::json!({"error": "bad_signature", "message": "This trailer URL is not signed for this server."}),
+        &[("cache-control", "no-store")],
+    ))
 }
 
 /// Parse `<movie|series>/<imdbId>.json` (the part after `meta/`) and dispatch to the meta handler.

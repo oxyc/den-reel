@@ -1,7 +1,8 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
-//!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL).
+//!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL);
+//!      REEL_PLAY_SECRET (optional signing of the /play + /crop URLs).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
 //!      sealed in the URL (den-scout/docs/SEALED-CONFIG.md). Drop the env keys once installs migrate.
@@ -38,6 +39,11 @@ pub struct Config {
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
     pub config_keys_prev: String,
+    /// `REEL_PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
+    /// require the signature (see `sign.rs`). `None` disables it, which is the default and has to
+    /// be: `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
+    /// turning this on unconditionally would break every install for that week.
+    pub play_secret: Option<String>,
     pub public_base_url: Option<String>,
     /// The yt-dlp format string we serve — H.264(avc1) + AAC(mp4a), ≤max_height (avc1's ceiling on
     /// YouTube), faststart-muxable. Forced so trailers play on AVPlayer's HARDWARE decode path
@@ -155,6 +161,7 @@ impl Config {
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("REEL_CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("REEL_CONFIG_KEYS_PREV").unwrap_or_default(),
+            play_secret: env_opt("REEL_PLAY_SECRET"),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,
