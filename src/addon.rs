@@ -108,17 +108,28 @@ pub async fn resolve_youtube_ids(
     ty: &str,
     lang: &str,
 ) -> Resolved {
-    // A keyless request gets its OWN namespace. The key is otherwise deliberately credential-free
-    // (a resolved trailer is public and key-independent) — true for a lookup that ran, false for one
-    // that could not: with no TMDB key only KinoCheck is consulted, and sharing that thinner answer
-    // with keyed installs let a config-less /meta blank titles for everyone. Namespacing it means
-    // the answer can be cached normally instead of re-asked forever, which is what the failure
-    // cooldown was being stretched to cover — badly, since a missing key is not a transient blip.
-    let cache_key = if tmdb_key.is_empty() {
-        format!("{imdb}:{lang}:nokey")
-    } else {
-        format!("{imdb}:{lang}")
+    // The key names WHICH SOURCES this request could ask, and nothing else. It is deliberately
+    // credential-free — a resolved trailer is public and key-independent, so installs that can ask
+    // the same sources share an entry — but "same sources" is the part that has to be in the key.
+    // An install that cannot ask a source gets a THINNER answer, and publishing that under the
+    // shared key hands it to installs that could have asked: a config-less /meta blanked titles for
+    // everyone, which is why the TMDB half was namespaced.
+    //
+    // KinoCheck needs the same treatment for the same reason. It is queried with or without a key
+    // (upstream.rs only adds the X-Api-Key header when there is one), so a keyless install usually
+    // gets an answer — until KinoCheck rate-limits or rejects it, and then `kc` is a fault, the
+    // candidate list loses its fallback id, and that shorter list is what every keyed install reads
+    // for a full YT_TTL_MS. It costs an alternate rather than a primary, which is exactly why it
+    // went unnoticed: the trailer still plays, there is just no second one to fall back to.
+    //
+    // Presence, never the value: two installs with different keys still share, as they should.
+    let sources = match (tmdb_key.is_empty(), kinocheck_key.is_some()) {
+        (false, true) => "",
+        (false, false) => ":nokc",
+        (true, true) => ":nokey",
+        (true, false) => ":nokey:nokc",
     };
+    let cache_key = format!("{imdb}:{lang}{sources}");
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         let now = (state.clock)();
