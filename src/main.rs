@@ -83,10 +83,15 @@ pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --sim
 /// The /configure page, embedded so the binary is self-contained (seals a BYOK TMDB key into the URL).
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
-/// A YouTube id as it appears in a /play path or `?v=`: `[A-Za-z0-9_-]{6,15}`.
+/// A YouTube id as it appears in a /play path or `?v=`: `[A-Za-z0-9_-]{11}`.
+///
+/// Exactly 11, not a 6..=15 window. A YouTube video id is a base64url-encoded 64-bit value and has
+/// been 11 characters for the life of the service. This is the ONLY gate on /play and /crop — both
+/// of which spend a download permit and a yt-dlp process on whatever they are handed — and it also
+/// decides what the cache sweep considers a published trailer, so the loosest thing that still
+/// accepts every real id is the right thing.
 pub fn is_valid_vid(id: &str) -> bool {
-    (6..=15).contains(&id.len())
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Consecutive hard upstream faults before /health reports `degraded` (ADDON-02).

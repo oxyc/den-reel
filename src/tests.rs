@@ -1263,6 +1263,27 @@ fn a_traversing_id_from_upstream_is_not_a_candidate() {
     );
 }
 
+/// A YouTube video id is a base64url-encoded 64-bit value: exactly 11 characters, and it has been
+/// for the life of the service. This gate is the only check standing in front of /play and /crop,
+/// both of which spend a download permit and a yt-dlp process on whatever they are handed, and it is
+/// also what the cache sweep uses to tell a published trailer from abandoned scratch.
+#[test]
+fn a_video_id_is_exactly_eleven_characters() {
+    assert!(crate::is_valid_vid("dSdWpY2Bxsc"), "a real id must still pass");
+    assert!(crate::is_valid_vid("_-Aa09Zz123"), "the full base64url alphabet is legal");
+    for bad in [
+        "",
+        "short",
+        "dSdWpY2Bxs",   // 10
+        "dSdWpY2Bxscc", // 12
+        "dSdWpY2Bxs/",  // right length, path separator
+        "dSdWpY2Bxs.",  // right length, extension games
+        "../../etc",
+    ] {
+        assert!(!crate::is_valid_vid(bad), "{bad:?} was accepted as a YouTube id");
+    }
+}
+
 /// And the sink refuses it too, so a future caller cannot reintroduce the same hole.
 #[tokio::test]
 async fn fetch_trailer_refuses_an_id_that_is_not_a_youtube_id() {
@@ -1334,18 +1355,18 @@ fn eviction_ttl_drops_stale_but_keeps_fresh() {
     let dir = temp_dir();
     // Real `<vid>.mp4` names: anything else on the volume is scratch, which the TTL pass leaves to
     // sweep_partials rather than deleting under a live download.
-    std::fs::write(dir.join("freshVid0001.mp4"), vec![0u8; 100]).unwrap();
-    std::fs::write(dir.join("staleVid0001.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("freshVid001.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join("staleVid001.mp4"), vec![0u8; 100]).unwrap();
     // Age the stale one's last-access to 20 days ago (past a 14-day TTL); the other stays at "now".
     let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
-    let f = std::fs::File::open(dir.join("staleVid0001.mp4")).unwrap();
+    let f = std::fs::File::open(dir.join("staleVid001.mp4")).unwrap();
     f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
     let mut cfg = test_cfg(dir.clone());
     cfg.cache_ttl = Duration::from_secs(14 * 24 * 60 * 60); // 14-day TTL
     cfg.cache_max_bytes = u64::MAX; // isolate the TTL: the size cap must not interfere
     crate::play::evict_if_needed(&cfg);
-    assert!(!dir.join("staleVid0001.mp4").exists(), "trailer past the last-access TTL should be evicted");
-    assert!(dir.join("freshVid0001.mp4").exists(), "recently-served trailer must be kept");
+    assert!(!dir.join("staleVid001.mp4").exists(), "trailer past the last-access TTL should be evicted");
+    assert!(dir.join("freshVid001.mp4").exists(), "recently-served trailer must be kept");
 }
 
 #[tokio::test]
@@ -1879,13 +1900,13 @@ async fn a_wrong_key_counts_as_no_answer_even_though_health_ignores_it() {
 /// for the whole window, so the title shows no trailer and no upstream call happens to correct it.
 #[tokio::test]
 async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     // A healthy install caches a real answer, which then expires.
     let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
-    assert_eq!(ids.first().map(String::as_str), Some("goodTrailer1"));
+    assert_eq!(ids.first().map(String::as_str), Some("goodTrailer"));
     clock.advance(crate::YT_TTL_MS + 1);
 
     // An install with a wrong key resolves the same title and gets nothing.
@@ -1894,16 +1915,16 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
     let broken = crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         broken.first().map(String::as_str),
-        Some("goodTrailer1"),
+        Some("goodTrailer"),
         "a failed lookup discarded the answer we already had"
     );
 
     // The healthy install must still see its trailer, and the failure must not be serving as a hit.
-    fake.set_tmdb(&["goodTrailer1"]);
+    fake.set_tmdb(&["goodTrailer"]);
     let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
-        Some("goodTrailer1"),
+        Some("goodTrailer"),
         "one install's bad key blanked the trailer for every install"
     );
 }
@@ -1957,16 +1978,16 @@ async fn one_titles_outage_does_not_touch_another_title() {
     assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en").await.ids.is_empty());
 
     // A different title, resolved successfully right after, must be cached at the FULL TTL.
-    fake.set_tmdb(&["goodTrailer1"]);
+    fake.set_tmdb(&["goodTrailer"]);
     assert_eq!(
         crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
-        vec!["goodTrailer1".to_string()]
+        vec!["goodTrailer".to_string()]
     );
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
         crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
-        vec!["goodTrailer1".to_string()]
+        vec!["goodTrailer".to_string()]
     );
     assert_eq!(fake.calls(), after, "another title's outage downgraded this title's entry");
 }
@@ -1975,7 +1996,7 @@ async fn one_titles_outage_does_not_touch_another_title() {
 /// insert, so every browse during a fault paid a full upstream round.
 #[tokio::test]
 async fn serving_a_stale_answer_still_rate_limits_the_outage() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
@@ -1988,7 +2009,7 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
     for _ in 0..5 {
         fake.fail_next();
         let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
-        assert_eq!(ids, vec!["goodTrailer1".to_string()], "the last known answer was dropped");
+        assert_eq!(ids, vec!["goodTrailer".to_string()], "the last known answer was dropped");
         calls.push(fake.calls());
         clock.advance(crate::YT_FAIL_TTL_MS / 4);
     }
@@ -2003,7 +2024,7 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
 /// for as long as anything in the process keeps faulting — and /meta ships it with a 7-day max-age.
 #[tokio::test]
 async fn a_stale_answer_stops_being_served_eventually() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
@@ -2013,7 +2034,7 @@ async fn a_stale_answer_stops_being_served_eventually() {
     // The trailer is gone upstream, and the lookups keep failing. Browse repeatedly, well past the
     // grace, so each failure gets the chance to refresh the entry it is serving.
     fake.set_tmdb(&[]);
-    let mut last = vec!["goodTrailer1".to_string()];
+    let mut last = vec!["goodTrailer".to_string()];
     for _ in 0..40 {
         fake.fail_next();
         last = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
@@ -2029,7 +2050,7 @@ async fn a_stale_answer_stops_being_served_eventually() {
 /// ...but it is still served for a good while: an outage must not blank the catalogue immediately.
 #[tokio::test]
 async fn a_stale_answer_survives_a_long_outage() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
@@ -2039,7 +2060,7 @@ async fn a_stale_answer_survives_a_long_outage() {
     fake.set_tmdb(&[]);
     fake.fail_next();
     let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
-    assert_eq!(ids, vec!["goodTrailer1".to_string()], "an outage blanked the title immediately");
+    assert_eq!(ids, vec!["goodTrailer".to_string()], "an outage blanked the title immediately");
 }
 
 /// A slow failing resolve must not downgrade a fast good one's full-TTL entry to the cooldown.
@@ -2065,20 +2086,20 @@ async fn a_failing_resolve_does_not_downgrade_a_live_entry() {
     assert_eq!(fake.calls(), 1, "A did not reach the upstream");
 
     // B: runs to completion while A is parked, inserting a live 24h entry.
-    fake.set_tmdb(&["goodTrailer1"]);
+    fake.set_tmdb(&["goodTrailer"]);
     let ids = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids;
-    assert_eq!(ids, vec!["goodTrailer1".to_string()]);
+    assert_eq!(ids, vec!["goodTrailer".to_string()]);
 
     // A resumes and finds B's live entry.
     gate.add_permits(1);
-    assert_eq!(a.await.unwrap(), vec!["goodTrailer1".to_string()], "A published its own empty result");
+    assert_eq!(a.await.unwrap(), vec!["goodTrailer".to_string()], "A published its own empty result");
 
     // B's entry must still be live well past the failure cooldown.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 3);
     assert_eq!(
         crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids,
-        vec!["goodTrailer1".to_string()]
+        vec!["goodTrailer".to_string()]
     );
     assert_eq!(fake.calls(), after, "a failing resolve downgraded a live 24h entry to the cooldown");
 }
@@ -2138,7 +2159,7 @@ async fn a_failed_title_lookup_is_not_an_answer() {
 /// after a day, so a 7-day max-age outlives the server's own bound by six.
 #[tokio::test]
 async fn a_stale_answer_is_not_cached_in_the_client_for_a_week() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
@@ -2151,12 +2172,12 @@ async fn a_stale_answer_is_not_cached_in_the_client_for_a_week() {
     fake.set_tmdb(&[]);
     fake.fail_next();
     let stood_in = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
-    assert_eq!(stood_in.ids, vec!["goodTrailer1".to_string()]);
+    assert_eq!(stood_in.ids, vec!["goodTrailer".to_string()]);
     assert!(stood_in.stale, "a stand-in answer was offered as a fresh one");
 
     // A cache HIT on that stand-in must stay marked too — the client sees the same body either way.
     let hit = crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await;
-    assert_eq!(hit.ids, vec!["goodTrailer1".to_string()]);
+    assert_eq!(hit.ids, vec!["goodTrailer".to_string()]);
     assert!(hit.stale, "a cache hit on a stand-in was offered as a fresh answer");
 }
 
@@ -2189,7 +2210,7 @@ async fn the_resolve_cache_is_actually_bounded() {
 /// a trailer link with a 7-day max-age, which for a stand-in outlives the server's own 48h bound.
 #[tokio::test]
 async fn meta_shortens_max_age_for_a_stand_in_answer() {
-    let fake = FakeUpstream::new(&["goodTrailer1"], None);
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
     let base = spawn_server(state.clone()).await;
@@ -2924,14 +2945,14 @@ fn a_directory_masquerading_as_a_trailer_is_cleared() {
     let dir = temp_dir();
     let impostor = dir.join("impostorvid.mp4");
     std::fs::create_dir_all(impostor.join("in-the-way")).unwrap();
-    std::fs::write(dir.join("realvideo001.mp4"), b"x").unwrap();
+    std::fs::write(dir.join("realvideo01.mp4"), b"x").unwrap();
     std::fs::create_dir_all(dir.join("yt-dlp")).unwrap();
     std::fs::write(dir.join("yt-dlp").join("player.json"), b"{}").unwrap();
 
     crate::play::sweep_partials(&test_cfg(dir.clone()));
 
     assert!(!impostor.exists(), "a directory at a trailer's path survived the sweep forever");
-    assert!(dir.join("realvideo001.mp4").exists(), "a real trailer was removed");
+    assert!(dir.join("realvideo01.mp4").exists(), "a real trailer was removed");
     assert!(dir.join("yt-dlp").join("player.json").exists(), "yt-dlp's own cache was removed");
 }
 
