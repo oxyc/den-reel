@@ -91,6 +91,6 @@ jobs:
           body: |
             Automated bump of the pinned deno to `${{ steps.rel.outputs.version }}` — release is ≥2 days old (supply-chain cooldown).
 
-            deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. SHA256 pins are computed from the downloaded archives (deno publishes no checksum manifest); the PR image build verifies the amd64 checksum, and the publish build verifies arm64 on merge.
+            deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. SHA256 pins are computed from the downloaded archives (deno publishes no checksum manifest). The PR image build verifies the amd64 checksum. The ARM64 pin is **not** checked by this PR — the publish job is the only thing that builds arm64, and it runs on a `v*` tag, so a bad ARM64 checksum surfaces at release time, not here.
 
             **Not auto-merged, on purpose.** CI proves the image builds and the checksum matches; it does **not** prove YouTube extraction still works, and this is the runtime that does the extracting. Merge when you're ready to watch `/health` after the deploy.

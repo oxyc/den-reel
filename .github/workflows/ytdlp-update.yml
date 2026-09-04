@@ -91,7 +91,7 @@ jobs:
           body: |
             Automated bump of the pinned yt-dlp to `${{ steps.rel.outputs.tag }}` — release is ≥2 days old (supply-chain cooldown).
 
-            SHA256 pins refreshed from the release's `SHA2-256SUMS`; the PR image build verifies the amd64 checksum, and the publish build verifies arm64 on merge.
+            SHA256 pins refreshed from the release's `SHA2-256SUMS`. The PR image build verifies the amd64 checksum. The ARM64 pin is **not** checked by this PR — the publish job is the only thing that builds arm64, and it runs on a `v*` tag, so a bad ARM64 checksum surfaces at release time, not here.
 
             Auto-merges once CI is green. CI proves the image builds and the checksum matches — it does **not** prove YouTube extraction still works (that canary can't run on datacenter IPs). If a bump breaks extraction, `/health` reports `degraded` on the homelab and this can be reverted.
 
