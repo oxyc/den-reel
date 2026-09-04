@@ -156,10 +156,25 @@ fn is_published_trailer(name: &str) -> bool {
     name.strip_suffix(".mp4").is_some_and(crate::is_valid_vid)
 }
 
+/// What the volume held when eviction last looked, so `/stats` can answer without walking the cache
+/// directory on a request. Measured after any eviction, so it describes the state we left behind.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheUsage {
+    pub trailer_bytes: u64,
+    pub trailer_count: u64,
+    /// In-flight partials and anything else not named `<vid>.mp4`. Counted against the cap but never
+    /// evictable here; `sweep_partials` reclaims it once it is provably abandoned.
+    pub scratch_bytes: u64,
+}
+
 /// Evict least-recently-used cached files until under the size cap (bounded cache). Sync fs, run
 /// off the runtime thread via spawn_blocking. Skips dotfiles so an in-progress `.<vid>.…partial.mp4`
 /// is neither counted nor deleted out from under its writer; `sweep_partials` reclaims stale ones.
-pub(crate) fn evict_if_needed(cfg: &Config) {
+///
+/// Returns what it saw, or `None` if the cache directory could not be read at all. It already walks
+/// the directory, so reporting the totals costs nothing and spares `/stats` from doing it again on
+/// the request path.
+pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
     // Everything on the volume counts toward the cap, but only published trailers are EVICTABLE.
     // Counting just `<vid>.mp4` made the cap a floor on real usage rather than a ceiling: an
     // in-progress download or a leaked MP4Box temp is trailer-sized and was invisible here, so the
@@ -184,7 +199,7 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
                 }
             }
         }
-        Err(_) => return,
+        Err(_) => return None,
     }
     // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
     // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
@@ -216,20 +231,37 @@ pub(crate) fn evict_if_needed(cfg: &Config) {
              on its own; evicting trailers cannot help — sweep_partials reclaims it",
             cfg.cache_max_bytes
         );
-        return;
+        return Some(usage(&files, scratch_bytes));
     };
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     if total <= budget {
-        return;
+        return Some(usage(&files, scratch_bytes));
     }
     files.sort_by_key(|f| f.2); // oldest atime first
+    let mut evicted = 0usize;
     for (p, size, _) in &files {
         if total <= budget {
             break;
         }
         if std::fs::remove_file(p).is_ok() {
             total -= size;
+            evicted += 1;
         }
+    }
+    // Report what SURVIVED. `files` still lists the evicted ones, and the sort put them first.
+    Some(CacheUsage {
+        trailer_bytes: total,
+        trailer_count: (files.len() - evicted) as u64,
+        scratch_bytes,
+    })
+}
+
+/// Totals for a directory listing nothing was evicted from.
+fn usage(files: &[(PathBuf, u64, SystemTime)], scratch_bytes: u64) -> CacheUsage {
+    CacheUsage {
+        trailer_bytes: files.iter().map(|f| f.1).sum(),
+        trailer_count: files.len() as u64,
+        scratch_bytes,
     }
 }
 
@@ -494,7 +526,9 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     state.local_fails.store(0, std::sync::atomic::Ordering::Relaxed);
 
     let cfg = state.cfg.clone();
-    let _ = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await;
+    if let Ok(Some(u)) = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await {
+        state.record_cache_usage(u);
+    }
     Ok(fp)
 }
 

@@ -246,6 +246,10 @@ fn build_state_full(
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
+        cache_trailer_bytes: std::sync::atomic::AtomicU64::new(0),
+        cache_trailer_count: std::sync::atomic::AtomicU64::new(0),
+        cache_scratch_bytes: std::sync::atomic::AtomicU64::new(0),
+        cache_measured_at: std::sync::atomic::AtomicU64::new(0),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
         local_fails: std::sync::atomic::AtomicU32::new(0),
     })
@@ -394,6 +398,39 @@ async fn an_unsigned_install_is_completely_unchanged() {
 
     let r = reqwest::get(format!("{base}/play/cachedVid08.mp4")).await.unwrap();
     assert_eq!(r.status(), 200, "signing is opt-in and this install did not opt in");
+}
+
+/// /health answers one question in one word. Everything behind that verdict — how full the volume
+/// is, how many downloads are in flight, how much of the resolve cache is standing — was visible
+/// only by reading logs. The figures come from the eviction pass, which already walks the directory,
+/// because an ops endpoint that stats a few thousand files per request makes a busy box busier.
+#[tokio::test]
+async fn stats_reports_the_measured_cache_rather_than_walking_it() {
+    let dir = temp_dir();
+    seed_cache(&dir, "statsVid001", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state.clone()).await;
+
+    // Nothing has measured the volume yet — and /stats must not be the thing that does, even though
+    // there is a trailer sitting right there.
+    let body: serde_json::Value = reqwest::get(format!("{base}/stats")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["cache"]["measured_at_ms"], 0, "/stats walked the cache directory itself");
+    assert_eq!(body["cache"]["trailers"], 0, "/stats walked the cache directory itself");
+
+    // The eviction pass measures; /stats reports what it found.
+    let u = crate::play::evict_if_needed(&state.cfg).expect("the cache dir is readable");
+    state.record_cache_usage(u);
+
+    let body: serde_json::Value = reqwest::get(format!("{base}/stats")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["cache"]["trailers"], 1);
+    assert_eq!(body["cache"]["trailer_bytes"], 4096);
+    assert!(body["cache"]["measured_at_ms"].as_u64().unwrap() > 0, "the measurement was not timestamped");
+    assert_eq!(
+        body["cache"]["free_bytes"],
+        state.cfg.cache_max_bytes - 4096,
+        "free space must account for what trailers already hold"
+    );
+    assert_eq!(body["downloads"]["limit"], crate::DOWNLOAD_CONCURRENCY);
 }
 
 #[test]

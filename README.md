@@ -47,6 +47,7 @@ GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabl
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
      …both take ?s=<tag> when REEL_PLAY_SECRET is set (403 without); one tag opens both
 GET /health                               →  200 {status} — ok, or degraded (see below)
+GET /stats                                →  cache usage, in-flight downloads, cache sizes, counters
 ```
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
@@ -169,6 +170,13 @@ MP4Box). The two are separate because the remedy is: an outage where every downl
 would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full disk.
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
 answering while every trailer silently comes back empty.
+
+`/stats` is the detail behind that verdict: bytes and trailers on the volume against
+`CACHE_MAX_BYTES` (plus the scratch that also counts against it), downloads in flight against the
+concurrency cap, the size of each in-memory cache, and the three consecutive-failure counters
+`/health` collapses into one word. The cache figures come from the eviction pass — which runs after
+every download and hourly — not from a directory walk per request, so `measured_at_ms` says how
+fresh they are and reads `0` until the first pass on a new process.
 
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
