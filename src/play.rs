@@ -90,9 +90,25 @@ pub(crate) fn invalidate_cache_availability(cfg: &Config) {
     cfg.cache_ok_until.store(0, Ordering::Relaxed);
 }
 
-/// Don't re-stamp a cached file's atime more often than this. The eviction TTL it feeds is measured
-/// in days (`CACHE_TTL_DAYS`), so an hour's resolution decides every case the same way.
-const TOUCH_MIN_AGE: Duration = Duration::from_secs(3600);
+/// Don't re-stamp a cached file's atime more often than this.
+///
+/// A minute, not the hour the TTL alone would justify — because the TTL is not the only thing
+/// reading this timestamp. `evict_if_needed`'s SIZE-CAP pass sorts by atime and removes oldest
+/// first, and that sort is only meaningful if a file being served right now is stamped more recently
+/// than one that was merely downloaded. The OS will not do it for us: under `relatime` a read does
+/// not refresh atime at all, so this touch is the entire signal.
+///
+/// At an hour the ordering inverted. A trailer streaming since T+3min kept its download-time stamp
+/// while speculative prewarms landing at T+10min got fresher ones, so the next eviction took the
+/// file the viewer was watching and left the idle ones — and the next range request re-downloaded it
+/// mid-playback, under a download permit. A minute is short against anything that creates competing
+/// files and long against AVPlayer's ranging, which is what the gate is here to thin out.
+const TOUCH_MIN_AGE: Duration = Duration::from_secs(60);
+const _: () = assert!(
+    TOUCH_MIN_AGE.as_secs() <= 60,
+    "atime has to stay fresher than the gap between competing downloads, or the size-cap sort \
+     evicts the trailer that is playing"
+);
 
 /// Bump a cached file's atime so the LRU eviction sees it as recently used. Fire-and-forget so the
 /// hot serve path isn't slowed; a rare eviction/serve race is handled by the open-miss refetch in
@@ -259,8 +275,9 @@ pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
         Err(_) => return None,
     }
     // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
-    // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
-    // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
+    // bumped when a serve finds it more than TOUCH_MIN_AGE stale (touch_atime), so a rewatched trailer
+    // keeps a timestamp within a minute of its last play and survives; only genuinely-stale ones age
+    // out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
     if !cfg.cache_ttl.is_zero() {
         if let Some(cutoff) = SystemTime::now().checked_sub(cfg.cache_ttl) {
             files.retain(|(p, _size, atime)| {
