@@ -28,6 +28,9 @@ use subtle::ConstantTimeEq;
 /// URL that ends up in a manifest, a client cache and a log line.
 type Tag = Blake2bMac<U12>;
 
+/// 12 bytes of tag, hex-encoded.
+const TAG_HEX_LEN: usize = 24;
+
 /// The MAC key, derived from the configured secret rather than used raw: BLAKE2b's key is capped at
 /// 64 bytes, and a secret is whatever the operator typed. Hashing first accepts any length without
 /// making the length a configuration error.
@@ -58,11 +61,13 @@ pub fn tag(secret: &str, vid: &str) -> String {
 /// character at a time from how long the comparison took.
 pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
     let Some(presented) = presented else { return false };
-    let expected = tag(secret, vid);
-    // ct_eq over equal-length slices; the length itself is public (it is a fixed 24 either way).
-    if presented.len() != expected.len() {
+    // Length first, before deriving anything. The length is public — it is a fixed 24 either way, so
+    // checking it early leaks nothing — and it means junk costs a comparison rather than two BLAKE2b
+    // key schedules per configured secret.
+    if presented.len() != TAG_HEX_LEN {
         return false;
     }
+    let expected = tag(secret, vid);
     presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 

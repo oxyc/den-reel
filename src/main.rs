@@ -277,7 +277,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             // carry it across — so a hard 403 here would turn "the app did not propagate `s`" into
             // de-letterboxing that silently disappears, with no error to report and /health green.
             // The gate exists to protect the DOWNLOAD, and `unsigned_response` reaches none of it.
-            if signature_check(&state, id, query).is_some() {
+            if !signature_ok(&state, id, query) {
                 return crop::unsigned_response(id);
             }
             return crop::handle_crop(state, id.to_string()).await;
@@ -299,29 +299,34 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         Some(v) if is_valid_vid(&v) => v,
         _ => return httputil::text(StatusCode::BAD_REQUEST, "bad video id"),
     };
-    if let Some(denied) = signature_check(&state, &vid, query) {
-        return denied;
+    if !signature_ok(&state, &vid, query) {
+        return bad_signature();
     }
     play::handle_play(state, &parts.headers, vid).await
 }
 
-/// Gate the two routes that spend a download on whatever id they are given. `None` means carry on —
-/// which is every request when `REEL_PLAY_SECRET` is unset, the default. `Some(response)` is the
-/// refusal.
+/// May this request spend a download on this id? `true` for every request when `REEL_PLAY_SECRET` is
+/// unset, which is the default.
+///
+/// A predicate, not a response. The two callers disagree about what a refusal looks like — `/play`
+/// says 403, `/crop` degrades to "play the full frame" — and the `/crop` refusal is the EXPECTED
+/// case there, since nothing this server emits is a signed crop URL. Returning a built response
+/// meant serializing a JSON body and a header map on that path and dropping both.
 ///
 /// Both endpoints authorise the same work for the same id, and the tag covers the id alone, so a
 /// client can carry the `s` it was handed on the play URL straight over to `/crop`.
-fn signature_check(state: &Arc<AppState>, vid: &str, query: &str) -> Option<Response<Body>> {
-    let secret = state.cfg.play_secret.as_deref()?;
-    if sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, query_param(query, "s").as_deref()) {
-        return None;
-    }
-    // Deliberately terse, and no hint about what a correct tag would look like.
-    Some(httputil::json(
+fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
+    let Some(secret) = state.cfg.play_secret.as_deref() else { return true };
+    sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, query_param(query, "s").as_deref())
+}
+
+/// The `/play` refusal: terse, and no hint about what a correct tag would look like.
+fn bad_signature() -> Response<Body> {
+    httputil::json(
         StatusCode::FORBIDDEN,
         &serde_json::json!({"error": "bad_signature", "message": "This trailer URL is not signed for this server."}),
         &[("cache-control", "no-store")],
-    ))
+    )
 }
 
 /// Parse `<movie|series>/<imdbId>.json` (the part after `meta/`) and dispatch to the meta handler.

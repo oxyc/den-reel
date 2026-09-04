@@ -17,7 +17,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::config::Config;
 use crate::httputil::{self, parse_range, Body, RangeReq};
-use crate::state::{AppState, BoxFuture, SharedDownload};
+use crate::state::{default_clock, AppState, BoxFuture, SharedDownload};
 use crate::ytdlp::{self, PlayError};
 
 /// Read buffer for streaming a cached file out. 256 KiB (vs ReaderStream's 4 KiB default) — one
@@ -29,12 +29,40 @@ fn cache_path(cfg: &Config, vid: &str) -> PathBuf {
     cfg.cache_dir.join(format!("{vid}.mp4"))
 }
 
-/// Is the on-disk cache usable? `create_dir_all` is idempotent and cheap when the dir already
-/// exists, so this doubles as a self-healing check — a volume that comes back after boot recovers
-/// without a restart. `/play` and `/crop` gate on it to return a clean 503 instead of a murky 502.
+/// How long a POSITIVE cache-availability answer stands before we probe the volume again.
+const CACHE_OK_TTL_MS: u64 = 5_000;
+
+/// Is the on-disk cache usable? `create_dir_all` is idempotent, so this doubles as a self-healing
+/// check — a volume that comes back after boot recovers without a restart. `/play` and `/crop` gate
+/// on it to return a clean 503 instead of a murky 502.
+///
+/// Idempotent is not the same as free. `tokio::fs` is `spawn_blocking` underneath, so this was two
+/// dispatches to the blocking pool and four syscalls on EVERY request — including the ones answered
+/// entirely from memory, ahead of the disk hit, the failure cache and the crop caches. On a
+/// single-threaded runtime that is two full task handoffs, which is an order of magnitude more than
+/// everything those fast paths do put together.
+///
+/// So hold a positive answer for a few seconds. Only the positive one: a volume that has just been
+/// seen to fail is re-probed on the very next request, so nothing delays recovery — which is the
+/// property this function exists for. The exposure is the reverse case, a volume that disappears and
+/// is not noticed for up to five seconds; the requests in that window fail on the read instead, which
+/// they already have to handle.
+/// The memo lives on the `Config` rather than in a static, because it is an answer ABOUT that
+/// config's volume. Production has exactly one, so it behaves identically either way — but a static
+/// would let one test's verdict about its own temp directory answer another test's question about a
+/// different one.
 pub async fn cache_available(cfg: &Config) -> bool {
-    tokio::fs::create_dir_all(&cfg.cache_dir).await.is_ok()
-        && tokio::fs::create_dir_all(&cfg.ytdlp_cache).await.is_ok()
+    let now = default_clock();
+    if now < cfg.cache_ok_until.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ok = tokio::fs::create_dir_all(&cfg.cache_dir).await.is_ok()
+        && tokio::fs::create_dir_all(&cfg.ytdlp_cache).await.is_ok();
+    // A failure stores nothing, so it is not remembered and the next request asks again.
+    if ok {
+        cfg.cache_ok_until.store(now + CACHE_OK_TTL_MS, Ordering::Relaxed);
+    }
+    ok
 }
 
 /// Bump a cached file's atime so the LRU eviction sees it as recently used. Fire-and-forget so the
@@ -371,11 +399,13 @@ pub fn demote_known_dead(state: &AppState, ids: &mut [String]) -> Demotion {
     if ids.is_empty() {
         return Demotion::default();
     }
-    let now = (state.clock)();
     let map = state.play_fails.lock().unwrap_or_else(|e| e.into_inner());
+    // The empty check first, so the normal case — nothing has ever failed — really does cost
+    // nothing, rather than a clock read it is about to throw away.
     if map.is_empty() {
         return Demotion::default();
     }
+    let now = (state.clock)();
     let is_dead = |id: &str| map.get(id).is_some_and(|(_, exp)| *exp > now);
     if !ids.iter().any(|id| is_dead(id)) {
         return Demotion::default();
@@ -409,6 +439,9 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
     // Checked here as well as at the routes, because `vid` also arrives from TMDB/KinoCheck via
     // prewarm, and it becomes a filename and a yt-dlp -o path. One `..` writes outside the cache.
     if !crate::is_valid_vid(&vid) {
+        // Logged at the point of rejection: this one never reaches the download future that does the
+        // logging for every other failure.
+        eprintln!("[{vid}] rejected: not a YouTube id");
         return Err(PlayError {
             status: 400,
             reason: "bad_id".into(),
@@ -458,7 +491,17 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
                     let out = download_cached(st.clone(), v.clone(), gen).await;
                     match &out {
                         Ok(_) => clear_failure(&st, &v),
-                        Err(e) => record_failure(&st, &v, e),
+                        Err(e) => {
+                            // Logged HERE, once per download that actually happened, rather than at
+                            // every request that observes the result. `record_failure` drops the
+                            // stderr tail precisely so a stale extractor message is not re-logged on
+                            // every later hit — but the line itself was still being written by the
+                            // serve path, so an id inside a one-hour window produced a syscall and a
+                            // log line per request saying the same thing. Repeats are supposed to be
+                            // free; this is the last part of them that was not.
+                            eprintln!("[{v}] {}", e.detail);
+                            record_failure(&st, &v, e);
+                        }
                     }
                     out
                 })
@@ -638,7 +681,10 @@ fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response<Body> {
     // when asking again could help. Never zero: a client reading `Retry-After: 0` will come straight
     // back, which is the one answer that is never useful here.
     let ms = remaining_fail_ms(state, vid).unwrap_or_else(|| fail_ttl_ms(&e.reason));
-    let retry_after = (ms / 1000).max(1).to_string();
+    // Round UP. `record_failure` and this read take separate millisecond clock readings, so dividing
+    // down reports one second short whenever the millisecond ticks between them — and a client that
+    // comes back a second early finds the window still closed. Rounding up can only ever be right.
+    let retry_after = ms.div_ceil(1000).max(1).to_string();
     httputil::json(
         StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY),
         &body,
@@ -668,10 +714,9 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
                 }
                 Err(()) => break,
             },
-            Err(e) => {
-                eprintln!("[{vid}] {}", e.detail);
-                return play_error(&state, &vid, &e);
-            }
+            // Not logged here: a failure is logged once by the download that produced it, and this
+            // arm is also reached by every request the failure cache answers from memory.
+            Err(e) => return play_error(&state, &vid, &e),
         }
     }
     httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "serve failed")

@@ -229,10 +229,13 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     let mut out = HashMap::new();
     // Bound the FILE before reading it, because the entry cap below cannot: `read` pulls the whole
     // thing into memory and `from_slice` materialises the whole map, so by the time anything is
-    // counted the memory has already been spent. YT_CACHE_MAX entries serialise to something over a
-    // megabyte, so this is generous headroom and still a bound — and this file lives on a volume we
-    // do not otherwise police, at a point in boot that runs before the listener binds.
-    const MAX_RESOLVE_FILE: u64 = 16 * 1024 * 1024;
+    // counted the memory has already been spent.
+    //
+    // Sized against what this process can actually write — YT_CACHE_MAX entries at roughly a
+    // hundred bytes each, so a megabyte or so — rather than a round number that felt safe. The
+    // difference is not cosmetic: the smallest legal entry is about 36 bytes, so a 16 MB cap admits
+    // ~465k of them and some 50 MB of parsed map, on a box budgeted at a few MB resident.
+    const MAX_RESOLVE_FILE: u64 = 2 * 1024 * 1024;
     match std::fs::metadata(&cfg.resolve_cache) {
         Ok(md) if md.len() > MAX_RESOLVE_FILE => {
             eprintln!(
@@ -254,15 +257,27 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
         if out.len() >= crate::YT_CACHE_MAX {
             break;
         }
+        // Everything downstream ADDS to `confirmed` without checking: `now >= confirmed + YT_TTL_MS`
+        // decides staleness on the /meta path, and the substitution path adds `STALE_GRACE_MS` on
+        // top of that. All of it was safe for as long as `confirmed` could only ever be a reading of
+        // our own clock — which is exactly the invariant this file breaks, since it is the one place
+        // the value arrives from outside the process.
+        //
+        // So restore the invariant HERE, once, rather than hardening three arithmetic sites: an
+        // entry claiming it was confirmed in the future did not come from our clock, and is not an
+        // entry worth keeping. (A backwards clock jump drops the cache, which costs a re-resolve.)
+        // Checked against both kinds of entry, because the empty ones are read by that same /meta
+        // staleness test.
+        if e.confirmed > now {
+            continue;
+        }
         if e.ids.is_empty() {
             if e.exp > now {
                 out.insert(k, e);
             }
             continue;
         }
-        // checked_add: `confirmed` is a u64 straight off disk, and a value near u64::MAX would
-        // panic here in a debug build — at boot, before anything is serving. An entry whose
-        // arithmetic does not fit is not an entry worth keeping.
+        // Belt and braces on top of the guard above, which already rules the overflow out.
         let Some(earned) = e.confirmed.checked_add(crate::YT_TTL_MS) else { continue };
         if now < earned {
             // Restore the expiry a confirmed answer is entitled to, rather than whatever cooldown
@@ -287,9 +302,14 @@ pub fn save_resolve_cache(state: &AppState) {
         eprintln!("resolve cache: {} is not writable ({e})", dir.display());
         return;
     }
+    // Only what is still live. An entry that has already expired is bytes to write now, bytes to
+    // read at boot, and an entry to parse and immediately discard — three costs for nothing.
+    let now = (state.clock)();
     let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(bytes) = serde_json::to_vec(&*cache) else { return };
-    let n = cache.len();
+    let live: HashMap<&String, &YtEntry> = cache.iter().filter(|(_, e)| e.exp > now).collect();
+    let Ok(bytes) = serde_json::to_vec(&live) else { return };
+    let n = live.len();
+    drop(live);
     drop(cache);
     // Write-then-rename, so a kill mid-write cannot leave a half-file that the next boot has to
     // parse. The temp lives in the same directory, which is what makes the rename atomic.

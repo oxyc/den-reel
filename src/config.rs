@@ -75,6 +75,10 @@ pub struct Config {
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
+    /// Until when `play::cache_available` may answer "yes" without touching the disk again (ms since
+    /// epoch, 0 = never asked). It memoises an answer about THIS config's volume, which is why it
+    /// lives here rather than in a static.
+    pub cache_ok_until: std::sync::atomic::AtomicU64,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -182,6 +186,7 @@ impl Config {
             ytdlp_extractor_args,
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
+            cache_ok_until: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
