@@ -405,8 +405,18 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> Bake {
             bake_outcome(BakeRun::NeverStarted)
         }
         Err(_) => {
-            eprintln!("bake_clap {}: exceeded {BAKE_TIMEOUT_SECS}s and was killed mid-rewrite", fp.display());
-            bake_outcome(BakeRun::Killed)
+            // Ask the file here too. The timeout covers MP4Box's read/parse phase as well as the
+            // rewrite, so a bake killed while still reading a large trailer never touched the
+            // target — condemning it on the exit alone is exactly the premise this stopped using.
+            // The SIGKILL from the guard's drop is asynchronous, so settle first.
+            tokio::time::sleep(KILL_SETTLE).await;
+            let touched = file_stamp(fp).await != before;
+            eprintln!(
+                "bake_clap {}: exceeded {BAKE_TIMEOUT_SECS}s and was killed{}",
+                fp.display(),
+                if touched { " mid-rewrite" } else { " before it wrote anything" }
+            );
+            bake_outcome(if touched { BakeRun::Killed } else { BakeRun::Refused { touched: false } })
         }
     }
 }
@@ -425,7 +435,8 @@ pub(crate) enum BakeRun {
     Refused { touched: bool },
     /// MP4Box could not be spawned at all.
     NeverStarted,
-    /// Timed out, so it was SIGKILLed — possibly part-way through the in-place rewrite.
+    /// Timed out and was SIGKILLed after it had already written — a half-rewritten file. A timeout
+    /// that killed it before it wrote is a `Refused { touched: false }`, not this.
     Killed,
 }
 
@@ -437,6 +448,10 @@ pub(crate) fn bake_outcome(run: BakeRun) -> Bake {
         BakeRun::Refused { touched: true } | BakeRun::Killed => Bake::Damaged,
     }
 }
+
+/// Long enough for an asynchronous SIGKILL to land before the file is stamped, short enough to be
+/// invisible — only ever paid on a bake that already ran into its 30s timeout.
+const KILL_SETTLE: Duration = Duration::from_millis(200);
 
 /// Size + mtime, the cheap evidence of whether something wrote to the file.
 async fn file_stamp(p: &Path) -> Option<(u64, std::time::SystemTime)> {

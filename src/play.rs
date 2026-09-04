@@ -67,9 +67,17 @@ pub(crate) fn sweep_partials(cfg: &Config) {
         // `<tmp>.f<id>.<ext>.part`), then only dotfiles (MP4Box's `-tmp` file is `_libgpac_…`, no
         // dot, no extension). A published trailer is `<vid>.mp4` and nothing else is.
         if is_published_trailer(&name) {
+            // ...unless it is not actually a trailer. See below.
+            if !entry.metadata().map(|m| m.is_file()).unwrap_or(true) {
+                eprintln!("sweep: {name} is a directory, not a trailer — removing");
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
             continue;
         }
-        // Directories are not ours to remove — yt-dlp's own cache lives in one here.
+        // Directories are not ours to remove — yt-dlp's own cache lives in one here. Except one at
+        // a PUBLISHED trailer's path, which nothing else will ever clear: the cache-hit check now
+        // rejects it (a directory reports a non-zero length), so every request for that id
+        // re-downloads and then fails at the rename, forever, dragging /health with it.
         if !entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
             continue;
         }

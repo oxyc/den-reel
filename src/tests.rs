@@ -2471,13 +2471,30 @@ async fn a_refusal_that_never_wrote_is_not_damage() {
 
     // Failed PART WAY through the rewrite — ENOSPC, EIO. This one really did damage it.
     let mangling = dir.join("mp4box-mangles");
-    std::fs::write(&mangling, "#!/bin/sh\nf=\"${@: -1}\"\nhead -c 64 /dev/zero >> \"$f\"\nexit 1\n").unwrap();
+    std::fs::write(
+        &mangling,
+        // POSIX: `for` leaves $f holding the LAST argument, which is MP4Box's target. `${@: -1}` is a
+        // bashism — under dash, which is /bin/sh on Linux CI, it is a Bad Substitution, so the fake
+        // exited without writing and the branch this test exists for was never reached there.
+        "#!/bin/sh\nfor f in \"$@\"; do :; done\nhead -c 64 /dev/zero >> \"$f\"\nexit 1\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&mangling, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let mut cfg = test_cfg(dir.clone());
     cfg.mp4box = mangling.to_string_lossy().into_owned();
+    let before = std::fs::metadata(&fp).unwrap().len();
+    let verdict = crate::crop::bake_clap(&cfg, &fp, &report).await;
+    // Check the FAKE did its job before trusting the verdict. A fake that silently no-ops makes
+    // this test pass for the wrong reason — which is exactly what a bashism did under dash, leaving
+    // the branch below unexercised everywhere except one developer's machine.
+    assert_ne!(
+        std::fs::metadata(&fp).unwrap().len(),
+        before,
+        "the fake MP4Box never wrote to the file, so this proves nothing about a damaged bake"
+    );
     assert_eq!(
-        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        verdict,
         crate::crop::Bake::Damaged,
         "a bake that wrote and then failed left a half-rewritten file"
     );
@@ -2586,7 +2603,8 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
     sh(&ff, "echo '  Stream #0:0: Video: h264, yuv420p, 1920x1080 [SAR 1:1]' >&2\ni=0; while [ $i -lt 12 ]; do echo 'crop=1920:800:0:140' >&2; i=$((i+1)); done");
     // MP4Box: ran, and failed — so the trailer may be mid-rewrite.
     let mp = dir.join("mp");
-    sh(&mp, "f=\"${@: -1}\"; head -c 64 /dev/zero >> \"$f\"; echo boom >&2; exit 1");
+    let ran = dir.join("mp-ran");
+    sh(&mp, &format!("for f in \"$@\"; do :; done; head -c 64 /dev/zero >> \"$f\" && : > {}; echo boom >&2; exit 1", ran.display()));
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
@@ -2597,6 +2615,11 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
     let err = crate::play::fetch_trailer(state.clone(), "bakevid0002".into())
         .await
         .expect_err("a possibly-corrupt trailer must not be published");
+    // The fake MP4Box has to have actually written, or this asserts the wrong failure.
+    assert!(
+        dir.join("mp-ran").exists(),
+        "the fake MP4Box never ran or never wrote; this proves nothing about a damaged bake"
+    );
     assert_eq!(err.reason, "incomplete_download", "{err:?}");
     // Name the failure, or this passes just as well when yt-dlp wrote nothing and the bake never ran.
     assert!(
@@ -2706,4 +2729,24 @@ async fn a_failed_publish_is_local_and_visible() {
         state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "every download failing at the rename still reported ok"
     );
+}
+
+/// A directory at a published trailer's path is served by nothing (the cache-hit check rejects it)
+/// and removed by nothing — `is_published_trailer` matches on name, and both cleanup passes skip
+/// non-files. So every request for that id re-downloads, fails at the rename, and bumps the health
+/// counter, permanently.
+#[test]
+fn a_directory_masquerading_as_a_trailer_is_cleared() {
+    let dir = temp_dir();
+    let impostor = dir.join("impostorvid.mp4");
+    std::fs::create_dir_all(impostor.join("in-the-way")).unwrap();
+    std::fs::write(dir.join("realvideo001.mp4"), b"x").unwrap();
+    std::fs::create_dir_all(dir.join("yt-dlp")).unwrap();
+    std::fs::write(dir.join("yt-dlp").join("player.json"), b"{}").unwrap();
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+
+    assert!(!impostor.exists(), "a directory at a trailer's path survived the sweep forever");
+    assert!(dir.join("realvideo001.mp4").exists(), "a real trailer was removed");
+    assert!(dir.join("yt-dlp").join("player.json").exists(), "yt-dlp's own cache was removed");
 }
