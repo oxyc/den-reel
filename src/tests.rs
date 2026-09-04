@@ -2604,7 +2604,9 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
     // MP4Box: ran, and failed — so the trailer may be mid-rewrite.
     let mp = dir.join("mp");
     let ran = dir.join("mp-ran");
-    sh(&mp, &format!("for f in \"$@\"; do :; done; head -c 64 /dev/zero >> \"$f\" && : > {}; echo boom >&2; exit 1", ran.display()));
+    // Quoted: an unquoted path word-splits under a TMPDIR containing a space, the marker is never
+    // written, and the test fails for a reason that has nothing to do with the code.
+    sh(&mp, &format!("for f in \"$@\"; do :; done; head -c 64 /dev/zero >> \"$f\" && : > \"{}\"; echo boom >&2; exit 1", ran.display()));
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
@@ -2749,4 +2751,21 @@ fn a_directory_masquerading_as_a_trailer_is_cleared() {
     assert!(!impostor.exists(), "a directory at a trailer's path survived the sweep forever");
     assert!(dir.join("realvideo001.mp4").exists(), "a real trailer was removed");
     assert!(dir.join("yt-dlp").join("player.json").exists(), "yt-dlp's own cache was removed");
+}
+
+/// The sweep and the serve path must agree on what a trailer is. `DirEntry::metadata` does not
+/// follow symlinks and `fs::metadata` does, so a symlinked trailer that plays perfectly well read
+/// as "not a file" to the sweep and was unlinked.
+#[test]
+fn a_symlinked_trailer_is_not_swept_away() {
+    let dir = temp_dir();
+    let real = dir.join("payload.bin");
+    std::fs::write(&real, b"a real trailer").unwrap();
+    let link = dir.join("linkedvid01.mp4");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    crate::play::sweep_partials(&test_cfg(dir.clone()));
+
+    assert!(link.exists(), "a symlinked trailer the serve path would happily open was removed");
+    assert!(real.exists(), "the symlink's target was removed");
 }

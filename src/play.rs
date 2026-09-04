@@ -67,10 +67,18 @@ pub(crate) fn sweep_partials(cfg: &Config) {
         // `<tmp>.f<id>.<ext>.part`), then only dotfiles (MP4Box's `-tmp` file is `_libgpac_…`, no
         // dot, no extension). A published trailer is `<vid>.mp4` and nothing else is.
         if is_published_trailer(&name) {
-            // ...unless it is not actually a trailer. See below.
-            if !entry.metadata().map(|m| m.is_file()).unwrap_or(true) {
-                eprintln!("sweep: {name} is a directory, not a trailer — removing");
-                let _ = std::fs::remove_dir_all(entry.path());
+            // ...unless it is not actually a trailer. `fs::metadata` FOLLOWS symlinks, which
+            // `DirEntry::metadata` does not — and the serve path follows, so anything else here
+            // would unlink a symlinked trailer that plays perfectly well.
+            if !std::fs::metadata(entry.path()).map(|m| m.is_file()).unwrap_or(true) {
+                // Say what happened, not what was intended: a removal that fails (EACCES on a
+                // directory a root-run container left in a volume we read as nonroot, EROFS, or a
+                // node where remove_dir_all returns ENOTDIR) otherwise logs success hourly while
+                // every request for that id keeps re-downloading and failing at the rename.
+                match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => eprintln!("sweep: removed {name}, which was not a trailer"),
+                    Err(e) => eprintln!("sweep: {name} is not a trailer and cannot be removed: {e}"),
+                }
             }
             continue;
         }
