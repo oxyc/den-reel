@@ -12,7 +12,7 @@ use hyper::body::Frame;
 use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
 use http_body_util::{BodyExt, StreamBody};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
 use crate::config::Config;
@@ -679,39 +679,90 @@ where
     StreamBody::new(stream).boxed()
 }
 
-/// Serve a file with HTTP range support (so the player can scrub). Always answers Content-Length +
-/// Accept-Ranges (+206 on Range) — which tvOS AVPlayer REQUIRES for a progressive MP4.
+/// A cached trailer, opened and ready to serve: everything the response needs from the filesystem,
+/// obtained in ONE blocking call.
+struct Opened {
+    file: std::fs::File,
+    size: u64,
+    /// Already resolved against the real size, and already seeked to when satisfiable.
+    range: Option<RangeReq>,
+}
+
+/// Open a cached trailer for serving — open, fstat, reject anything that is not a real file, bump
+/// atime, resolve the Range header and seek to it — in a single `spawn_blocking`.
 ///
-/// `Err(())` means the file vanished before we could open it (evicted between fetch and serve) —
-/// the caller retries with a fresh fetch. Every other outcome is a finished `Response`.
-async fn serve_file(range: Option<&str>, fp: &Path, vid: &str) -> Result<Response<Body>, ()> {
-    let file = match tokio::fs::File::open(fp).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("serve_file open {}: {e}", fp.display());
-            return Err(());
+/// Serving a warm file used to cost four or five dispatches to the blocking pool: `metadata` in
+/// `fetch_trailer`, an `open` + `set_times` for the atime touch, then `File::open` and `metadata`
+/// again here, plus a `seek` on a Range request. On a current-thread runtime each of those is a full
+/// task handoff, and one playback is many range requests. Every one of them is answering a question
+/// about the same file, so ask once.
+///
+/// `set_times` goes through the handle we already hold rather than opening the path again, and the
+/// `is_file` check that used to live in `fetch_trailer` comes along for free — `open` on a directory
+/// succeeds on Linux, so something has to reject it, and the fstat is right here.
+fn open_for_serve(fp: &Path, range: Option<&str>) -> std::io::Result<Opened> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(fp)?;
+    let md = file.metadata()?;
+    if !md.is_file() || md.len() == 0 {
+        // A directory reports a non-zero length, so anything that left one at a trailer's path would
+        // otherwise be served as a cache hit that can never produce bytes.
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a published trailer"));
+    }
+    // Best-effort: the LRU wants to know this was served, but failing to record it must not fail the
+    // playback. See `evict_if_needed` for why the stamp matters.
+    let _ = file.set_times(std::fs::FileTimes::new().set_accessed(SystemTime::now()));
+
+    let size = md.len();
+    let parsed = parse_range(range, size);
+    if let Some(RangeReq::Satisfiable { start, .. }) = parsed {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    Ok(Opened { file, size, range: parsed })
+}
+
+/// Run [`open_for_serve`] off the runtime thread. `None` means "not servable" — usually simply not
+/// cached yet, which is the normal cold path and not worth a log line.
+async fn try_open(cfg: &Config, vid: &str, range: Option<&str>) -> Option<Opened> {
+    let fp = cache_path(cfg, vid);
+    let range = range.map(str::to_string);
+    let opened = tokio::task::spawn_blocking(move || open_for_serve(&fp, range.as_deref())).await;
+    match opened {
+        Ok(Ok(o)) => Some(o),
+        // A cold id is the common case and says nothing; anything else is worth seeing.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Err(e)) => {
+            eprintln!("[{vid}] open for serve: {e}");
+            None
         }
-    };
-    let size = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(_) => return Ok(httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "stat failed")),
-    };
+        Err(e) => {
+            eprintln!("[{vid}] open for serve panicked: {e}");
+            None
+        }
+    }
+}
+
+/// Build the response for an already-opened trailer. Always answers Content-Length + Accept-Ranges
+/// (+206 on Range) — which tvOS AVPlayer REQUIRES for a progressive MP4.
+///
+/// Pure: no I/O, no awaits. Everything it needs was settled by `open_for_serve`.
+fn serve_opened(opened: Opened, vid: &str) -> Response<Body> {
+    let Opened { file, size, range } = opened;
+    let file = tokio::fs::File::from_std(file);
     // The cached MP4 for a given id is byte-stable + immutable (a new extraction would be a new id),
     // so it can be cached hard. A strong ETag from id+size lets a caller/proxy revalidate cheaply.
     let etag = httputil::etag_of(format!("{vid}:{size}").as_bytes());
 
-    let resp = match parse_range(range, size) {
+    match range {
         Some(RangeReq::Unsatisfiable) => Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header("content-range", format!("bytes */{size}"))
             .body(httputil::full(""))
             .unwrap(),
         Some(RangeReq::Satisfiable { start, end }) => {
+            // Already seeked, in the same blocking call that opened it.
             let len = end - start + 1;
-            let mut file = file;
-            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-                return Ok(httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "seek failed"));
-            }
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-range", format!("bytes {start}-{end}/{size}"))
@@ -732,8 +783,7 @@ async fn serve_file(range: Option<&str>, fp: &Path, vid: &str) -> Result<Respons
             .header("etag", &etag)
             .body(stream_body(file))
             .unwrap(),
-    };
-    Ok(resp)
+    }
 }
 
 /// What is LEFT of this id's failure window, in ms. `None` when nothing is standing — the entry was
@@ -777,22 +827,30 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
         );
     }
     let range = headers.get("range").and_then(|v| v.to_str().ok()).map(str::to_string);
-    // At most two attempts: if the cached file is evicted between fetch and open, re-fetch once.
+
+    // Try to serve first, ask questions later. The overwhelmingly common request is for a trailer
+    // that is already cached — prewarm exists to make it so — and this reaches it in ONE dispatch to
+    // the blocking pool. Going through `fetch_trailer` first meant a stat and an atime touch before
+    // the open and fstat that actually serve, all to establish what a single open would have told us.
+    if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
+        return serve_opened(opened, &vid);
+    }
+
+    // Not servable: cold, or evicted out from under us. Two attempts, because the file can be
+    // evicted again between the download completing and us opening it.
     for attempt in 0..2 {
-        match fetch_trailer(state.clone(), vid.clone()).await {
-            Ok(fp) => match serve_file(range.as_deref(), &fp, &vid).await {
-                Ok(resp) => return resp,
-                // Evicted between fetch and open. Retire the finished entry first, or the retry
-                // joins it and is handed the very path that just vanished.
-                Err(()) if attempt == 0 => {
-                    drop_if_finished(&state, &vid);
-                    continue;
-                }
-                Err(()) => break,
-            },
+        if let Err(e) = fetch_trailer(state.clone(), vid.clone()).await {
             // Not logged here: a failure is logged once by the download that produced it, and this
             // arm is also reached by every request the failure cache answers from memory.
-            Err(e) => return play_error(&state, &vid, &e),
+            return play_error(&state, &vid, &e);
+        }
+        if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
+            return serve_opened(opened, &vid);
+        }
+        // Retire the finished entry before retrying, or `fetch_trailer` joins it and hands back the
+        // same success for the file that just vanished.
+        if attempt == 0 {
+            drop_if_finished(&state, &vid);
         }
     }
     httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "serve failed")

@@ -1572,6 +1572,40 @@ fn eviction_ttl_drops_stale_but_keeps_fresh() {
     assert!(dir.join("freshVid001.mp4").exists(), "recently-served trailer must be kept");
 }
 
+/// Serving a warm file must reach the bytes without consulting the extractor at all, and must stamp
+/// atime on the way — that stamp is the only thing making an in-use trailer sort as recently used,
+/// and `evict_if_needed` removes oldest-atime first after every download.
+///
+/// Both halves are now done by the single blocking call that opens the file, which also makes the
+/// stamp deterministic: it completes before the response is built, where the old fire-and-forget
+/// touch could still be in flight while eviction was already reading the directory.
+#[tokio::test]
+async fn a_warm_serve_stamps_atime_and_never_reaches_yt_dlp() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir();
+    seed_cache(&dir, "warmVid0001", 100);
+
+    // Age the stamp well past anything a test could take, so a bump is unmistakable.
+    let old = SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60);
+    let f = std::fs::File::open(dir.join("warmVid0001.mp4")).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(old)).unwrap();
+    drop(f);
+
+    let mut cfg = test_cfg(dir.clone());
+    // If the warm path tries to download, this fails loudly rather than quietly succeeding.
+    cfg.ytdlp = "/nonexistent/yt-dlp".into();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let resp = crate::play::handle_play(state, &hyper::HeaderMap::new(), "warmVid0001".into()).await;
+    assert_eq!(resp.status(), 200, "a cached trailer was not served from cache");
+
+    let atime = std::fs::metadata(dir.join("warmVid0001.mp4")).unwrap().accessed().unwrap();
+    assert!(
+        atime.elapsed().unwrap() < Duration::from_secs(60),
+        "the serve did not stamp atime, so eviction cannot tell this file is in use"
+    );
+}
+
 #[tokio::test]
 async fn play_unsatisfiable_range_is_416() {
     let dir = temp_dir();
