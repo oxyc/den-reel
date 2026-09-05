@@ -538,6 +538,12 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         let mut map = state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, existing)) = map.get(&vid) {
             existing.clone()
+        } else if map.len() >= crate::IN_FLIGHT_MAX {
+            // Only a NEW id is refused. Joining a download already in flight costs nothing and is
+            // exactly what the de-duplication is for, so a viewer waiting on a trailer someone else
+            // triggered is never turned away by this.
+            eprintln!("[{vid}] refused: {} downloads already outstanding", map.len());
+            return Err(PlayError::overloaded());
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
             let fut: BoxFuture<Result<PathBuf, PlayError>> = {

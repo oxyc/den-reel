@@ -99,6 +99,7 @@ so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see th
 451 {"error":"geo_blocked","message":"This trailer is not available in your region.","id":…}
 403 {"error":"restricted", …}   # private / age-restricted
 404 {"error":"unavailable", …}  # removed
+503 {"error":"busy", …}           # IN_FLIGHT_MAX distinct ids already downloading
 502 {"error":"extraction_failed", …}
 502 {"error":"incomplete_download", …}  # yt-dlp was fine; no usable file came out of it
 504 {"error":"timeout", …}

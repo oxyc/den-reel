@@ -63,6 +63,18 @@ impl PlayError {
             detail: "the crop bake was interrupted mid-rewrite".into(),
         }
     }
+    /// Too many distinct ids already have a download outstanding. A 503 rather than a 502: nothing
+    /// is wrong with the video or the extractor, this instance is simply full, and the same request
+    /// a minute later will very likely work. Deliberately not cached in `play_fails` — it says
+    /// nothing about the id, and pinning it would turn a busy minute into a dead trailer.
+    pub(crate) fn overloaded() -> PlayError {
+        PlayError {
+            status: 503,
+            reason: "busy".into(),
+            message: "Too many trailers are being fetched right now.".into(),
+            detail: "in-flight download cap reached".into(),
+        }
+    }
     fn timed_out() -> PlayError {
         PlayError {
             status: 504,

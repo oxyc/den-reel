@@ -154,11 +154,9 @@ wraps the call in `spawn_blocking` — at which point a wedged volume would bloc
 `/stats` for the duration of a disk write. Fixing it means giving the width back to a `Vec`, which is
 the allocation that write was changed to avoid, so it is a genuine trade and not an obvious win.
 
-**`in_flight` has no cap** (pre-existing, outside this changeset). `download_sem` bounds concurrent
-downloads to three, but the permit is taken *inside* `download_cached`, so every distinct valid id
-gets a map entry and a spawned driver that can sit queued for up to `DOWNLOAD_TIMEOUT_SECS`. On an
-instance without `REEL_PLAY_SECRET` that is request-driven growth. `sign.rs` is the mitigation and it
-defaults off by necessity; a cap on `in_flight` would be the real fix.
+~~**`in_flight` has no cap**~~ — DONE. Capped at `IN_FLIGHT_MAX` (64); a new id past the cap gets a
+503 `busy`, while joining a download already in flight is always free. Not recorded in `play_fails`,
+since it says nothing about the video.
 
 ## STILL OPEN — the cached-serve path takes 3–4 blocking-pool dispatches where 1 would do
 
@@ -180,7 +178,9 @@ largest win in the changeset; these 3 are what is left, not evidence the memo wa
 
 **Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold path, and the
 code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms` then
-re-locks to fetch; `sign::key_of` re-derives the MAC key per id and per secret (default-off).
+re-locks to fetch. (`sign::key_of` re-deriving per id is now fixed — `sign::Signer` derives the key
+once per response; it still re-derives once per configured secret when *verifying*, which is at most
+a handful and only with signing on.)
 
 An earlier version of this note also filed `save_resolve_cache`'s `to_vec` here. That was a
 mis-triage — it was a multi-megabyte transient allocation at shutdown, not a nanosecond cost, and it

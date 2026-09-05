@@ -80,6 +80,17 @@ const _: () = assert!(
     "prewarm must leave a download permit for a real /play"
 );
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
+// Cap on DISTINCT ids with a download outstanding. `download_sem` bounds how many run at once, but
+// the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
+// driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. That is request-driven growth: on an
+// instance without REEL_PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
+// are merely well-formed. Generous against real use (3 downloading, 2 prewarming, the rest waiting
+// their turn) and small enough that the map cannot become the way the box runs out of memory.
+pub const IN_FLIGHT_MAX: usize = 64;
+const _: () = assert!(
+    IN_FLIGHT_MAX > DOWNLOAD_CONCURRENCY + PREWARM_MAX,
+    "the queue has to be able to hold everything that may legitimately be running at once"
+);
 
 /// The /configure page, embedded so the binary is self-contained (seals a BYOK TMDB key into the URL).
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
