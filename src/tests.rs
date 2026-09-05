@@ -193,7 +193,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         play_secrets_prev: Vec::new(),
         public_base_url: None,
         ytdlp_format: "fmt".into(),
-        ytdlp_extractor_args: Some("youtube:player_client=tv_embedded".into()),
+        ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
         cache_ok_until: std::sync::atomic::AtomicU64::new(0),

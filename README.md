@@ -166,7 +166,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube; below 144 (no rendition can match) it falls back to the default |
 | `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold; below 256 MB (under one trailer) it falls back to the default |
 | `CACHE_TTL_DAYS` | `14` | Drop a trailer this long after it was last served |
-| `YTDLP_PLAYER_CLIENTS` | `tv_embedded,android` | YouTube innertube client(s) for `--extractor-args player_client`. The TV-embedded client returns clean H.264 with non-signature URLs, so it sidesteps BotGuard ("confirm you're not a bot") **and** a broken nsig/JS-runtime — the two ways server-side extraction fails while the `web`/`tv` clients get DRM-wrapped/blocked. Comma-separate to try several — `tv_embedded` goes **first**, with `android` behind it for the videos tv_embedded reports unavailable; yt-dlp merges both clients' formats and the format ladder prefers the clean avc1 either way. Empty = yt-dlp defaults. |
+| `YTDLP_PLAYER_CLIENTS` | *(unset — yt-dlp chooses)* | Pin the YouTube innertube client(s) for `--extractor-args player_client`, comma-separated. **Normally leave this alone.** It used to default to `tv_embedded,android`; yt-dlp has since retired `tv_embedded`, and an unrecognised client is answered with a *warning* (`Skipping unsupported client`) that `--no-warnings` hides — so the pin silently degraded to `android` alone, which now needs a PO token for both HTTPS and DASH. Which client works is a judgement about what YouTube is enforcing this month, it is the judgement the yt-dlp team makes daily, and bumping `YTDLP_VERSION` is how we receive it. Set this only to ride out a specific outage, and check the name against the yt-dlp release you have pinned — a retired one fails quietly. |
 
 ## Maintenance
 
@@ -174,7 +174,8 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 `tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
 fallback and its outage is deliberately invisible here), or
 `extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
-YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` or tune `YTDLP_PLAYER_CLIENTS`),
+YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` — pinning
+`YTDLP_PLAYER_CLIENTS` is a stopgap, not the fix),
 or `downloads_failing` (yt-dlp extracts fine but no file is produced — check the cache volume and
 MP4Box). The two are separate because the remedy is: an outage where every download fails locally
 would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full disk.
