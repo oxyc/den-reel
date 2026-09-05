@@ -227,10 +227,8 @@ pub fn default_prewarm() -> PrewarmFn {
 ///
 /// So: populated entries live by `confirmed`, empty ones by their own `exp`.
 pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
-    let mut out = HashMap::new();
-    // Bound the FILE before reading it, because the entry cap below cannot: `read` pulls the whole
-    // thing into memory and `from_slice` materialises the whole map, so by the time anything is
-    // counted the memory has already been spent.
+    // Bound the FILE before opening it, because the entry cap below cannot: the map is materialised
+    // in full before anything can be counted, so by then the memory has already been spent.
     //
     // Sized against what this process can actually write, because a cap below that ceiling does not
     // protect anything — it just makes every boot discard the whole parked cache, permanently, since
@@ -241,10 +239,9 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     // is ~140 bytes of body — ~169 a piece, so ~1.61 MB when completely full. Two megabytes clears
     // that by a fifth.
     //
-    // Not more than that. The cap is the ONLY bound on what boot will materialise — `from_slice`
-    // builds the whole map before any entry count can be applied — and a file this process did not
-    // write can be all minimum-size entries, which JSON expands roughly threefold into the map. So
-    // every byte of slack here is about eight bytes of peak RSS at startup, on a box measured in
+    // Not more than that. The cap is the ONLY bound on what boot will materialise, and a file this
+    // process did not write can be all minimum-size entries, which JSON expands severalfold into the
+    // map. So every byte of slack here is several bytes of peak RSS at startup, on a box measured in
     // single-digit megabytes. Bounding the imdb id is what made a tight cap safe; spending that
     // safety on headroom nothing needs would be a poor trade.
     const MAX_RESOLVE_FILE: u64 = 2 * 1024 * 1024;
@@ -255,23 +252,33 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
                 cfg.resolve_cache.display(),
                 md.len()
             );
-            return out;
+            return HashMap::new();
         }
         Ok(_) => {}
-        Err(_) => return out, // no parked cache, which is the normal first boot
+        Err(_) => return HashMap::new(), // no parked cache, which is the normal first boot
     }
-    let Ok(bytes) = std::fs::read(&cfg.resolve_cache) else { return out };
-    let Ok(parsed) = serde_json::from_slice::<HashMap<String, YtEntry>>(&bytes) else {
-        eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
-        return out;
-    };
-    // The raw bytes are dead the moment they are parsed, and holding them would keep a second full
-    // copy of the file alive beside the map for the whole restore — at boot, on a box measured in
-    // single-digit megabytes.
-    drop(bytes);
-    for (k, e) in parsed {
-        if out.len() >= crate::YT_CACHE_MAX {
-            break;
+    // Streamed, and then filtered IN PLACE. The obvious shape — read the file into a Vec, parse that
+    // into one map, drain it into a second — has three full copies of the data alive at the worst
+    // moment: the byte buffer (which `from_slice` borrows, so it cannot be dropped before the parse
+    // completes), the parsed table, and the destination table growing to match by doubling. At boot,
+    // which is when a redeploy still has the outgoing process resident.
+    //
+    // This is the same mistake `save_resolve_cache` was fixed for one function down, in the same
+    // direction: build the whole document in memory rather than stream it. The read side is the
+    // larger half, because what it materialises is a HashMap and not a byte vector.
+    let Ok(file) = std::fs::File::open(&cfg.resolve_cache) else { return HashMap::new() };
+    let mut parsed: HashMap<String, YtEntry> =
+        match serde_json::from_reader(std::io::BufReader::new(file)) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
+                return HashMap::new();
+            }
+        };
+    let mut kept = 0usize;
+    parsed.retain(|_, e| {
+        if kept >= crate::YT_CACHE_MAX {
+            return false;
         }
         // Everything downstream ADDS to `confirmed` without checking: `now >= confirmed + YT_TTL_MS`
         // decides staleness on the /meta path, and the substitution path adds `STALE_GRACE_MS` on
@@ -285,26 +292,31 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
         // Checked against both kinds of entry, because the empty ones are read by that same /meta
         // staleness test.
         if e.confirmed > now {
-            continue;
+            return false;
         }
-        if e.ids.is_empty() {
-            if e.exp > now {
-                out.insert(k, e);
+        let keep = if e.ids.is_empty() {
+            e.exp > now
+        } else {
+            // Belt and braces on top of the guard above, which already rules the overflow out.
+            match e.confirmed.checked_add(crate::YT_TTL_MS) {
+                Some(earned) if now < earned => {
+                    // Restore the expiry a confirmed answer is entitled to, rather than whatever
+                    // cooldown the last failing lookup happened to leave behind.
+                    e.exp = earned;
+                    true
+                }
+                _ => false,
             }
-            continue;
+        };
+        if keep {
+            kept += 1;
         }
-        // Belt and braces on top of the guard above, which already rules the overflow out.
-        let Some(earned) = e.confirmed.checked_add(crate::YT_TTL_MS) else { continue };
-        if now < earned {
-            // Restore the expiry a confirmed answer is entitled to, rather than whatever cooldown
-            // the last failing lookup happened to leave behind.
-            out.insert(k, YtEntry { ids: e.ids, exp: earned, confirmed: e.confirmed });
-        }
+        keep
+    });
+    if kept > 0 {
+        println!("resolve cache: {kept} entr{} still good", if kept == 1 { "y" } else { "ies" });
     }
-    if !out.is_empty() {
-        println!("resolve cache: {} entr{} still good", out.len(), if out.len() == 1 { "y" } else { "ies" });
-    }
-    out
+    parsed
 }
 
 /// Park the resolve cache on the way out, so a redeploy does not make the next browse re-ask TMDB
