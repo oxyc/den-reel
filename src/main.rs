@@ -126,8 +126,10 @@ fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32, l
         serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     } else if extract_fails >= HEALTH_FAIL_THRESHOLD {
         // Trailers resolve upstream but yt-dlp can't extract any of them here — YouTube BotGuard or a
-        // stale yt-dlp / broken nsig-JS runtime. Bump YTDLP_VERSION (Dockerfile) or tune YTDLP_PLAYER_CLIENTS.
-        serde_json::json!({"status": "degraded", "reason": "extractor_unavailable", "detail": "yt-dlp can't extract YouTube here — bump yt-dlp or set YTDLP_PLAYER_CLIENTS"})
+        // stale yt-dlp / broken nsig-JS runtime. Bumping YTDLP_VERSION is the fix that usually works,
+        // and is named FIRST on purpose: pinning a client with YTDLP_PLAYER_CLIENTS is the advice that
+        // produced a dead client name silently degrading extraction for who knows how long.
+        serde_json::json!({"status": "degraded", "reason": "extractor_unavailable", "detail": "yt-dlp can't extract YouTube here — bump YTDLP_VERSION first; pin YTDLP_PLAYER_CLIENTS only as a stopgap"})
     } else if local_fails >= HEALTH_FAIL_THRESHOLD {
         // Downloads are failing for a reason that is ours, not YouTube's — no output file, or a
         // clap bake killed part-way. Named separately because "bump yt-dlp" is the wrong advice.

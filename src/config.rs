@@ -62,15 +62,24 @@ pub struct Config {
     /// playback needs (a candidate that can't produce it — geo-blocked, removed, VP9/AV1-only — is
     /// skipped in favour of the next trailer).
     pub ytdlp_format: String,
-    /// The `--extractor-args` value forcing YouTube's innertube **player client(s)** — `None` disables
-    /// the flag (yt-dlp's own defaults). Default `youtube:player_client=tv_embedded,android`: yt-dlp
-    /// queries both clients and merges their formats, so the format selector still prefers
-    /// `tv_embedded`'s clean H.264 **non-signature** URLs (which sidestep the BotGuard "confirm you're
-    /// not a bot" challenge AND a broken nsig/JS-runtime) whenever that client can serve the video —
-    /// but falls back to `android` for the videos `tv_embedded` alone reports as "not available"
-    /// (some trailers only expose formats to the android client). Without the fallback those trailers
-    /// 502 on every candidate. Override with `YTDLP_PLAYER_CLIENTS` (comma-separated), or set it empty
-    /// to fall back to yt-dlp's defaults.
+    /// The `--extractor-args` value forcing YouTube's innertube **player client(s)**. `None` — the
+    /// default — passes no flag at all, so yt-dlp picks.
+    ///
+    /// It used to pin `tv_embedded,android`, chosen because that client returned clean H.264 over
+    /// non-signature URLs and so sidestepped both BotGuard and a broken nsig runtime. **`tv_embedded`
+    /// no longer exists.** yt-dlp's client table renamed and reshuffled it, an unrecognised name is
+    /// answered with `Skipping unsupported client "..."` — a *warning*, which `--no-warnings`
+    /// swallowed — and the pin therefore silently degraded to `android` alone, which as of this
+    /// yt-dlp requires a GVS PO token for both HTTPS and DASH.
+    ///
+    /// So do not pin by default. Picking a client is a judgement about what YouTube is currently
+    /// enforcing, it changes every few weeks, and it is the judgement the yt-dlp team makes daily and
+    /// we bump their releases to receive. Their current unauthenticated default is `visionos,web`,
+    /// and `visionos` declares no PO-token policy and no JS-player requirement — precisely the
+    /// properties `tv_embedded` was pinned for.
+    ///
+    /// `YTDLP_PLAYER_CLIENTS` still pins it, comma-separated, for riding out a specific outage. Be
+    /// aware that a name yt-dlp has retired fails quietly, in exactly the way described above.
     pub ytdlp_extractor_args: Option<String>,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
@@ -149,11 +158,12 @@ impl Config {
             }
         }
         ytdlp_format.push_str("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]");
-        // tv_embedded first (BotGuard/nsig-resistant, clean avc1) with android as fallback for the
-        // videos tv_embedded reports "not available"; yt-dlp merges both clients' formats. Empty disables.
+        // Unset = pass no flag = yt-dlp chooses. See the field's doc for why pinning was removed:
+        // the pinned client no longer existed, and an unknown name is skipped with a warning that
+        // `--no-warnings` hid.
         let ytdlp_extractor_args = env::var("YTDLP_PLAYER_CLIENTS")
             .map(|v| v.trim().to_string())
-            .unwrap_or_else(|_| "tv_embedded,android".to_string());
+            .unwrap_or_default();
         let ytdlp_extractor_args = if ytdlp_extractor_args.is_empty() {
             None
         } else {
