@@ -319,35 +319,43 @@ fn pick_candidates_orders_and_dedupes() {
     );
 }
 
-/// `include_video_language` asks TMDB for `<lang>,en,null`, because `language=<lang>` alone returns
-/// almost nothing — zero videos for most titles. That widening means an English trailer now arrives
-/// beside a native one, so the ordering has to prefer the language that was asked for. A viewer who
-/// asked for German gets the German trailer when there is one and the English one when there is not;
-/// ranking on kind alone would hand them whichever TMDB happened to mark official.
+/// The ordering prefers the FILM'S language, then English, then anything else — never the viewer's.
+///
+/// A video tagged with the viewer's language is a dub or a local-market cut; the thing worth watching
+/// is the film as it was made, subtitled by the client if it wants. An earlier version of this ranked
+/// the viewer's language first, which handed a Finnish viewer a Finnish-dubbed trailer for an English
+/// film in preference to the original.
 #[test]
-fn pick_candidates_prefers_the_requested_language() {
+fn pick_candidates_prefers_the_films_own_language_then_english() {
+    // The Finnish entry is deliberately the OFFICIAL trailer: language has to outrank kind, or a
+    // locally-marketed cut wins on being marked official.
     let results = vec![
-        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "en", "key": "englishOff1" }),
-        json!({ "site": "YouTube", "type": "Teaser", "iso_639_1": "de", "key": "germanTease" }),
-        json!({ "site": "YouTube", "type": "Trailer", "iso_639_1": "de", "key": "germanTrail" }),
+        json!({ "site": "YouTube", "type": "Teaser", "iso_639_1": "en", "key": "engTeaser01" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "fr", "key": "frenchOff01" }),
+        json!({ "site": "YouTube", "type": "Trailer", "iso_639_1": "en", "key": "engTrailer1" }),
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "fi", "key": "finnishDub1" }),
         json!({ "site": "YouTube", "type": "Trailer", "key": "untagged001" }),
     ];
 
-    // German asked for: both German videos first, in kind order, then the rest by kind.
+    // A French film: its own official trailer leads, then English by kind, then the rest. The
+    // Finnish cut is behind both English videos despite being the other "official" one.
     assert_eq!(
-        pick_trailer_candidates(&results, "de"),
-        vec!["germanTrail", "germanTease", "englishOff1", "untagged001"]
+        pick_trailer_candidates(&results, "fr"),
+        vec!["frenchOff01", "engTrailer1", "engTeaser01", "finnishDub1", "untagged001"]
     );
-    // English asked for: the official English trailer leads, and nothing German is dropped — it is
-    // still a playable fallback.
+    // An English film: English leads by kind, and the French and Finnish officials both fall behind
+    // an English video that is not marked official at all.
     assert_eq!(
         pick_trailer_candidates(&results, "en"),
-        vec!["englishOff1", "germanTrail", "untagged001", "germanTease"]
+        vec!["engTrailer1", "engTeaser01", "frenchOff01", "finnishDub1", "untagged001"]
     );
-    // A language with no native video at all still gets the full English fallback set.
+    // A film whose own language has no video here falls back to English — and behaves exactly like
+    // an English film, because nothing occupies the first band. Nothing is dropped: a dub is still a
+    // playable last resort if everything ahead of it fails.
     assert_eq!(
-        pick_trailer_candidates(&results, "fi"),
-        vec!["englishOff1", "germanTrail", "untagged001", "germanTease"]
+        pick_trailer_candidates(&results, "ja"),
+        pick_trailer_candidates(&results, "en"),
+        "falling back to English should order identically to an English film"
     );
 }
 
