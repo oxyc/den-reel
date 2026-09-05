@@ -43,10 +43,31 @@ fn key_of(secret: &str) -> [u8; 32] {
     key
 }
 
-/// The tag for `vid`, lowercase hex.
+/// A secret with its MAC key already derived, so a caller signing several ids pays for that once.
+///
+/// `build_meta` signs up to `MAX_PROBE` links per response, and deriving the key is a full BLAKE2b
+/// over the secret each time — the same work, repeated per link, for a value that only depends on
+/// the secret.
+pub struct Signer([u8; 32]);
+
+impl Signer {
+    pub fn new(secret: &str) -> Signer {
+        Signer(key_of(secret))
+    }
+
+    /// The tag for `vid`, lowercase hex.
+    pub fn tag(&self, vid: &str) -> String {
+        tag_with_key(&self.0, vid)
+    }
+}
+
+/// The tag for `vid`, lowercase hex. Derives the key per call; use [`Signer`] to sign more than one.
 pub fn tag(secret: &str, vid: &str) -> String {
-    let key = key_of(secret);
-    let mut mac = <Tag as Mac>::new_from_slice(&key).expect("32 bytes is a valid BLAKE2b key");
+    tag_with_key(&key_of(secret), vid)
+}
+
+fn tag_with_key(key: &[u8; 32], vid: &str) -> String {
+    let mut mac = <Tag as Mac>::new_from_slice(key).expect("32 bytes is a valid BLAKE2b key");
     mac.update(vid.as_bytes());
     let out = mac.finalize().into_bytes();
     let mut s = String::with_capacity(out.len() * 2);
@@ -123,6 +144,17 @@ mod tests {
         );
         assert!(!verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some("deadbeefdeadbeefdeadbeef")));
         assert!(!verify_any("new-secret", &[], "dSdWpY2Bxsc", Some(&old_tag)), "an empty rotation set accepts nothing extra");
+    }
+
+    /// Deriving the key once must produce the same tags as deriving it per call, or the hoist in
+    /// `build_meta` would silently invalidate every URL it signs.
+    #[test]
+    fn a_signer_agrees_with_the_one_shot_tag() {
+        let signer = Signer::new("s3cret");
+        for vid in ["dSdWpY2Bxsc", "dQw4w9WgXcQ", "_-Aa09Zz123"] {
+            assert_eq!(signer.tag(vid), tag("s3cret", vid), "{vid} signed differently");
+            assert!(verify("s3cret", vid, Some(&signer.tag(vid))));
+        }
     }
 
     /// A secret longer than BLAKE2b's 64-byte key limit must be usable, not a startup error.

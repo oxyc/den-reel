@@ -3272,6 +3272,55 @@ async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
     assert!(dir.join("evictedvid1.mp4").exists(), "the retry never actually re-downloaded");
 }
 
+/// `download_sem` bounds how many downloads RUN at once, but the permit is taken inside
+/// `download_cached` — so every distinct well-formed id got an `in_flight` entry and a spawned
+/// driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. On an instance without
+/// REEL_PLAY_SECRET that is request-driven growth, reachable by anyone who can hit /play.
+///
+/// Joining a download already in flight must still be free: that is what the de-duplication is for,
+/// and a viewer waiting on a trailer someone else triggered must never be turned away by the cap.
+#[tokio::test]
+async fn a_flood_of_distinct_ids_cannot_grow_the_in_flight_map_without_bound() {
+    let dir = temp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    // A yt-dlp that does not return, so downloads stay outstanding for the whole test. Only
+    // DOWNLOAD_CONCURRENCY of these ever exist — the permit is taken before the spawn, so the rest
+    // of the flood is tasks parked on the semaphore — and they are reaped when this test's runtime
+    // drops. Emphatically NOT cleaned up with `kill_live_groups`: that registry is process-wide, and
+    // the suite runs in parallel, so calling it here killed seven other tests' fake yt-dlps.
+    let yt = dir.join("yt-hangs");
+    std::fs::write(&yt, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    // Well past the cap, all distinct and all well-formed.
+    for i in 0..(crate::IN_FLIGHT_MAX + 20) {
+        let st = state.clone();
+        let id = format!("floodvid{i:03}");
+        tokio::spawn(async move { crate::play::fetch_trailer(st, id).await });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let outstanding = state.in_flight.lock().unwrap().len();
+    assert!(outstanding > 0, "nothing was queued, so this test proves nothing");
+    assert!(
+        outstanding <= crate::IN_FLIGHT_MAX,
+        "{outstanding} outstanding downloads against a cap of {}",
+        crate::IN_FLIGHT_MAX
+    );
+
+    // An id already in flight is still joined, not refused.
+    let joined = state.in_flight.lock().unwrap().keys().next().cloned().expect("something is queued");
+    let st = state.clone();
+    let waiter = tokio::spawn(async move { crate::play::fetch_trailer(st, joined).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiter.is_finished(), "a request joining a live download was refused by the cap");
+    waiter.abort();
+}
+
 /// A `/play` verdict was the one thing this service learned and then immediately forgot: the
 /// in-flight entry is cleared however a download ends, so the next request for a video YouTube has
 /// REMOVED spent another of three download permits, and another yt-dlp process, to rediscover it.

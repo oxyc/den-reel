@@ -85,11 +85,14 @@ fn is_sane_host(h: &str) -> bool {
 /// bare URL this has always emitted.
 pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String], secret: Option<&str>) -> Value {
     let base = base.trim_end_matches('/');
+    // Derived once, not once per link: the MAC key depends only on the secret, and this signs up to
+    // MAX_PROBE ids per response.
+    let signer = secret.map(crate::sign::Signer::new);
     let links: Vec<Value> = yt_ids
         .iter()
         .map(|id| {
-            let url = match secret {
-                Some(s) => format!("{base}/play/{id}.mp4?s={}", crate::sign::tag(s, id)),
+            let url = match &signer {
+                Some(s) => format!("{base}/play/{id}.mp4?s={}", s.tag(id)),
                 None => format!("{base}/play/{id}.mp4"),
             };
             json!({
