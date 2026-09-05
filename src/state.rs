@@ -313,6 +313,13 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
         }
         keep
     });
+    // `retain` removes entries but keeps the table, so what survives here is sized to the FILE's
+    // entry count and never shrinks again — `addon.rs`'s own trimming is also a `retain`, and the
+    // map lives for the process. Filtering in place lowered the peak by dropping a byte buffer and a
+    // second table; without this it would raise the floor by the same order, which is the worse of
+    // the two on a box measured in single-digit megabytes. Costs one realloc, at boot, of something
+    // strictly smaller than what was just freed.
+    parsed.shrink_to_fit();
     if kept > 0 {
         println!("resolve cache: {kept} entr{} still good", if kept == 1 { "y" } else { "ies" });
     }

@@ -1,18 +1,22 @@
 # den-reel — audited task list
 
-## Audit status (2026-09-04)
+## Audit status (2026-09-04) — CONVERGED
 
-Five review rounds ran, two independent auditors each. Round 6 was launched and **stopped before it
-reported**, so this changeset has had five rounds, not six. Counting only correctness defects and
-hot-path regressions — nits excluded — the rounds found 5, 2, 4, 3 and 3. The loop never hit its
-"two consecutive rounds under two findings" exit.
+Seven review rounds, two independent auditors each. Counting only correctness defects and hot-path
+or memory regressions — nits excluded — the rounds found **5, 2, 4, 3, 3, 1, 1**. Rounds 6 and 7 are
+the two consecutive rounds under two findings that the loop was waiting for. Round 7's single item
+was raised by both auditors, and the correctness one classed it as not-a-defect.
 
-The reason it did not converge is worth knowing: after round 1, almost every finding was a defect in
-the *previous round's fix*, not in the original work. The `touch_atime` optimisation was wrong twice
-in a row — the second time wrong in kind, not degree — and ended up reverted to the behaviour that
-was already in the repo. Treat anything below dated later than round 3 as less settled than the rest.
+The shape of the middle rounds is the useful part: after round 1, almost every finding was a defect
+in the *previous round's fix* rather than in the original work. The `touch_atime` optimisation was
+wrong twice in a row — the second time wrong in kind, not degree — and ended up reverted to the
+behaviour already in the repo. `load_resolve_cache` needed three passes. Two lessons worth carrying:
+a fix written to answer an audit deserves the same scrutiny as the code it replaces, and when an
+optimisation keeps producing defects, the behaviour it replaced was probably right.
 
-What is still open is in the three sections marked STILL OPEN and ACCEPTED RISK.
+Nothing was verified against a running binary. Everything here is `cargo test` plus clippy, with no
+real yt-dlp, ffmpeg, MP4Box or TMDB in the loop. What is still open is in the sections marked
+STILL OPEN and ACCEPTED RISK.
 
 
 Every item below survived an adversarial audit against the source. File:line anchors are from
