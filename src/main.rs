@@ -84,9 +84,14 @@ pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --sim
 // the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
 // driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. That is request-driven growth: on an
 // instance without REEL_PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
-// are merely well-formed. Generous against real use (3 downloading, 2 prewarming, the rest waiting
-// their turn) and small enough that the map cannot become the way the box runs out of memory.
-pub const IN_FLIGHT_MAX: usize = 64;
+// are merely well-formed.
+//
+// Sized by what the queue can plausibly SERVE, not just by memory. The wait is un-timed — only the
+// yt-dlp run itself has a timeout — so a queue this deep is also a promise: at three at a time and a
+// 240s worst case per download, 24 drains in about half an hour, where 64 would take an hour and a
+// half of clients waiting on requests that will mostly have been abandoned. Still many times what
+// legitimate use puts in flight (three downloading, two prewarming, a few waiting their turn).
+pub const IN_FLIGHT_MAX: usize = 24;
 const _: () = assert!(
     IN_FLIGHT_MAX > DOWNLOAD_CONCURRENCY + PREWARM_MAX,
     "the queue has to be able to hold everything that may legitimately be running at once"

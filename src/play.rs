@@ -481,6 +481,29 @@ fn drop_if_finished(state: &AppState, vid: &str) {
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
 pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
+    fetch_trailer_inner(state, vid, true).await
+}
+
+/// [`fetch_trailer`] for a caller that has just tried to open the file and found it absent.
+///
+/// Skips the disk check, because that caller already paid for it. `/play` tries `open_for_serve`
+/// first and only lands here when it failed, so asking `metadata` for the same answer was a second
+/// dispatch to the blocking pool on every cold play — and on every failure-cache hit, which is the
+/// path that is supposed to cost a hash lookup and nothing else.
+///
+/// The window this gives up: if the file appears between that open and this call, the disk check
+/// would have caught it and now the `in_flight` join has to. It nearly always does, since the entry
+/// outlives the download it describes; when it does not, the cost is one redundant download that
+/// publishes by atomic rename over an identical file.
+pub(crate) async fn fetch_trailer_cold(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
+    fetch_trailer_inner(state, vid, false).await
+}
+
+async fn fetch_trailer_inner(
+    state: Arc<AppState>,
+    vid: String,
+    check_disk: bool,
+) -> Result<PathBuf, PlayError> {
     // Checked here as well as at the routes, because `vid` also arrives from TMDB/KinoCheck via
     // prewarm, and it becomes a filename and a yt-dlp -o path. One `..` writes outside the cache.
     if !crate::is_valid_vid(&vid) {
@@ -495,29 +518,31 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         });
     }
     let fp = cache_path(&state.cfg, &vid);
-    if let Ok(md) = tokio::fs::metadata(&fp).await {
-        // is_file, not just non-empty: a directory reports a non-zero length, so anything that left
-        // one at a trailer's path was served as a cache hit that serve_file could then never open.
-        if md.is_file() && md.len() > 0 {
-            // Unconditionally, and that is load-bearing rather than lazy.
-            //
-            // This touch is the ONLY thing that makes atime mean "recently served" — under relatime
-            // a read does not refresh it — and `evict_if_needed`'s size-cap pass sorts on exactly
-            // that field, oldest first, after every completed download. Stamping `now` on every
-            // request is what makes the file currently streaming the freshest thing on the volume,
-            // and therefore structurally the last candidate for eviction.
-            //
-            // Two attempts to skip it when the stamp was "recent enough" both broke that. The gate
-            // reads "touch only if atime is ALREADY stale", so a trailer downloaded at T and played
-            // at T+5s is never touched at all: it keeps its download-time stamp while prewarms
-            // landing behind it get fresher ones, and the next eviction takes the one being watched.
-            // Any non-zero threshold admits that; the threshold only sets how much traffic it takes.
-            //
-            // It costs a blocking-pool dispatch per request. Removing that cost belongs with the
-            // deferred serve-path work in TASKS.md — one spawn_blocking doing open + fstat +
-            // set_times — not with a rule about when the timestamp may be skipped.
-            touch_atime(fp.clone());
-            return Ok(fp);
+    if check_disk {
+        if let Ok(md) = tokio::fs::metadata(&fp).await {
+            // is_file, not just non-empty: a directory reports a non-zero length, so anything that
+            // left one at a trailer's path was served as a cache hit that could never produce bytes.
+            if md.is_file() && md.len() > 0 {
+                // Unconditionally, and that is load-bearing rather than lazy.
+                //
+                // This touch is the ONLY thing that makes atime mean "recently served" — under
+                // relatime a read does not refresh it — and `evict_if_needed`'s size-cap pass sorts
+                // on exactly that field, oldest first, after every completed download. Stamping
+                // `now` on every request is what makes the file currently streaming the freshest
+                // thing on the volume, and therefore structurally the last candidate for eviction.
+                //
+                // Two attempts to skip it when the stamp was "recent enough" both broke that. The
+                // gate reads "touch only if atime is ALREADY stale", so a trailer downloaded at T
+                // and played at T+5s is never touched at all: it keeps its download-time stamp
+                // while prewarms landing behind it get fresher ones, and the next eviction takes
+                // the one being watched. Any non-zero threshold admits that.
+                //
+                // `/play` reaches its serves through `open_for_serve` instead, which stamps atime
+                // on the handle it already holds; this path is what `/crop` and prewarm come
+                // through, and they read the file too.
+                touch_atime(fp.clone());
+                return Ok(fp);
+            }
         }
     }
 
@@ -542,7 +567,14 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
             // Only a NEW id is refused. Joining a download already in flight costs nothing and is
             // exactly what the de-duplication is for, so a viewer waiting on a trailer someone else
             // triggered is never turned away by this.
-            eprintln!("[{vid}] refused: {} downloads already outstanding", map.len());
+            let outstanding = map.len();
+            // Guard released BEFORE logging. Once the map is full every new id takes this branch, so
+            // the line is request-driven and unbounded — and stderr is a pipe someone else drains.
+            // A write that blocks would block it holding this mutex, stalling every /play, /crop and
+            // prewarm on a single-threaded runtime; a write that fails would panic with the guard
+            // held. Neither is worth risking to save a `drop`.
+            drop(map);
+            eprintln!("[{vid}] refused: {outstanding} downloads already outstanding");
             return Err(PlayError::overloaded());
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
@@ -839,7 +871,10 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
     // Not servable: cold, or evicted out from under us. Two attempts, because the file can be
     // evicted again between the download completing and us opening it.
     for attempt in 0..2 {
-        if let Err(e) = fetch_trailer(state.clone(), vid.clone()).await {
+        // `_cold`: the open above already asked the disk and it said no. Going through the checking
+        // variant asked the same question a second time, on every cold play and — worse — on every
+        // request the failure cache answers, which is meant to cost a hash lookup and nothing else.
+        if let Err(e) = fetch_trailer_cold(state.clone(), vid.clone()).await {
             // Not logged here: a failure is logged once by the download that produced it, and this
             // arm is also reached by every request the failure cache answers from memory.
             return play_error(&state, &vid, &e);

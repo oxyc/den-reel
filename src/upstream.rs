@@ -10,9 +10,18 @@ use serde_json::Value;
 
 use crate::config::Config;
 
-/// Max upstream JSON body we'll buffer. TMDB /videos + KinoCheck responses are a few KB; 4 MB is a
-/// generous ceiling that still stops a runaway/hostile body from ballooning memory.
-const MAX_UPSTREAM_BODY: usize = 4 * 1024 * 1024;
+/// Max upstream JSON body we'll buffer.
+///
+/// 256 KB, down from 4 MB. Asking for `include_video_language={lang},en,null` made these responses
+/// 10–30× larger — a title can now come back with 57 videos instead of two — so "these payloads are
+/// a few KB" stopped being the whole story, and the cap is the only thing standing between a runaway
+/// or hostile body and memory. It is not one buffer either: nothing gates concurrent resolves, so the
+/// real ceiling is this times however many `/meta` misses are in flight, and each buffer becomes a
+/// `serde_json::Value` tree several times its own size.
+///
+/// 256 KB still admits roughly a thousand videos for one title, which is orders of magnitude past
+/// anything TMDB actually returns.
+const MAX_UPSTREAM_BODY: usize = 256 * 1024;
 
 /// A source could not be asked: transport error, a wrong key's 401, a 429, a 5xx, or a 200 whose
 /// body never arrived. Distinct from a source that answered with nothing, which is a real result.
