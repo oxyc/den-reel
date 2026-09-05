@@ -174,7 +174,10 @@ a `PathBuf`, so `/crop` and the eviction retry are untouched. Two things improve
 the `is_file` check now comes from the fstat that was happening anyway, and the atime stamp completes
 before the response is built rather than racing eviction as a fire-and-forget task.
 
-Cold path is unchanged in cost (one failed open, then the download, then one open).
+The cold path goes through `fetch_trailer_cold`, which skips the disk check because `try_open` just
+made it. Without that, a cold play — and, worse, every request the failure cache answers — asked the
+same ENOENT question twice. Cold is now one failed open plus the download plus one open, which is a
+dispatch fewer than before this work; a failure-cache hit is one dispatch, the same as before.
 
 **Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold path, and the
 code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms` then
