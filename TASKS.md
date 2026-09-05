@@ -170,8 +170,9 @@ Collapsing them means `fetch_trailer` handing back an open `File` instead of a `
 changes its contract for `/crop` (which wants the path, not the handle) and for the eviction retry in
 `handle_play`. That is worth doing, with its own test pass — not as a late edit in an audit loop.
 
-After the `touch_atime` gate landed, this is the largest remaining cost on the hot path, and it is
-now bigger than everything the `cache_available` memo saved.
+This is the largest remaining cost on the cached-serve path. To be precise about the comparison: the
+`cache_available` memo removed 2 of about 5 blocking-pool handoffs from that path and is the single
+largest win in the changeset; these 3 are what is left, not evidence the memo was small.
 
 **Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold path, and the
 code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms` then
