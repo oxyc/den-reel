@@ -158,23 +158,23 @@ the allocation that write was changed to avoid, so it is a genuine trade and not
 503 `busy`, while joining a download already in flight is always free. Not recorded in `play_fails`,
 since it says nothing about the video.
 
-## STILL OPEN — the cached-serve path takes 3–4 blocking-pool dispatches where 1 would do
+## DONE — the cached-serve path is one blocking-pool dispatch
 
-Raised by the round-3 performance audit and deliberately **not** taken, because it is a refactor of
-the most delicate code in the service rather than a fix.
+Was: `tokio::fs::metadata` in `fetch_trailer`, an `open` + `set_times` for the atime touch,
+`File::open` in `serve_file`, `file.metadata()` after it, and a `seek` on a Range request — four or
+five full task handoffs on a current-thread runtime, every one of them asking about the same file,
+and one playback is many range requests.
 
-Serving an already-cached `/play` currently pays: `tokio::fs::metadata` in `fetch_trailer`
-(`play.rs`, the cache-hit check), `File::open` in `serve_file`, and `file.metadata()` right after it
-— three `spawn_blocking` round-trips, each a full task handoff on a current-thread runtime, plus a
-fourth for `seek` on a Range request. The stat largely duplicates what the open and fstat establish.
+Now `open_for_serve` does open + fstat + `is_file` reject + atime + range-resolve + seek in a single
+`spawn_blocking`, and `handle_play` calls it BEFORE `fetch_trailer` — serve first, ask questions
+only when there is nothing to serve. `serve_opened` is then pure response building.
 
-Collapsing them means `fetch_trailer` handing back an open `File` instead of a `PathBuf`, which
-changes its contract for `/crop` (which wants the path, not the handle) and for the eviction retry in
-`handle_play`. That is worth doing, with its own test pass — not as a late edit in an audit loop.
+It did not need the contract change this section previously predicted: `fetch_trailer` still returns
+a `PathBuf`, so `/crop` and the eviction retry are untouched. Two things improved as a side effect —
+the `is_file` check now comes from the fstat that was happening anyway, and the atime stamp completes
+before the response is built rather than racing eviction as a fire-and-forget task.
 
-This is the largest remaining cost on the cached-serve path. To be precise about the comparison: the
-`cache_available` memo removed 2 of about 5 blocking-pool handoffs from that path and is the single
-largest win in the changeset; these 3 are what is left, not evidence the memo was small.
+Cold path is unchanged in cost (one failed open, then the download, then one open).
 
 **Nits noted and consciously not taken** (each costs tens of nanoseconds on a cold path, and the
 code is clearer as it stands): `cached_failure` discards the expiry that `remaining_fail_ms` then
