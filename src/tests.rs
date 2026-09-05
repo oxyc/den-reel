@@ -314,8 +314,40 @@ fn pick_candidates_orders_and_dedupes() {
         json!({ "site": "YouTube", "type": "Trailer", "official": true, "key": "official111" }),
     ];
     assert_eq!(
-        pick_trailer_candidates(&results),
+        pick_trailer_candidates(&results, "en"),
         vec!["official111", "plain222222", "teaser00000"]
+    );
+}
+
+/// `include_video_language` asks TMDB for `<lang>,en,null`, because `language=<lang>` alone returns
+/// almost nothing — zero videos for most titles. That widening means an English trailer now arrives
+/// beside a native one, so the ordering has to prefer the language that was asked for. A viewer who
+/// asked for German gets the German trailer when there is one and the English one when there is not;
+/// ranking on kind alone would hand them whichever TMDB happened to mark official.
+#[test]
+fn pick_candidates_prefers_the_requested_language() {
+    let results = vec![
+        json!({ "site": "YouTube", "type": "Trailer", "official": true, "iso_639_1": "en", "key": "englishOff1" }),
+        json!({ "site": "YouTube", "type": "Teaser", "iso_639_1": "de", "key": "germanTease" }),
+        json!({ "site": "YouTube", "type": "Trailer", "iso_639_1": "de", "key": "germanTrail" }),
+        json!({ "site": "YouTube", "type": "Trailer", "key": "untagged001" }),
+    ];
+
+    // German asked for: both German videos first, in kind order, then the rest by kind.
+    assert_eq!(
+        pick_trailer_candidates(&results, "de"),
+        vec!["germanTrail", "germanTease", "englishOff1", "untagged001"]
+    );
+    // English asked for: the official English trailer leads, and nothing German is dropped — it is
+    // still a playable fallback.
+    assert_eq!(
+        pick_trailer_candidates(&results, "en"),
+        vec!["englishOff1", "germanTrail", "untagged001", "germanTease"]
+    );
+    // A language with no native video at all still gets the full English fallback set.
+    assert_eq!(
+        pick_trailer_candidates(&results, "fi"),
+        vec!["englishOff1", "germanTrail", "untagged001", "germanTease"]
     );
 }
 
@@ -1388,7 +1420,7 @@ fn a_traversing_id_from_upstream_is_not_a_candidate() {
         json!({"site": "YouTube", "type": "Trailer", "official": true, "key": "dQw4w9WgXcQ"}),
     ];
     assert_eq!(
-        crate::upstream::pick_trailer_candidates(&results),
+        crate::upstream::pick_trailer_candidates(&results, "en"),
         vec!["dQw4w9WgXcQ".to_string()],
         "an id that is not a YouTube id must not reach a filename"
     );

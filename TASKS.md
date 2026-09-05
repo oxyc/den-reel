@@ -201,7 +201,22 @@ service whose `/play` and `/crop` can be gated. The reasons for leaving it open:
 Blocking one path at the reverse proxy is the right layer, and the README says so. Revisit only if
 `/stats` grows a field that is not already inferable from `/health` plus `/manifest.json`.
 
-## T7 — SKIPPED (2026-09-04): no TMDB key in the environment, so the premise could not be settled — `include_video_language` was not added, and `valid_lang` was correctly left alone.
+## T7 — DONE (2026-09-04). Premise CONFIRMED against the live API, using the key from den's `.env`:
+
+| title | `language=en` | `language=de` | `de` + `include_video_language` | `language=fi` | `fi` + widened |
+|---|---|---|---|---|---|
+| Shawshank (278) | 21 | 1 | 22 | **0** | 21 |
+| Oppenheimer (872585) | 51 | 6 | 57 | 1 | 52 |
+| Inception (27205) | 27 | 2 | 29 | **0** | 27 |
+
+`?lang=fi` returned zero candidates for two of three titles, so the resolver spent a yt-dlp search
+and then negative-cached "no trailer" for an hour. Fixed by asking for `<lang>,en,null`, plus a
+language-first ordering — the widening means an English trailer now arrives beside a native one, and
+a viewer who asked for German should get the German trailer when one exists.
+
+`valid_lang` deliberately still rejects `pt-BR` and falls back to `en`. Loosening it is now safe (the
+widening removes the thin-result trap the earlier audit warned about) but buys little, since the `en`
+fallback already works — left alone rather than widened on speculation.
 
 ## T7 — TMDB language filtering — VERIFY FIRST, SKIP IF YOU CANNOT
 
