@@ -213,13 +213,25 @@ Blocking one path at the reverse proxy is the right layer, and the README says s
 | Inception (27205) | 27 | 2 | 29 | **0** | 27 |
 
 `?lang=fi` returned zero candidates for two of three titles, so the resolver spent a yt-dlp search
-and then negative-cached "no trailer" for an hour. Fixed by asking for `<lang>,en,null`, plus a
-language-first ordering — the widening means an English trailer now arrives beside a native one, and
-a viewer who asked for German should get the German trailer when one exists.
+and then negative-cached "no trailer" for an hour.
 
-`valid_lang` deliberately still rejects `pt-BR` and falls back to `en`. Loosening it is now safe (the
-widening removes the thin-result trap the earlier audit warned about) but buys little, since the `en`
-fallback already works — left alone rather than widened on speculation.
+**Revised the same day**, because the first fix asked the wrong question. It used the VIEWER's
+language, which ranked a Finnish-dubbed trailer above the English original. What is wanted is the
+film as it was made — subtitles are the client's business — so the request now carries the film's own
+`original_language` (already in the `/find` hit) and never the viewer's:
+
+| | `language=fi` + `fi,en,null` (first fix) | `language=en` + `<original>,en,null` (now) |
+|---|---|---|
+| Amélie (`fr`) | 14, all `en` — **no French trailer at all** | 16: `fr`=2, `en`=14 |
+| Spirited Away (`ja`) | 6, all `en` | 7: `ja`=1, `en`=6 |
+| Oppenheimer (`en`) | 52: `en`=51, **`fi`=1** | 51, all `en` — the dub is gone |
+
+One change both adds the original-language trailer for foreign films and removes the local dub.
+Measured: `include_video_language` accepts a language `language=` is not set to, so the film's
+language can be requested regardless of the viewer's.
+
+`valid_lang` deliberately still rejects `pt-BR`. It no longer matters for TMDB video selection at all
+— only KinoCheck (`de`/`en`) and the cache key still use the viewer's language.
 
 ## T7 — TMDB language filtering — VERIFY FIRST, SKIP IF YOU CANNOT
 

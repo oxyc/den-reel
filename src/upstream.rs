@@ -49,6 +49,19 @@ pub trait Upstream: Send + Sync {
     }
 }
 
+/// Which language band a TMDB /videos entry falls in: the film's own language, English, or other.
+///
+/// An untagged video (`iso_639_1` absent or empty) lands in `other` rather than being guessed at. We
+/// ask for `null` in `include_video_language` so those are not lost, but an untagged video is not
+/// evidence of anything, so it sorts behind the two we can actually identify.
+fn lang_band(v: &Value, original: &str) -> u8 {
+    match v["iso_639_1"].as_str() {
+        Some(l) if l.eq_ignore_ascii_case(original) => 0,
+        Some(l) if l.eq_ignore_ascii_case("en") => 1,
+        _ => 2,
+    }
+}
+
 /// Rank a TMDB /videos entry: official trailer first, then trailer, teaser, anything else.
 fn rank(v: &Value) -> u8 {
     let ty = v["type"].as_str().unwrap_or("");
@@ -63,13 +76,15 @@ fn rank(v: &Value) -> u8 {
 
 /// Rank + dedupe a TMDB /videos result into an ordered list of YouTube ids. Pure — unit-tested.
 ///
-/// Ordered by the requested language FIRST, then by kind (official trailer, trailer, teaser, other).
-/// The language key exists because `include_video_language` asks TMDB for `<lang>,en,null` — without
-/// it a non-English request gets almost nothing back — and that widening means an English trailer now
-/// arrives alongside a native one. A viewer who asked for German should get the German trailer when
-/// there is one, and the English trailer when there is not; ranking on kind alone would hand them
-/// whichever TMDB happened to mark official.
-pub fn pick_trailer_candidates(results: &[Value], lang: &str) -> Vec<String> {
+/// Ordered by language band first, then by kind (official trailer, trailer, teaser, other). The
+/// bands are: the FILM'S OWN language, then English, then anything else.
+///
+/// `original` is the film's `original_language`, not the viewer's. That is the whole point: a trailer
+/// tagged with the viewer's language is a dub or a local-market cut, and the thing worth watching is
+/// the film as it was made — with subtitles if the client wants them, which is the client's business.
+/// English second because it is both the most common original language and the most likely to exist
+/// at all; when the film IS English the two bands coincide and this is simply kind order.
+pub fn pick_trailer_candidates(results: &[Value], original: &str) -> Vec<String> {
     let mut yt: Vec<&Value> = results
         .iter()
         // An id from upstream is untrusted: it ends up as a cache filename and a yt-dlp -o path,
@@ -78,10 +93,7 @@ pub fn pick_trailer_candidates(results: &[Value], lang: &str) -> Vec<String> {
         .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(crate::is_valid_vid))
         .collect();
     // stable → preserves TMDB order within a rank, like JS's sort
-    yt.sort_by_key(|v| {
-        let native = v["iso_639_1"].as_str().is_some_and(|l| l.eq_ignore_ascii_case(lang));
-        (u8::from(!native), rank(v))
-    });
+    yt.sort_by_key(|v| (lang_band(v, original), rank(v)));
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for v in yt {
@@ -245,7 +257,9 @@ fn redact(url: &str) -> &str {
 #[async_trait]
 impl Upstream for HttpUpstream {
     /// imdb → TMDB id (via /find) → /videos → ordered YouTube trailer candidates ([] on miss).
-    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, lang: &str) -> Answered<Vec<String>> {
+    // `_lang` is the VIEWER's language, and TMDB video selection deliberately does not use it — see
+    // the `include_video_language` reasoning below. KinoCheck still does.
+    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, _lang: &str) -> Answered<Vec<String>> {
         if tmdb_key.is_empty() {
             return Ok(Vec::new()); // not consulted, which is not a failure
         }
@@ -266,16 +280,30 @@ impl Upstream for HttpUpstream {
         let Some(hit_id) = results.get(0).and_then(|h| h["id"].as_i64()) else {
             return Ok(Vec::new());
         };
-        // `include_video_language` is what makes a non-English request work at all. `language={lang}`
-        // alone filters /videos to videos TAGGED with that language, and almost every trailer on TMDB
-        // is tagged `en` — measured against the live API, `language=fi` returns ZERO videos for two
-        // of three sampled titles where `language=en` returns 21 and 27. The resolver then found no
-        // candidates, spent a yt-dlp search on the title, and negative-cached "this film has no
-        // trailer" for an hour. Asking for `<lang>,en,null` restores the English trailers (and the
-        // untagged ones) as fallbacks behind any native match; `pick_trailer_candidates` does the
-        // preferring.
+        // The film's own language, which is what decides which trailer we want — NOT the viewer's.
+        // Already in the /find hit, so it costs nothing to read.
+        let original = results
+            .get(0)
+            .and_then(|h| h["original_language"].as_str())
+            .filter(|l| l.len() == 2 && l.bytes().all(|b| b.is_ascii_lowercase()))
+            .unwrap_or("en");
+        // `include_video_language` is what makes this work at all, and it is doing two jobs.
+        //
+        // Without it, `/videos` returns only videos TAGGED with `language=` — and with no `language=`
+        // at all TMDB defaults to en-US, which is the same thing. Measured against the live API:
+        // Amélie returns 14 videos, all English, and NOT its two French trailers. So the original
+        // trailer for a foreign-language film was simply unreachable.
+        //
+        // And it takes a list that `language=` need not contain, so the film's language can be asked
+        // for regardless of the viewer's: `language=en&include_video_language=fr,en,null` returns the
+        // French ones. Amélie 14 → 16 (fr=2), Spirited Away 6 → 7 (ja=1).
+        //
+        // The viewer's language is deliberately NOT in this list. A video tagged with it is a dub or
+        // a local-market cut, not the film as made — asking for `fi` got Oppenheimer a Finnish
+        // trailer ranked above the English original. Leaving it out drops that (52 → 51) as well as
+        // adding what we wanted. Subtitles are the client's business, not ours.
         let videos_url = format!(
-            "{}/{tmdb_type}/{hit_id}/videos?api_key={key}&language={lang}&include_video_language={lang},en,null",
+            "{}/{tmdb_type}/{hit_id}/videos?api_key={key}&language=en&include_video_language={original},en,null",
             self.cfg.tmdb_base
         );
         let Some(data) = self.get_json(&videos_url, &[]).await? else {
@@ -283,7 +311,7 @@ impl Upstream for HttpUpstream {
         };
         let empty = Vec::new();
         let results = data["results"].as_array().unwrap_or(&empty);
-        Ok(pick_trailer_candidates(results, lang))
+        Ok(pick_trailer_candidates(results, original))
     }
 
     /// imdb → "Title Year" via TMDB /find, for the YouTube-search fallback query. None on miss.
