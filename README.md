@@ -71,8 +71,8 @@ YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the 
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
 yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
 degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
-+ `cargo test` on every push and PR; it publishes `ghcr.io/oxyc/den-reel` only on a `v*` tag or a
-manual run.
++ `cargo test` on every push and PR; it publishes `ghcr.io/oxyc/den-reel` on a `v*` tag, and rebuilds
+the newest tag weekly for security fixes (see Deploy).
 
 ## Routes
 
@@ -230,6 +230,24 @@ The homelab runs it as a Podman Quadlet unit, `den-reel.container`, from the `de
 uid 65532 (the image's non-root user), and the cache bind-mounted from `/var/lib/den/reel-cache`
 (owned by 65532). New images reach it through the health-gated `den-update` script. The env files,
 digest pinning and rollback are described once, in that repo's `deploy/README.md`.
+
+**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run
+rebuilds the newest `v*` tag (never `main`) with the base images re-pulled, no build cache and a fresh
+`apt-get upgrade`, and publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian
+security fix — ffmpeg parses every trailer downloaded here — reaches the box between releases, through
+`den-update`'s probe and rollback like any release. It rebuilds the tag's pinned yt-dlp and deno; a newer
+yt-dlp still ships only with a release. Trivy scans each image before `:latest` moves: a CRITICAL with a
+fix available fails the run (on the weekly rebuild only in OS packages, the part a rebuild can fix), and
+fixable HIGH and CRITICAL findings go to code scanning. A finding that does not apply goes in
+`.trivyignore` with a reason. Every image carries SLSA provenance and an SBOM and is signed keylessly with
+cosign; verify a digest with:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/oxyc/den-reel/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/oxyc/den-reel@sha256:<digest>
+```
 
 Nothing sits in front of it, so play URLs are built from the host the client asked for
 (`http://<den-ip>:8092/play/…`). Add the URL `/configure` gives you —

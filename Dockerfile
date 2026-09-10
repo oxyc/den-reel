@@ -75,8 +75,11 @@ RUN set -eux; \
 FROM debian:trixie-slim
 
 # ffmpeg (mux/faststart + cropdetect) + ca-certificates (TLS roots). curl/unzip were build-only, so
-# they're gone; MP4Box comes from the build stage below, not apt.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+# they're gone; MP4Box comes from the build stage below, not apt. `upgrade` first: the slim base is
+# refreshed only every few weeks, and ffmpeg parses untrusted media, so every build (the weekly patch
+# rebuild included) takes the current Debian security fixes rather than the base's.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tools /usr/local/bin/deno /usr/local/bin/deno
