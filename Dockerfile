@@ -3,7 +3,7 @@
 # Three stages: build the Rust binary, fetch the extractor tools (deno + yt-dlp) with curl/unzip in
 # a throwaway stage, then assemble a runtime image that carries neither the Rust toolchain nor
 # curl/unzip — just ffmpeg, ca-certs, the two extractor binaries, and our ~2 MB binary. No Node, no
-# npm, no python3 (yt-dlp's standalone build bundles its own interpreter). Builds amd64 and arm64.
+# npm, no python3 (yt-dlp's standalone build bundles its own interpreter). Builds amd64, the box's arch.
 
 # ---- build ----------------------------------------------------------------
 FROM rust:1-bookworm AS build
@@ -38,11 +38,9 @@ ARG DENO_VERSION=2.9.6
 # Checksummed like yt-dlp below: this binary executes YouTube's JS in our container, so it is the
 # last thing that should arrive unverified.
 ARG DENO_SHA256_AMD64=394f07f4da2bebe6ce6f1e7ce0fa16429b29b08c35e3fac3fe25972676dff4b2
-ARG DENO_SHA256_ARM64=9a46afc6c392c7cd2ff71a31558935545b46408d0e87f7a86908c712721c046e
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) arch=x86_64-unknown-linux-gnu; sha=$DENO_SHA256_AMD64 ;; \
-      arm64) arch=aarch64-unknown-linux-gnu; sha=$DENO_SHA256_ARM64 ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-${arch}.zip" \
@@ -58,11 +56,9 @@ ARG YTDLP_VERSION=2026.08.19
 # supply-chain guard — there's no advisory DB for a standalone binary, so integrity is the whole game.
 # Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml (which refreshes both).
 ARG YTDLP_SHA256_AMD64=58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a
-ARG YTDLP_SHA256_ARM64=b16e4dab368a816cd05d477d698a605a6ae87ccee1c8ffd38fa21d7254141fcc
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) asset=yt-dlp_linux; sha=$YTDLP_SHA256_AMD64 ;; \
-      arm64) asset=yt-dlp_linux_aarch64; sha=$YTDLP_SHA256_ARM64 ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${asset}" \

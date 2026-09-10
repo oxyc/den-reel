@@ -1,9 +1,9 @@
 name: ytdlp-update
 
 # Daily check for a newer yt-dlp release. If one exists and is >=2 days old (supply-chain COOLDOWN — a
-# poisoned release that gets yanked within 48h is never pulled), bump YTDLP_VERSION + the pinned SHA256s
-# in the Dockerfile and open an auto-merging PR. The PR's CI (docker-publish.yml on pull_request: clippy,
-# cargo test, and a real image build that runs the SHA-verified yt-dlp download) is the merge gate.
+# poisoned release that gets yanked within 48h is never pulled), bump YTDLP_VERSION + the pinned SHA256
+# in the Dockerfile and open an auto-merging PR. The PR's CI (ci.yml: fmt, clippy, cargo test, and a
+# real image build that runs the SHA-verified yt-dlp download) is the merge gate.
 #
 # CI proves the image builds and the binary's checksum matches — it does NOT prove YouTube extraction
 # still works (that canary can't run on datacenter IPs). Extraction breakage is caught operationally:
@@ -53,16 +53,14 @@ jobs:
           fi
           curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${tag}/SHA2-256SUMS" -o sums.txt
           amd64=$(awk '$2=="yt-dlp_linux"{print $1}' sums.txt)
-          arm64=$(awk '$2=="yt-dlp_linux_aarch64"{print $1}' sums.txt)
           rm -f sums.txt
-          if [ -z "$amd64" ] || [ -z "$arm64" ]; then
-            echo "::error::could not read both SHA256 sums for $tag"; exit 1
+          if [ -z "$amd64" ]; then
+            echo "::error::could not read the SHA256 sum for $tag"; exit 1
           fi
           {
             echo "proceed=true"
             echo "tag=$tag"
             echo "amd64=$amd64"
-            echo "arm64=$arm64"
           } >> "$GITHUB_OUTPUT"
 
       - name: Patch Dockerfile
@@ -70,12 +68,10 @@ jobs:
         env:
           TAG: ${{ steps.rel.outputs.tag }}
           AMD64: ${{ steps.rel.outputs.amd64 }}
-          ARM64: ${{ steps.rel.outputs.arm64 }}
         run: |
           set -euo pipefail
           sed -i -E "s|^ARG YTDLP_VERSION=.*|ARG YTDLP_VERSION=${TAG}|" Dockerfile
           sed -i -E "s|^ARG YTDLP_SHA256_AMD64=.*|ARG YTDLP_SHA256_AMD64=${AMD64}|" Dockerfile
-          sed -i -E "s|^ARG YTDLP_SHA256_ARM64=.*|ARG YTDLP_SHA256_ARM64=${ARM64}|" Dockerfile
           git diff -- Dockerfile
 
       - name: Open auto-merging PR
@@ -91,7 +87,7 @@ jobs:
           body: |
             Automated bump of the pinned yt-dlp to `${{ steps.rel.outputs.tag }}` — release is ≥2 days old (supply-chain cooldown).
 
-            SHA256 pins refreshed from the release's `SHA2-256SUMS`. The PR image build verifies the amd64 checksum. The ARM64 pin is **not** checked by this PR — the publish job is the only thing that builds arm64, and it runs on a `v*` tag, so a bad ARM64 checksum surfaces at release time, not here.
+            SHA256 pin refreshed from the release's `SHA2-256SUMS`, and verified by the PR image build.
 
             Auto-merges once CI is green. CI proves the image builds and the checksum matches — it does **not** prove YouTube extraction still works (that canary can't run on datacenter IPs). If a bump breaks extraction, `/health` reports `degraded` on the homelab and this can be reverted.
 

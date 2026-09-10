@@ -5,8 +5,8 @@ name: deno-update
 # makes it the pin most likely to rot silently, so it gets the same treatment as yt-dlp itself.
 #
 # Same supply-chain cooldown as ytdlp-update.yml (a poisoned release yanked within 48h is never
-# pulled) and the same checksum refresh for both arches. Deno publishes no checksum manifest, so the
-# sums are computed from the downloaded archives.
+# pulled) and the same checksum refresh. Deno publishes no checksum manifest, so the sum is computed
+# from the downloaded archive.
 #
 # Unlike yt-dlp this does NOT auto-merge. A yt-dlp bump is routine and usually the fix for something
 # already broken; deno is a whole JS runtime, and CI cannot prove extraction still works — that
@@ -50,19 +50,16 @@ jobs:
             echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           base="https://github.com/denoland/deno/releases/download/${tag}"
-          curl -fsSL "${base}/deno-x86_64-unknown-linux-gnu.zip"  -o amd64.zip
-          curl -fsSL "${base}/deno-aarch64-unknown-linux-gnu.zip" -o arm64.zip
+          curl -fsSL "${base}/deno-x86_64-unknown-linux-gnu.zip" -o amd64.zip
           amd64=$(sha256sum amd64.zip | cut -d' ' -f1)
-          arm64=$(sha256sum arm64.zip | cut -d' ' -f1)
-          rm -f amd64.zip arm64.zip
-          if [ -z "$amd64" ] || [ -z "$arm64" ]; then
-            echo "::error::could not compute both SHA256 sums for $tag"; exit 1
+          rm -f amd64.zip
+          if [ -z "$amd64" ]; then
+            echo "::error::could not compute the SHA256 sum for $tag"; exit 1
           fi
           {
             echo "proceed=true"
             echo "version=$version"
             echo "amd64=$amd64"
-            echo "arm64=$arm64"
           } >> "$GITHUB_OUTPUT"
 
       - name: Patch Dockerfile
@@ -70,12 +67,10 @@ jobs:
         env:
           VERSION: ${{ steps.rel.outputs.version }}
           AMD64: ${{ steps.rel.outputs.amd64 }}
-          ARM64: ${{ steps.rel.outputs.arm64 }}
         run: |
           set -euo pipefail
           sed -i -E "s|^ARG DENO_VERSION=.*|ARG DENO_VERSION=${VERSION}|" Dockerfile
           sed -i -E "s|^ARG DENO_SHA256_AMD64=.*|ARG DENO_SHA256_AMD64=${AMD64}|" Dockerfile
-          sed -i -E "s|^ARG DENO_SHA256_ARM64=.*|ARG DENO_SHA256_ARM64=${ARM64}|" Dockerfile
           git diff -- Dockerfile
 
       - name: Open PR
@@ -91,6 +86,6 @@ jobs:
           body: |
             Automated bump of the pinned deno to `${{ steps.rel.outputs.version }}` — release is ≥2 days old (supply-chain cooldown).
 
-            deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. SHA256 pins are computed from the downloaded archives (deno publishes no checksum manifest). The PR image build verifies the amd64 checksum. The ARM64 pin is **not** checked by this PR — the publish job is the only thing that builds arm64, and it runs on a `v*` tag, so a bad ARM64 checksum surfaces at release time, not here.
+            deno is yt-dlp's JS runtime for YouTube's signature/nsig challenge. The SHA256 pin is computed from the downloaded archive (deno publishes no checksum manifest), and the PR image build verifies it.
 
             **Not auto-merged, on purpose.** CI proves the image builds and the checksum matches; it does **not** prove YouTube extraction still works, and this is the runtime that does the extracting. Merge when you're ready to watch `/health` after the deploy.

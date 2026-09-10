@@ -40,18 +40,11 @@ costs steady-state memory, an extra thread, or an extra subprocess has to pay fo
 
 ---
 
-## T1 — Build arm64. One line.
+## T1 — Build arm64. Dropped.
 
-`.github/workflows/docker-publish.yml:94-102` (the publish job) sets no `platforms:`, so buildx uses
-the runner's native platform. `build-pr` at line 46 is explicitly `linux/amd64`. **No arm64 image has
-ever been published**, despite `Dockerfile:6` claiming it builds both and the Dockerfile being fully
-arm64-ready (`ARG TARGETARCH`, `aarch64` branches, pinned SHAs at `Dockerfile:30,41-46,61-66`).
-
-Add `platforms: linux/amd64,linux/arm64` to the publish job. Then fix the three comments that
-currently assert arm64 is already covered — they are wrong and will mislead the next reader:
-`docker-publish.yml:31`, `ytdlp-update.yml:94`, `deno-update.yml:94`.
-
-Leave `build-pr` amd64-only; its comment about speed is sound once the publish job is honest.
+Skipped: the only host is x86_64, so arm64 was removed instead — the Dockerfile's `aarch64` branches
+and ARM64 pins, the bump workflows' ARM64 sums, and the emulated arm64 publish. Every den addon now
+builds and publishes amd64 only.
 
 ## T2 — The KinoCheck key needs the cache-key namespacing the TMDB key already has
 
