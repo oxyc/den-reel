@@ -89,6 +89,17 @@ anything else                             →  404 {"error":"not_found"}
 
 Every response carries `Access-Control-Allow-Origin: *`.
 
+`/meta`, `/play` and `/crop` send `Server-Timing` naming what the handler did — `tmdb`,
+`kinocheck`, `search`, `download`, `cropdetect` and `bake` with `dur` in milliseconds, or
+`cache;desc=hit` / `cache;desc=stale` when the answer came from memory or the volume — then
+`total`, the time to headers (a streamed video is still being sent when it is measured).
+
+An answer that is a fallback says so in `X-Den-Degraded`, which is absent otherwise:
+`stale_answer` (`/meta` serving the last known trailers while the lookup fails),
+`upstream_unavailable` (an empty `/meta` because the lookup could not be made, not because there is
+no trailer), and `crop_unavailable` (`/crop`'s "play the full frame", when no rect could be measured
+or the call was unsigned). A `/meta` reordered around trailers `/play` found dead is not degraded.
+
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
 following `/play` is warm. Two knobs:
 - `?prewarm=0` — resolve only, don't pull bytes yet (for a browse-time prefetch that isn't sure

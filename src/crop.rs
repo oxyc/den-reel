@@ -23,7 +23,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper::{Response, StatusCode};
 use serde::Serialize;
@@ -514,7 +514,7 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
         );
     }
     if let Some(cached) = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() {
-        return json(&cached);
+        return httputil::timed(json(&cached), "cache;desc=hit");
     }
     // A recent pass over this file produced nothing parsable, so the answer is already decided:
     // `unknown`, identical to what every other failing path here returns.
@@ -525,12 +525,16 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     // that does not depend on what was fetched is the expensive half of the problem the permit
     // below does not solve. /play still downloads what it needs; nothing here has to.
     if unknown_is_fresh(&state, &id) {
-        return json(&CropReport::unknown(&id));
+        return httputil::timed(json(&CropReport::unknown(&id)), "cache;desc=hit");
     }
     // Ensure the file (de-dupes with a concurrent /play), then detect. If either fails, answer
     // "unknown" so the app just plays normally — and don't cache that, so it retries later.
+    let mut timing = String::new();
     let report = match fetch_trailer(state.clone(), id.clone()).await {
-        Ok(fp) => {
+        Ok(fetched) => {
+            // A download this call waited on is part of what it cost.
+            timing = fetched.timing();
+            let fp = fetched.path;
             // download_cached may have just cached the report — reuse it with a SINGLE lock (using the
             // Option directly, so a concurrent cache_report clear() can't wedge us on an unwrap).
             let cached = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
@@ -543,7 +547,13 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
                 None => {
                     let detected = {
                         let _permit = state.probe_sem.acquire().await;
-                        detect(&state.cfg, &id, &fp).await
+                        let started = Instant::now();
+                        let detected = detect(&state.cfg, &id, &fp).await;
+                        if !timing.is_empty() {
+                            timing.push_str(", ");
+                        }
+                        timing.push_str(&httputil::timing("cropdetect", started.elapsed()));
+                        detected
                     };
                     match detected {
                         Some(r) => {
@@ -560,7 +570,7 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
         }
         Err(_) => CropReport::unknown(&id),
     };
-    json(&report)
+    httputil::timed(json(&report), &timing)
 }
 
 pub(crate) fn json(report: &CropReport) -> Response<Body> {
@@ -570,6 +580,15 @@ pub(crate) fn json(report: &CropReport) -> Response<Body> {
     // or the file was not there — and it was going out with the same year-long `immutable`, so one
     // hiccup cost that trailer its de-letterboxing until the client's own cache was cleared. Its
     // own doc says "not cached, so a later call retries"; that was true server-side only.
-    let caching = if report.is_known() { "public, max-age=31536000, immutable" } else { "no-store" };
-    httputil::json(StatusCode::OK, &value, &[("cache-control", caching)])
+    if report.is_known() {
+        httputil::json(StatusCode::OK, &value, &[("cache-control", "public, max-age=31536000, immutable")])
+    } else {
+        // "Play the full frame" stands in for a rect nobody could (or, unsigned, would) measure,
+        // and the app is told so rather than left to read it as a verdict about the video.
+        httputil::json(
+            StatusCode::OK,
+            &value,
+            &[("cache-control", "no-store"), ("x-den-degraded", "crop_unavailable")],
+        )
+    }
 }

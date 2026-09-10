@@ -669,6 +669,65 @@ fn the_request_log_redacts_the_config_segment() {
     }
 }
 
+fn server_timing(r: &reqwest::Response) -> String {
+    r.headers().get("server-timing").expect("no Server-Timing").to_str().unwrap().to_string()
+}
+
+/// /meta names what the resolve did — the upstream calls on a miss, the cache on a hit — and the
+/// header always ends with `total`.
+#[tokio::test]
+async fn meta_says_where_its_time_went() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["goodTrailer"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let base = spawn_server(state).await;
+
+    let miss = server_timing(&reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap());
+    assert!(miss.starts_with("tmdb;dur="), "{miss}");
+    assert!(miss.contains(", kinocheck;dur=") && miss.contains(", total;dur="), "{miss}");
+    let hit = server_timing(&reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap());
+    assert!(hit.starts_with("cache;desc=hit, total;dur="), "{hit}");
+}
+
+/// A trailer already on the volume is a cache hit, and `total` is the time to headers.
+#[tokio::test]
+async fn a_cached_play_says_it_was_a_cache_hit() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid11", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::get(format!("{base}/play/cachedVid11.mp4")).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let t = server_timing(&r);
+    assert!(t.starts_with("cache;desc=hit, total;dur="), "{t}");
+}
+
+/// The last known trailers served while the lookup fails say so, and so does the cache hit on
+/// them that follows. A fresh answer carries no such header.
+#[tokio::test]
+async fn a_stand_in_meta_answer_says_it_is_degraded() {
+    let fake = FakeUpstream::new(&["goodTrailer"], None);
+    let clock = TestClock::default();
+    let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
+    let base = spawn_server(state).await;
+    let degraded =
+        |r: &reqwest::Response| r.headers().get("x-den-degraded").map(|v| v.to_str().unwrap().to_string());
+
+    let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&fresh), None, "a fresh answer was marked degraded");
+
+    clock.advance(crate::YT_TTL_MS + 1);
+    fake.set_tmdb(&[]);
+    fake.fail_next();
+    let stood_in = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&stood_in).as_deref(), Some("stale_answer"));
+    let hit = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(degraded(&hit).as_deref(), Some("stale_answer"));
+}
+
 #[test]
 fn classify_maps_geoblock_to_451() {
     let e = classify(
@@ -3656,8 +3715,8 @@ async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
     // A finished download whose file is gone: exactly what the retry is supposed to recover from.
     let gone = dir.join("evictedvid1.mp4");
     assert!(!gone.exists(), "the point is that this file is not there");
-    let fut: crate::state::BoxFuture<Result<PathBuf, crate::ytdlp::PlayError>> =
-        Box::pin(async move { Ok(gone) });
+    let fut: crate::state::BoxFuture<Result<crate::play::Fetched, crate::ytdlp::PlayError>> =
+        Box::pin(async move { Ok(crate::play::Fetched::cached(gone)) });
     let shared = fut.shared();
     let _ = shared.clone().await; // resolve it, so it is a COMPLETED entry
     state.in_flight.lock().unwrap().insert("evictedvid1".to_string(), (0, shared));

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::{FutureExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
@@ -476,8 +476,33 @@ fn drop_if_finished(state: &AppState, vid: &str) {
 
 /// Download+mux a faststart MP4 for `vid`, cached. De-dupes concurrent requests via `in_flight`:
 /// the first caller creates one shared download, everyone else awaits it.
-pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
+pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<Fetched, PlayError> {
     fetch_trailer_inner(state, vid, true).await
+}
+
+/// A trailer on disk, and what producing it cost, for `Server-Timing`. The durations are `None`
+/// when it was already cached; a caller that joined someone else's download gets that download's.
+#[derive(Clone, Debug)]
+pub struct Fetched {
+    pub path: PathBuf,
+    pub download: Option<Duration>,
+    pub cropdetect: Option<Duration>,
+    pub bake: Option<Duration>,
+}
+
+impl Fetched {
+    pub(crate) fn cached(path: PathBuf) -> Fetched {
+        Fetched { path, download: None, cropdetect: None, bake: None }
+    }
+
+    /// The phases that ran, as `Server-Timing` entries; empty when none did.
+    pub fn timing(&self) -> String {
+        [("download", self.download), ("cropdetect", self.cropdetect), ("bake", self.bake)]
+            .into_iter()
+            .filter_map(|(name, d)| d.map(|d| httputil::timing(name, d)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// [`fetch_trailer`] for a caller that has just tried to open the file and found it absent.
@@ -491,7 +516,7 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
 /// would have caught it and now the `in_flight` join has to. It nearly always does, since the entry
 /// outlives the download it describes; when it does not, the cost is one redundant download that
 /// publishes by atomic rename over an identical file.
-pub(crate) async fn fetch_trailer_cold(state: Arc<AppState>, vid: String) -> Result<PathBuf, PlayError> {
+pub(crate) async fn fetch_trailer_cold(state: Arc<AppState>, vid: String) -> Result<Fetched, PlayError> {
     fetch_trailer_inner(state, vid, false).await
 }
 
@@ -499,7 +524,7 @@ async fn fetch_trailer_inner(
     state: Arc<AppState>,
     vid: String,
     check_disk: bool,
-) -> Result<PathBuf, PlayError> {
+) -> Result<Fetched, PlayError> {
     // Checked here as well as at the routes, because `vid` also arrives from TMDB/KinoCheck via
     // prewarm, and it becomes a filename and a yt-dlp -o path. One `..` writes outside the cache.
     if !crate::is_valid_vid(&vid) {
@@ -537,7 +562,7 @@ async fn fetch_trailer_inner(
                 // on the handle it already holds; this path is what `/crop` and prewarm come
                 // through, and they read the file too.
                 touch_atime(fp.clone());
-                return Ok(fp);
+                return Ok(Fetched::cached(fp));
             }
         }
     }
@@ -574,7 +599,7 @@ async fn fetch_trailer_inner(
             return Err(PlayError::overloaded());
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
-            let fut: BoxFuture<Result<PathBuf, PlayError>> = {
+            let fut: BoxFuture<Result<Fetched, PlayError>> = {
                 let st = state.clone();
                 let v = vid.clone();
                 // Record the verdict INSIDE the shared future, not in the driver task below. Both
@@ -623,7 +648,7 @@ async fn fetch_trailer_inner(
 /// The actual yt-dlp download for a cold `vid`: mux to a per-generation temp file, bake the clap on
 /// the temp, then atomically rename into place and evict if we blew the cap. `gen` makes the temp
 /// name unique so even a de-dupe miss can't put two writers on one path. Bounded by `download_sem`.
-async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<PathBuf, PlayError> {
+async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<Fetched, PlayError> {
     let fp = cache_path(&state.cfg, &vid);
     // Temp MUST end in .mp4 — yt-dlp derives the merge output name from the extension. Leading dot
     // keeps it out of eviction's LRU scan.
@@ -632,6 +657,8 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     // Global cap on concurrent downloads (bounds CPU/disk/fd for a burst of distinct ids).
     let _permit = state.download_sem.acquire().await;
 
+    // After the permit: time spent queued for it is not the download's, and shows in `total`.
+    let started = Instant::now();
     if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
         remove_temp_set(&state.cfg, &tmp).await;
         // Re-probe the volume on the next request. Deliberately on ANY failure, not just the ones
@@ -653,6 +680,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         }
         return Err(e);
     }
+    let download = started.elapsed();
     state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed); // extraction worked → clear the signal
 
     // Detect the content rect (cached for /crop) and bake a `clap` box — on the TEMP file, BEFORE
@@ -663,13 +691,22 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     // the return value. MP4Box rewrites in place, on the same inode, so an interrupted one leaves a
     // half-rewritten trailer — which was then renamed into the cache and served immutable for a
     // year, never re-fetched. Better to lose the download and re-fetch than to cache that.
-    if let Some(report) = crate::crop::detect(&state.cfg, &vid, &tmp).await {
+    let detect_started = Instant::now();
+    let report = crate::crop::detect(&state.cfg, &vid, &tmp).await;
+    let cropdetect = Some(detect_started.elapsed());
+    let mut bake = None;
+    if let Some(report) = report {
         crate::crop::cache_report(&state, &vid, report.clone());
-        if crate::crop::bake_clap(&state.cfg, &tmp, &report).await == crate::crop::Bake::Damaged {
-            remove_temp_set(&state.cfg, &tmp).await;
-            state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            invalidate_cache_availability(&state.cfg);
-            return Err(PlayError::bake_interrupted());
+        let bake_started = Instant::now();
+        match crate::crop::bake_clap(&state.cfg, &tmp, &report).await {
+            crate::crop::Bake::Damaged => {
+                remove_temp_set(&state.cfg, &tmp).await;
+                state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                invalidate_cache_availability(&state.cfg);
+                return Err(PlayError::bake_interrupted());
+            }
+            crate::crop::Bake::Baked => bake = Some(bake_started.elapsed()),
+            crate::crop::Bake::Skipped => {}
         }
     }
 
@@ -692,7 +729,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     if let Ok(Some(u)) = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await {
         state.record_cache_usage(u);
     }
-    Ok(fp)
+    Ok(Fetched { path: fp, download: Some(download), cropdetect, bake })
 }
 
 /// Wrap an async reader as a streaming response body with a large read buffer.
@@ -858,7 +895,7 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
     // the blocking pool. Going through `fetch_trailer` first meant a stat and an atime touch before
     // the open and fstat that actually serve, all to establish what a single open would have told us.
     if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
-        return serve_opened(opened, &vid);
+        return httputil::timed(serve_opened(opened, &vid), "cache;desc=hit");
     }
 
     // Not servable: cold, or evicted out from under us. Two attempts, because the file can be
@@ -867,13 +904,14 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
         // `_cold`: the open above already asked the disk and it said no. Going through the checking
         // variant asked the same question a second time, on every cold play and — worse — on every
         // request the failure cache answers, which is meant to cost a hash lookup and nothing else.
-        if let Err(e) = fetch_trailer_cold(state.clone(), vid.clone()).await {
+        let fetched = match fetch_trailer_cold(state.clone(), vid.clone()).await {
+            Ok(fetched) => fetched,
             // Not logged here: a failure is logged once by the download that produced it, and this
             // arm is also reached by every request the failure cache answers from memory.
-            return play_error(&state, &vid, &e);
-        }
+            Err(e) => return play_error(&state, &vid, &e),
+        };
         if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
-            return serve_opened(opened, &vid);
+            return httputil::timed(serve_opened(opened, &vid), &fetched.timing());
         }
         // Retire the finished entry before retrying, or `fetch_trailer` joins it and hands back the
         // same success for the file that just vanished.

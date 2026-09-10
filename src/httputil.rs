@@ -88,6 +88,22 @@ pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> R
     b.body(full(body)).unwrap()
 }
 
+/// One `Server-Timing` entry: a phase and how long it took, in milliseconds.
+pub fn timing(name: &str, d: std::time::Duration) -> String {
+    format!("{name};dur={:.1}", d.as_secs_f64() * 1000.0)
+}
+
+/// Name what a handler spent its time on in `Server-Timing`; `handle_request` appends `total`.
+/// An empty list sends nothing.
+pub fn timed(mut resp: Response<Body>, phases: &str) -> Response<Body> {
+    if !phases.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(phases) {
+            resp.headers_mut().insert("server-timing", v);
+        }
+    }
+    resp
+}
+
 /// The one 404 every Den addon answers, for an unknown path and a refused `/metrics` alike, so a
 /// refusal cannot be told apart from a route that does not exist.
 pub fn not_found() -> Response<Body> {
@@ -144,6 +160,14 @@ pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Respons
     // it is the header this response exists to be correct about.
     if let Some(v) = resp.headers().get("vary") {
         headers.insert("vary", v.clone());
+    }
+    // What the handler did, and whether the answer is a fallback, describe THIS response; the
+    // client's stored copy can say neither. The same body can be fresh one hour and a stand-in the
+    // next, so the ETag alone would hide the change.
+    for name in ["server-timing", "x-den-degraded"] {
+        if let Some(v) = resp.headers().get(name) {
+            headers.insert(name, v.clone());
+        }
     }
     b.body(full("")).unwrap()
 }

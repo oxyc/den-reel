@@ -300,13 +300,23 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // reports a CORS failure instead of the error.
     resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // Time to headers: a streamed /play body is still being written when this runs.
+    let elapsed = start.elapsed();
+    // `total` only where a handler named its phases, so it is never the whole of the header.
+    let timing = resp
+        .headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .map(|phases| format!("{phases}, {}", httputil::timing("total", elapsed)));
+    if let Some(v) = timing.and_then(|t| hyper::header::HeaderValue::from_str(&t).ok()) {
+        resp.headers_mut().insert("server-timing", v);
+    }
     if log {
         eprintln!(
             "{} {} {} {}ms",
             parts.method,
             redact_path(parts.uri.path()),
             resp.status().as_u16(),
-            start.elapsed().as_millis()
+            elapsed.as_millis()
         );
     }
     resp

@@ -116,6 +116,10 @@ pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String], secret: O
 pub struct Resolved {
     pub ids: Vec<String>,
     pub stale: bool,
+    /// Why this answer is a fallback, for `X-Den-Degraded`. `None` when it is the real one.
+    pub degraded: Option<&'static str>,
+    /// What the resolve spent its time on, as `Server-Timing` entries.
+    pub timing: String,
 }
 
 pub async fn resolve_youtube_ids(
@@ -156,16 +160,40 @@ pub async fn resolve_youtube_ids(
                 // Past when it would normally have expired means these ids are a stand-in written
                 // by a failed lookup, not a fresh answer — the caller caches it in the client for
                 // hours, not a week.
-                return Resolved { ids: e.ids.clone(), stale: now >= e.confirmed + YT_TTL_MS };
+                let stale = now >= e.confirmed + YT_TTL_MS;
+                // An empty entry that lives only the failure cooldown records a lookup that could
+                // not be made, not a title with no trailer: every other write lives longer.
+                let failed = e.ids.is_empty() && e.exp <= e.confirmed + YT_FAIL_TTL_MS;
+                return Resolved {
+                    ids: e.ids.clone(),
+                    stale,
+                    degraded: if stale {
+                        Some("stale_answer")
+                    } else if failed {
+                        Some("upstream_unavailable")
+                    } else {
+                        None
+                    },
+                    timing: if stale { "cache;desc=stale" } else { "cache;desc=hit" }.to_string(),
+                };
             }
         }
     }
     // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
     // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
-    let (tmdb, kc) = tokio::join!(
-        state.upstream.tmdb_candidates(tmdb_key, imdb, ty, lang),
-        state.upstream.kinocheck_youtube_id(kinocheck_key, imdb, ty, lang),
+    // Both are first polled at the same instant, so each one's elapsed time at completion is its
+    // own duration.
+    let started = std::time::Instant::now();
+    let ((tmdb, tmdb_dur), (kc, kc_dur)) = tokio::join!(
+        async { (state.upstream.tmdb_candidates(tmdb_key, imdb, ty, lang).await, started.elapsed()) },
+        async {
+            (state.upstream.kinocheck_youtube_id(kinocheck_key, imdb, ty, lang).await, started.elapsed())
+        },
     );
+    // TMDB only when it was asked — without a key it is not consulted. KinoCheck always is.
+    let mut timing =
+        if tmdb_key.is_empty() { String::new() } else { httputil::timing("tmdb", tmdb_dur) + ", " };
+    timing.push_str(&httputil::timing("kinocheck", kc_dur));
     // Whether we got an ANSWER, per call. With a key TMDB decides — KinoCheck is a fallback whose
     // outage means only that we lost the fallback. Without one TMDB is never consulted, so
     // KinoCheck is the sole source and its outage is a total failure to get an answer.
@@ -189,6 +217,7 @@ pub async fn resolve_youtube_ids(
     // Fallback: NO TMDB/KinoCheck candidate at all (a brand-new title TMDB hasn't linked a video for) →
     // search YouTube for "<title year> trailer". Still no probe — the results are returned as candidates.
     if ids.is_empty() {
+        let search_started = std::time::Instant::now();
         let title = state.upstream.tmdb_title(tmdb_key, imdb, ty).await;
         // The title lookup is the gate on the search: if IT could not be asked, no search ran, and
         // the empty result below is not an answer either.
@@ -213,6 +242,9 @@ pub async fn resolve_youtube_ids(
                 None => search_failed = true,
             }
         }
+        // The title lookup and the search together: the fallback is one phase to the client.
+        timing.push_str(", ");
+        timing.push_str(&httputil::timing("search", search_started.elapsed()));
     }
     // A title with no trailer at all is a normal empty (short-cached), not an extraction failure.
     if ids.is_empty() {
@@ -272,7 +304,12 @@ pub async fn resolve_youtube_ids(
                 // it without rewriting stops a slow failing resolve from downgrading a fast good
                 // one's 24h entry to the 60s cooldown.
                 if e.exp > now {
-                    return Resolved { ids: e.ids.clone(), stale: true };
+                    return Resolved {
+                        ids: e.ids.clone(),
+                        stale: true,
+                        degraded: Some("stale_answer"),
+                        timing: timing + ", cache;desc=stale",
+                    };
                 }
                 ids = e.ids.clone();
                 confirmed = e.confirmed;
@@ -296,7 +333,17 @@ pub async fn resolve_youtube_ids(
     if substituted {
         eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
     }
-    Resolved { ids, stale: substituted }
+    // A stand-in is the last known answer; an empty result from a lookup that could not be made is
+    // no answer at all, and must not read as "this title has no trailer".
+    let degraded = if substituted {
+        timing.push_str(", cache;desc=stale");
+        Some("stale_answer")
+    } else if ids.is_empty() && !asked_and_got_an_answer {
+        Some("upstream_unavailable")
+    } else {
+        None
+    };
+    Resolved { ids, stale: substituted, degraded, timing }
 }
 
 pub async fn handle_meta(
@@ -361,5 +408,10 @@ pub async fn handle_meta(
     } else {
         &[("cache-control", "no-store")]
     };
-    httputil::json(StatusCode::OK, &payload, extra)
+    let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, extra), &resolved.timing);
+    // Not for a demotion: that order is this server's best current knowledge, not a fallback.
+    if let Some(reason) = resolved.degraded {
+        resp.headers_mut().insert("x-den-degraded", hyper::header::HeaderValue::from_static(reason));
+    }
+    resp
 }

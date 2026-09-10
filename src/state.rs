@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
@@ -26,7 +25,7 @@ pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Option<Vec<String>>> + Send 
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
-pub type SharedDownload = Shared<BoxFuture<Result<PathBuf, PlayError>>>;
+pub type SharedDownload = Shared<BoxFuture<Result<crate::play::Fetched, PlayError>>>;
 
 /// Resolved (or negatively-cached) trailer ytIds — best-playable first, then unprobed alternates the
 /// client falls back to on a playback failure. Empty = "no trailer". `exp` is ms since epoch.
