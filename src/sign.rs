@@ -2,9 +2,8 @@
 //!
 //! `/play` and `/crop` both take a YouTube id, spend one of three download permits and a yt-dlp
 //! process on it, and cache the result on the operator's volume. The only check in front of either
-//! is [`crate::is_valid_vid`], so an instance reachable from outside the LAN — which is exactly what
-//! the README's `https://trailers.<domain>` deployment is — is a YouTube extraction service anyone
-//! can point at any video, and a way to fill a 4 GB cache with things nobody asked for.
+//! is [`crate::is_valid_vid`], so an instance reachable from outside the LAN is a YouTube extraction
+//! service anyone can point at any video, and a way to fill a 4 GB cache with things nobody asked for.
 //!
 //! With `REEL_PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>` and both endpoints
 //! require a tag that verifies. Unset, nothing changes at all: this has to default off because

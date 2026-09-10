@@ -135,10 +135,13 @@ curl http://localhost:8092/meta/movie/tt0111161.json          # → a /play URL
 curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke test
 ```
 
-In the homelab it runs behind Caddy at `https://trailers.<domain>` (compose profile
-`trailers`); Caddy forwards `Host` + `X-Forwarded-Proto`, so the addon builds correct
-`https://trailers.<domain>/play/…` URLs with no extra config. Add
-the URL `/configure` gives you — `https://trailers.<domain>/<config>/manifest.json` — to Den
+In the homelab it runs as a Podman Quadlet unit, `den-reel.container`, from the `den` repo's
+`deploy/`: LAN host port 8092, every capability dropped, `no-new-privileges`, a 1 GiB memory cap,
+and the cache bind-mounted from `/var/lib/den/reel-cache` (owned by uid 65532, the image's non-root
+user). New images reach it through the health-gated `den-update` script. The env files, digest
+pinning and rollback are described once, in that repo's `deploy/README.md`. Nothing sits in front of
+it, so play URLs are built from the host the client asked for (`http://<den-ip>:8092/play/…`). Add
+the URL `/configure` gives you — `http://<den-ip>:8092/<config>/manifest.json` — to Den
 (Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while
 `TMDB_KEY` is still set, and resolves with that shared key rather than the install's own.
 
@@ -157,7 +160,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `METRICS_TOKEN` | — | turns on `/metrics`, which then requires `Authorization: Bearer <token>`. Unset, `/metrics` answers 404 like any unknown path. |
 | `TMDB_KEY` | — | **migration fallback** only: the legacy server-side discovery key, used when a request carries no per-install config. New installs seal their own key; drop this once migrated. |
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
-| `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
+| `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded — they follow the request's `Host` (and a proxy's `X-Forwarded-Host`/`-Proto`) |
 | `PORT` | `8092` | |
 | `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: any top-level *file* that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. Subdirectories are left alone — den-reel keeps yt-dlp's player cache in `yt-dlp/` and parks its resolve cache in `state/` across restarts. |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |

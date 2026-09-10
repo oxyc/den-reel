@@ -138,16 +138,19 @@ full 10k entries the map is ~5 MB resident on a box budgeted at a few MB. At rea
 (hundreds to low thousands of entries, 1–3 ids each) it is 0.2–1 MB and fine. Re-deciding a tuning
 constant on speculation, at the end of an audit loop, with no occupancy data from the actual box, is
 not an improvement — measure `/stats`'s `resolve_cache.entries` on the real instance first.
+(2026-09-10: `/stats` is gone; the figure is now `reel_resolve_cache_entries` on the token-gated
+`/metrics`.)
 
 **`save_resolve_cache` holds the `yt_cache` guard across the file write.** The borrowed `live` map
 keeps the guard alive through `File::create`, the writes and the flush. Unreachable today: the only
 caller runs after the accept loop has broken, on the runtime thread of a current-thread runtime, so
 nothing else can be running. It becomes real the moment someone switches to a multi-thread runtime or
 wraps the call in `spawn_blocking` — at which point a wedged volume would block every `/meta` and
-`/stats` for the duration of a disk write. Fixing it means giving the width back to a `Vec`, which is
+`/stats` (now `/metrics`) for the duration of a disk write. Fixing it means giving the width back to a `Vec`, which is
 the allocation that write was changed to avoid, so it is a genuine trade and not an obvious win.
 
-~~**`in_flight` has no cap**~~ — DONE. Capped at `IN_FLIGHT_MAX` (64); a new id past the cap gets a
+~~**`in_flight` has no cap**~~ — DONE. Capped at `IN_FLIGHT_MAX` (64, since lowered to 24 — see
+the constant's comment for why); a new id past the cap gets a
 503 `busy`, while joining a download already in flight is always free. Not recorded in `play_fails`,
 since it says nothing about the video.
 
@@ -183,6 +186,10 @@ mis-triage — it was a multi-megabyte transient allocation at shutdown, not a n
 landed exactly when a redeploy has two processes alive. It now streams through a `BufWriter`.
 
 ## ACCEPTED RISK — `/stats` is served without a gate
+
+**Superseded 2026-09-10.** `/stats` was removed. Its replacement, `/metrics`, is off unless
+`METRICS_TOKEN` is set and then requires it as a bearer token, so the risk below no longer exists. The
+reasoning is kept as it was decided.
 
 Raised by three independent audit passes; resolved deliberately, not overlooked. `/stats` reports
 cache occupancy, in-flight download counts and the failure counters with no signature check, on a
@@ -264,6 +271,9 @@ empty ones, so applying that same rule to an empty entry would resurrect a 60-se
 Skip if the write turns out to need more than a serialize-and-rename at shutdown.
 
 ## T9 — `/stats`
+
+Done, then replaced on 2026-09-10 by the token-gated Prometheus `/metrics`, which carries the same
+figures.
 
 `route()` (`main.rs:117-223`) exposes no `/stats` or `/metrics`. The four counters are read at
 `main.rs:126-128` only to pick a `health_body` branch; `in_flight` depth and cache bytes never

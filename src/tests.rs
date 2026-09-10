@@ -424,8 +424,7 @@ fn a_signed_install_hands_out_signed_play_urls() {
 
 /// The only thing standing in front of /play and /crop was "is this eleven characters", and both
 /// spend a download permit, a yt-dlp process and cache space on whatever they are handed. An
-/// instance reachable beyond the LAN — which is exactly what the README's trailers.<domain>
-/// deployment is — was a YouTube extraction service for anyone who found it.
+/// instance reachable beyond the LAN was a YouTube extraction service for anyone who found it.
 #[tokio::test]
 async fn a_signed_install_refuses_unsigned_play_and_crop() {
     let dir = temp_dir();
