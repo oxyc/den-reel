@@ -463,6 +463,47 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
     assert_eq!(r.status(), 200, "the play URL's tag must open /crop for the same id");
 }
 
+/// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
+async fn start_serve(
+    grace: std::time::Duration,
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let stop = async move {
+        let _ = rx.await;
+    };
+    (addr, tx, tokio::spawn(crate::serve_until(listener, state, stop, grace)))
+}
+
+#[tokio::test]
+async fn an_idle_server_stops_at_once() {
+    let (_, stop, server) = start_serve(std::time::Duration::from_secs(5)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("an idle server waited out the grace instead of stopping")
+        .unwrap();
+}
+
+/// A graceful shutdown waits for every connection, so without a deadline a client that sends half a
+/// request head and goes quiet would hold the stop open for as long as it liked.
+#[tokio::test]
+async fn a_half_sent_request_cannot_hold_the_stop_open() {
+    use tokio::io::AsyncWriteExt;
+    let (addr, stop, server) = start_serve(std::time::Duration::from_millis(300)).await;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the server accept it first
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .expect("the drain is unbounded")
+        .unwrap();
+}
+
 /// ...and with no secret configured, nothing changes: every install in the field is holding unsigned
 /// play URLs that /meta told it to cache for a week.
 #[tokio::test]

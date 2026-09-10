@@ -28,10 +28,13 @@ mod ytdlp;
 mod tests;
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::time::Duration;
 
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
 use crate::config::Config;
@@ -412,51 +415,23 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
-    // Built ONCE, outside the loop. Constructing it per iteration dropped the Signal each time
-    // accept() won the select, and tokio's signal subscribes at the current watch version — so a
-    // SIGTERM delivered while no Signal existed was simply not seen by the next one.
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!(
         "den-reel on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
         if addon_on { "on" } else { "off \u{2014} set TMDB_KEY" }
     );
 
-    loop {
-        // A transient accept error (e.g. EMFILE under an fd-exhausting burst) must not take the
-        // whole server down — log and keep accepting.
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("accept: {e}");
-                    continue;
-                }
-            },
-            // A redeploy (`podman auto-update`) sends SIGTERM. Without handling it the process is
-            // killed outright: every in-flight subprocess keeps running in its own process group,
-            // and the partial files it was writing sit on the cache volume — invisible to the size
-            // cap and unreclaimable until the sweep's 30-minute grace, under a pid that no longer
-            // exists. See the shutdown block below for what stopping the loop actually does.
-            _ = &mut shutdown => {
-                eprintln!("shutting down: stopping accepts, killing in-flight downloads");
-                break;
-            }
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle_request(state, req).await) }
-            });
-            // A client hanging up mid-response is normal; don't log it.
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
-        });
-    }
-    // Only the shutdown branch breaks — an accept error continues — so reaching here means SIGTERM.
+    // Built ONCE, before serving. Constructing it per accept dropped the Signal each time accept()
+    // won the select, and tokio's signal subscribes at the current watch version — so a SIGTERM
+    // delivered while no Signal existed was simply not seen by the next one.
+    //
+    // A redeploy sends SIGTERM. Without handling it the process is killed outright: every in-flight
+    // subprocess keeps running in its own process group, and the partial files it was writing sit on
+    // the cache volume — invisible to the size cap and unreclaimable until the sweep's 30-minute
+    // grace, under a pid that no longer exists.
+    serve_until(listener, state.clone(), shutdown_signal(), DRAIN_GRACE).await;
+
+    // In-flight responses have finished, or run out of time.
     //
     // Kill the downloads EXPLICITLY. Dropping the state does not do it: `in_flight` holds a Shared
     // clone of a future that captures the very Arc<AppState> the map lives in, so the cycle keeps
@@ -471,6 +446,60 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     state::save_resolve_cache(&state);
     Ok(())
+}
+
+/// How long in-flight requests get to finish after SIGTERM. Under podman's default 10s stop timeout,
+/// as den-atlas's and den-embed's are, so the drain works whether or not the Quadlet's --stop-timeout
+/// has reached the box.
+const DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`. Before
+/// this, SIGTERM stopped the loop and returned at once, cutting every response mid-stream.
+///
+/// The bound is the point: a graceful shutdown waits for every connection, and a client that sends
+/// half a request head and stops — or a /play parked on a download that has minutes left — would
+/// otherwise decide how long a restart takes. The caller kills the downloads once this returns.
+async fn serve_until(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+) {
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
+    loop {
+        // A transient accept error (e.g. EMFILE under an fd-exhausting burst) must not take the
+        // whole server down — log and keep accepting.
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
+        };
+        let state = state.clone();
+        let service = service_fn(move |req| {
+            let state = state.clone();
+            async move { Ok::<_, Infallible>(handle_request(state, req).await) }
+        });
+        let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+        let conn = graceful.watch(conn);
+        // A client hanging up mid-response is normal; don't log it.
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    eprintln!("den-reel: shutting down — draining in-flight requests");
+    tokio::select! {
+        _ = graceful.shutdown() => {}
+        _ = tokio::time::sleep(grace) => {
+            eprintln!("den-reel: drain deadline ({grace:?}) reached with requests still in flight");
+        }
+    }
 }
 
 /// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal). On a platform without unix signals only
