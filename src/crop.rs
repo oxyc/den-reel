@@ -570,10 +570,6 @@ pub(crate) fn json(report: &CropReport) -> Response<Body> {
     // or the file was not there — and it was going out with the same year-long `immutable`, so one
     // hiccup cost that trailer its de-letterboxing until the client's own cache was cleared. Its
     // own doc says "not cached, so a later call retries"; that was true server-side only.
-    let caching = if report.is_known() {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-store"
-    };
+    let caching = if report.is_known() { "public, max-age=31536000, immutable" } else { "no-store" };
     httputil::json(StatusCode::OK, &value, &[("cache-control", caching)])
 }

@@ -136,14 +136,23 @@ mod tests {
         let old_tag = tag("old-secret", "dSdWpY2Bxsc");
         let prev = vec!["old-secret".to_string()];
 
-        assert!(!verify("new-secret", "dSdWpY2Bxsc", Some(&old_tag)), "the premise: it does not verify alone");
-        assert!(verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some(&old_tag)), "rotation costs a week of 403s");
+        assert!(
+            !verify("new-secret", "dSdWpY2Bxsc", Some(&old_tag)),
+            "the premise: it does not verify alone"
+        );
+        assert!(
+            verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some(&old_tag)),
+            "rotation costs a week of 403s"
+        );
         assert!(
             verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some(&tag("new-secret", "dSdWpY2Bxsc"))),
             "the current secret must still be the one that signs"
         );
         assert!(!verify_any("new-secret", &prev, "dSdWpY2Bxsc", Some("deadbeefdeadbeefdeadbeef")));
-        assert!(!verify_any("new-secret", &[], "dSdWpY2Bxsc", Some(&old_tag)), "an empty rotation set accepts nothing extra");
+        assert!(
+            !verify_any("new-secret", &[], "dSdWpY2Bxsc", Some(&old_tag)),
+            "an empty rotation set accepts nothing extra"
+        );
     }
 
     /// Deriving the key once must produce the same tags as deriving it per call, or the hoist in

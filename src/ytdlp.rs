@@ -85,7 +85,6 @@ impl PlayError {
     }
 }
 
-
 /// Map a yt-dlp failure to an HTTP status + short reason (the cause is in stderr; match the common
 /// YouTube ones). Anything unrecognized is a blanket 502.
 pub fn classify(code: Option<i32>, stderr: &str) -> PlayError {
@@ -183,7 +182,9 @@ pub async fn probe(cfg: &Config, vid: &str) -> Probe {
             // Only a genuine failure (geo-block, removed, bot-check) fails both → Unplayable.
             eprintln!("probe {vid}: --print exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
             if probe_extractable(cfg, vid).await {
-                eprintln!("probe {vid}: extractable via --simulate → serving (orientation unknown → landscape)");
+                eprintln!(
+                    "probe {vid}: extractable via --simulate → serving (orientation unknown → landscape)"
+                );
                 Probe::Playable { landscape: true }
             } else {
                 Probe::Unplayable
@@ -285,10 +286,7 @@ pub(crate) fn stderr_tail(stderr: &[u8]) -> String {
 /// Parse yt-dlp's `"W H"` print → is it landscape (`w >= h`)? Missing/unparsable dims → `true`.
 pub fn parse_landscape(s: &str) -> bool {
     let mut it = s.split_whitespace();
-    match (
-        it.next().and_then(|w| w.parse::<u32>().ok()),
-        it.next().and_then(|h| h.parse::<u32>().ok()),
-    ) {
+    match (it.next().and_then(|w| w.parse::<u32>().ok()), it.next().and_then(|h| h.parse::<u32>().ok())) {
         (Some(w), Some(h)) => w >= h,
         _ => true,
     }
@@ -416,8 +414,7 @@ impl Drop for GroupGuard {
 /// `in_flight` holds a `Shared` clone of a future that itself captures the `Arc<AppState>` the map
 /// lives in, so the cycle keeps the child alive past runtime teardown. Registering the groups gives
 /// shutdown something it can act on directly, without depending on drop order.
-static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
-    std::sync::Mutex::new(None);
+static LIVE_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
 
 pub(crate) fn register_group(pgid: Option<u32>) {
     if let Some(p) = pgid.filter(|&p| p > 1 && p <= i32::MAX as u32) {

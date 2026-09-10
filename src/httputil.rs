@@ -33,26 +33,18 @@ pub fn etag_of(bytes: &[u8]) -> String {
 
 /// The `Cache-Control` value from a handler's extra-header slice, if any (case-insensitive key).
 fn cache_control_of<'a>(extra: &'a [(&str, &str)]) -> Option<&'a str> {
-    extra
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
-        .map(|(_, v)| *v)
+    extra.iter().find(|(k, _)| k.eq_ignore_ascii_case("cache-control")).map(|(_, v)| *v)
 }
 
 /// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
 /// caching directive that isn't `no-store`. Errors and `no-store` bodies never get an ETag.
 fn cacheable(status: StatusCode, cache_control: Option<&str>) -> bool {
-    status == StatusCode::OK
-        && cache_control.is_some_and(|cc| !cc.is_empty() && !cc.contains("no-store"))
+    status == StatusCode::OK && cache_control.is_some_and(|cc| !cc.is_empty() && !cc.contains("no-store"))
 }
 
 /// `sendJson` equivalent: JSON + permissive CORS + explicit Content-Length, plus any extra headers
 /// (e.g. Cache-Control). Serialization can't fail for our own types, but stay total just in case.
-pub fn json(
-    status: StatusCode,
-    value: &serde_json::Value,
-    extra: &[(&str, &str)],
-) -> Response<Body> {
+pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)]) -> Response<Body> {
     let s = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let mut b = Response::builder()
         .status(status)
@@ -103,9 +95,7 @@ pub fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
 
 /// Plain-text response (health, bad-request bodies). Non-2xx get `Cache-Control: no-store`.
 pub fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
-    let mut b = Response::builder()
-        .status(status)
-        .header("content-length", msg.len());
+    let mut b = Response::builder().status(status).header("content-length", msg.len());
     if !status.is_success() {
         b = b.header("cache-control", "no-store");
     }
@@ -116,11 +106,7 @@ pub fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
 /// collapse to a `304 Not Modified` that keeps the `ETag` + `Cache-Control` headers and drops the
 /// body. A no-op for unsafe methods, responses without an ETag (errors, `no-store`), or a
 /// non-matching request.
-pub fn apply_conditional(
-    method: &Method,
-    req_headers: &HeaderMap,
-    resp: Response<Body>,
-) -> Response<Body> {
+pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Response<Body>) -> Response<Body> {
     if !matches!(*method, Method::GET | Method::HEAD) {
         return resp;
     }
@@ -136,9 +122,7 @@ pub fn apply_conditional(
     let Some(etag) = resp.headers().get(ETAG) else {
         return head_stripped(method, resp);
     };
-    let matched = req_headers
-        .get(IF_NONE_MATCH)
-        .is_some_and(|inm| if_none_match_matches(inm, etag));
+    let matched = req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, etag));
     if !matched {
         return head_stripped(method, resp);
     }

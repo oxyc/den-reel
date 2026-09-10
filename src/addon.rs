@@ -203,7 +203,10 @@ pub async fn resolve_youtube_ids(
                         }
                     }
                     ids.truncate(MAX_PROBE);
-                    eprintln!("trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)", ids.len());
+                    eprintln!(
+                        "trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)",
+                        ids.len()
+                    );
                 }
                 // The third source has the same two-failures-one-value problem as the other two: a
                 // broken yt-dlp returned the same empty list as "YouTube has nothing".
@@ -317,13 +320,8 @@ pub async fn handle_meta(
     }
     // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
     // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).
-    let tmdb_key = cfg
-        .map(|c| c.tmdb_key.as_str())
-        .or(state.cfg.tmdb_key.as_deref())
-        .unwrap_or("");
-    let kinocheck_key = cfg
-        .and_then(|c| c.kinocheck_key.as_deref())
-        .or(state.cfg.kinocheck_key.as_deref());
+    let tmdb_key = cfg.map(|c| c.tmdb_key.as_str()).or(state.cfg.tmdb_key.as_deref()).unwrap_or("");
+    let kinocheck_key = cfg.and_then(|c| c.kinocheck_key.as_deref()).or(state.cfg.kinocheck_key.as_deref());
     let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
     // Lowercased, not just accepted: the cache key and KinoCheck's language pick are both
     // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.

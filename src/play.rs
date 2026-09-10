@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_util::{FutureExt, TryStreamExt};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
-use http_body_util::{BodyExt, StreamBody};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
@@ -311,11 +311,7 @@ pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
         }
     }
     // Report what SURVIVED. `files` still lists the evicted ones, and the sort put them first.
-    Some(CacheUsage {
-        trailer_bytes: total,
-        trailer_count: (files.len() - evicted) as u64,
-        scratch_bytes,
-    })
+    Some(CacheUsage { trailer_bytes: total, trailer_count: (files.len() - evicted) as u64, scratch_bytes })
 }
 
 /// Totals for a directory listing nothing was evicted from.
@@ -631,10 +627,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     let fp = cache_path(&state.cfg, &vid);
     // Temp MUST end in .mp4 — yt-dlp derives the merge output name from the extension. Leading dot
     // keeps it out of eviction's LRU scan.
-    let tmp = state
-        .cfg
-        .cache_dir
-        .join(format!(".{vid}.{}.{gen}.partial.mp4", std::process::id()));
+    let tmp = state.cfg.cache_dir.join(format!(".{vid}.{}.{gen}.partial.mp4", std::process::id()));
 
     // Global cap on concurrent downloads (bounds CPU/disk/fd for a burst of distinct ids).
     let _permit = state.download_sem.acquire().await;
@@ -682,11 +675,11 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
 
     tokio::fs::rename(&tmp, &fp).await.map_err(|e| {
         let _ = std::fs::remove_file(&tmp); // by here yt-dlp has merged and cleaned its own siblings
-        // A rename failure is ours — a full or read-only volume, {vid}.mp4 already there as a
-        // directory — not the extractor's. Calling it `extraction_failed` sent the operator after
-        // yt-dlp, and because the extraction counter was cleared just above and this error is built
-        // here rather than in download_to, an instance failing EVERY download at the rename moved
-        // no counter at all and reported ok.
+                                            // A rename failure is ours — a full or read-only volume, {vid}.mp4 already there as a
+                                            // directory — not the extractor's. Calling it `extraction_failed` sent the operator after
+                                            // yt-dlp, and because the extraction counter was cleared just above and this error is built
+                                            // here rather than in download_to, an instance failing EVERY download at the rename moved
+                                            // no counter at all and reported ok.
         state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         invalidate_cache_availability(&state.cfg);
         PlayError::incomplete(format!("rename {}: {e}", tmp.display()))

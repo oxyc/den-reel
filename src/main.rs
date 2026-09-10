@@ -41,15 +41,15 @@ use std::sync::Arc;
 
 pub const MAX_PROBE: usize = 6; // cap how many trailer candidates we validate per movie
 pub const SEARCH_MAX: usize = 4; // YouTube-search fallback: how many results to consider (then probe)
-// Strictly below DOWNLOAD_CONCURRENCY, and that relationship is the point: the prewarm permit and
-// the download permit are different semaphores, so equal caps let three speculative prewarms take
-// every download permit and — the semaphore being FIFO-fair — park the /play the viewer is actually
-// waiting on behind them, for up to DOWNLOAD_TIMEOUT_SECS. One permit stays reserved for real work.
+                                 // Strictly below DOWNLOAD_CONCURRENCY, and that relationship is the point: the prewarm permit and
+                                 // the download permit are different semaphores, so equal caps let three speculative prewarms take
+                                 // every download permit and — the semaphore being FIFO-fair — park the /play the viewer is actually
+                                 // waiting on behind them, for up to DOWNLOAD_TIMEOUT_SECS. One permit stays reserved for real work.
 pub const PREWARM_MAX: usize = 2;
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
-// A lookup that FAILED, rather than one that answered "nothing": long enough to stop a browse from
-// stampeding a sick upstream, short enough that a recovery is visible in about a minute.
+                                               // A lookup that FAILED, rather than one that answered "nothing": long enough to stop a browse from
+                                               // stampeding a sick upstream, short enough that a recovery is visible in about a minute.
 pub const YT_FAIL_TTL_MS: u64 = 60 * 1000;
 // How long PAST its normal expiry a known-good answer may keep standing in for a failing lookup,
 // measured from when it was last CONFIRMED (re-serving rewrites the expiry, so that is the only
@@ -57,16 +57,14 @@ pub const YT_FAIL_TTL_MS: u64 = 60 * 1000;
 // but a trailer that was REMOVED upstream has to stop being handed out eventually — and /meta ships
 // it with a 7-day max-age, so "eventually" cannot mean "while anything is still faulting".
 pub const STALE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
-const _: () = assert!(
-    YT_FAIL_TTL_MS < YT_NEG_TTL_MS,
-    "a failure must be re-asked sooner than a real 'no trailer'"
-);
+const _: () =
+    assert!(YT_FAIL_TTL_MS < YT_NEG_TTL_MS, "a failure must be re-asked sooner than a real 'no trailer'");
 pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
 pub const CROP_CACHE_MAX: usize = 10_000; // bound the crop-report cache the same way
-// Bound the /play failure cache. Far smaller than the two above on purpose: those hold answers worth
-// keeping, this holds a reason to not re-spawn yt-dlp for a minute or six hours, every entry expires
-// on its own, and losing one costs exactly one repeated download. A homelab sees a few hundred
-// distinct trailers, so 512 covers the working set without reserving memory for a library.
+                                          // Bound the /play failure cache. Far smaller than the two above on purpose: those hold answers worth
+                                          // keeping, this holds a reason to not re-spawn yt-dlp for a minute or six hours, every entry expires
+                                          // on its own, and losing one costs exactly one repeated download. A homelab sees a few hundred
+                                          // distinct trailers, so 512 covers the working set without reserving memory for a library.
 pub const PLAY_FAIL_MAX: usize = 512;
 // Same shape, same reasoning, for the ids cropdetect could not read. A vid and a timestamp each.
 pub const CROP_UNKNOWN_MAX: usize = 512;
@@ -75,22 +73,20 @@ pub const CROP_UNKNOWN_MAX: usize = 512;
 // here is a cropdetect that timed out under load, and that deserves another go before long.
 pub const CROP_UNKNOWN_TTL_MS: u64 = 10 * 60 * 1000;
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
-const _: () = assert!(
-    PREWARM_MAX < DOWNLOAD_CONCURRENCY,
-    "prewarm must leave a download permit for a real /play"
-);
+const _: () =
+    assert!(PREWARM_MAX < DOWNLOAD_CONCURRENCY, "prewarm must leave a download permit for a real /play");
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
-// Cap on DISTINCT ids with a download outstanding. `download_sem` bounds how many run at once, but
-// the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
-// driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. That is request-driven growth: on an
-// instance without REEL_PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
-// are merely well-formed.
-//
-// Sized by what the queue can plausibly SERVE, not just by memory. The wait is un-timed — only the
-// yt-dlp run itself has a timeout — so a queue this deep is also a promise: at three at a time and a
-// 240s worst case per download, 24 drains in about half an hour, where 64 would take an hour and a
-// half of clients waiting on requests that will mostly have been abandoned. Still many times what
-// legitimate use puts in flight (three downloading, two prewarming, a few waiting their turn).
+                                        // Cap on DISTINCT ids with a download outstanding. `download_sem` bounds how many run at once, but
+                                        // the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
+                                        // driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. That is request-driven growth: on an
+                                        // instance without REEL_PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
+                                        // are merely well-formed.
+                                        //
+                                        // Sized by what the queue can plausibly SERVE, not just by memory. The wait is un-timed — only the
+                                        // yt-dlp run itself has a timeout — so a queue this deep is also a promise: at three at a time and a
+                                        // 240s worst case per download, 24 drains in about half an hour, where 64 would take an hour and a
+                                        // half of clients waiting on requests that will mostly have been abandoned. Still many times what
+                                        // legitimate use puts in flight (three downloading, two prewarming, a few waiting their turn).
 pub const IN_FLIGHT_MAX: usize = 24;
 const _: () = assert!(
     IN_FLIGHT_MAX > DOWNLOAD_CONCURRENCY + PREWARM_MAX,
@@ -119,7 +115,12 @@ const HEALTH_FAIL_THRESHOLD: u32 = 3;
 /// so no install can supply one), or when TMDB has been failing
 /// (>= HEALTH_FAIL_THRESHOLD consecutive hard faults); otherwise `ok`. `/health` is addon-level (no
 /// per-install config), so a keyring being present is enough to consider trailers workable.
-fn health_body(tmdb_available: bool, recent_failures: u32, extract_fails: u32, local_fails: u32) -> serde_json::Value {
+fn health_body(
+    tmdb_available: bool,
+    recent_failures: u32,
+    extract_fails: u32,
+    local_fails: u32,
+) -> serde_json::Value {
     if !tmdb_available {
         serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
@@ -304,10 +305,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 
     // playback: id from /play/<id>.mp4 (overrides ?v=), else ?v= on the bare /play path.
     let mut vid = query_param(query, "v");
-    let play_match = path
-        .strip_prefix("/play/")
-        .and_then(|r| r.strip_suffix(".mp4"))
-        .filter(|id| is_valid_vid(id));
+    let play_match =
+        path.strip_prefix("/play/").and_then(|r| r.strip_suffix(".mp4")).filter(|id| is_valid_vid(id));
     if let Some(id) = play_match {
         vid = Some(id.to_string());
     } else if path != "/play" {
@@ -454,9 +453,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
                 async move { Ok::<_, Infallible>(handle_request(state, req).await) }
             });
             // A client hanging up mid-response is normal; don't log it.
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
         });
     }
     // Only the shutdown branch breaks — an accept error continues — so reaching here means SIGTERM.
@@ -512,10 +509,7 @@ async fn healthcheck(port: u16) -> i32 {
 fn main() {
     let cfg = Config::from_env();
     // current_thread: one runtime thread keeps idle RAM low; the heavy lifting is in subprocesses.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         std::process::exit(rt.block_on(healthcheck(cfg.port)));

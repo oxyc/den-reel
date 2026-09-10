@@ -88,7 +88,13 @@ impl FakeUpstream {
 
 #[async_trait]
 impl Upstream for FakeUpstream {
-    async fn tmdb_candidates(&self, _tmdb_key: &str, _imdb: &str, _ty: &str, _lang: &str) -> crate::upstream::Answered<Vec<String>> {
+    async fn tmdb_candidates(
+        &self,
+        _tmdb_key: &str,
+        _imdb: &str,
+        _ty: &str,
+        _lang: &str,
+    ) -> crate::upstream::Answered<Vec<String>> {
         self.0.calls.fetch_add(1, Ordering::SeqCst);
         // Claim this call's outcome BEFORE parking, or the resolve that runs while we are parked
         // consumes the flag that was armed for us.
@@ -102,13 +108,24 @@ impl Upstream for FakeUpstream {
         }
         Ok(self.0.tmdb.lock().unwrap().clone())
     }
-    async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> crate::upstream::Answered<Option<String>> {
+    async fn kinocheck_youtube_id(
+        &self,
+        _kinocheck_key: Option<&str>,
+        _imdb: &str,
+        _ty: &str,
+        _lang: &str,
+    ) -> crate::upstream::Answered<Option<String>> {
         if self.0.fail_kc.load(Ordering::SeqCst) {
             return Err(crate::upstream::NoAnswer);
         }
         Ok(self.0.kc.lock().unwrap().clone())
     }
-    async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> crate::upstream::Answered<Option<String>> {
+    async fn tmdb_title(
+        &self,
+        _tmdb_key: &str,
+        _imdb: &str,
+        _ty: &str,
+    ) -> crate::upstream::Answered<Option<String>> {
         if self.0.fail_title.load(Ordering::SeqCst) {
             return Err(crate::upstream::NoAnswer);
         }
@@ -213,13 +230,23 @@ fn noop_searcher() -> crate::state::SearchFn {
     Box::new(|_q| Box::pin(async { Some(Vec::<String>::new()) }))
 }
 
-fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
+fn build_state(
+    cache_dir: PathBuf,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+) -> Arc<AppState> {
     build_state_cfg(test_cfg(cache_dir), upstream, prober, prewarm)
 }
 
 /// Like `build_state` but with an explicit `Config` — lets a test enable the sealed-config keyring
 /// (via `config_key`) exactly the way production does.
-fn build_state_cfg(cfg: Config, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
+fn build_state_cfg(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+) -> Arc<AppState> {
     build_state_full(cfg, upstream, prober, prewarm, noop_searcher())
 }
 
@@ -258,7 +285,11 @@ fn build_state_full(
     })
 }
 
-fn build_state_clock(cache_dir: PathBuf, upstream: Box<dyn Upstream>, clock: crate::state::ClockFn) -> Arc<AppState> {
+fn build_state_clock(
+    cache_dir: PathBuf,
+    upstream: Box<dyn Upstream>,
+    clock: crate::state::ClockFn,
+) -> Arc<AppState> {
     let state = build_state(cache_dir, upstream, always_playable(), noop_prewarm());
     let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
     state.clock = clock;
@@ -267,7 +298,11 @@ fn build_state_clock(cache_dir: PathBuf, upstream: Box<dyn Upstream>, clock: cra
 
 /// Both at once: a real `Config` (so a test can point `ytdlp` at a fake) and a driven clock (so a
 /// TTL can be asserted by advancing time rather than sleeping).
-fn build_state_cfg_clock(cfg: Config, upstream: Box<dyn Upstream>, clock: crate::state::ClockFn) -> Arc<AppState> {
+fn build_state_cfg_clock(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    clock: crate::state::ClockFn,
+) -> Arc<AppState> {
     let state = build_state_cfg(cfg, upstream, always_playable(), noop_prewarm());
     let mut state = Arc::try_unwrap(state).ok().expect("sole owner");
     state.clock = clock;
@@ -293,9 +328,7 @@ async fn spawn_server(state: Arc<AppState>) -> String {
                     let state = state.clone();
                     async move { Ok::<_, Infallible>(crate::handle_request(state, req).await) }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, svc)
-                    .await;
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, svc).await;
             });
         }
     });
@@ -313,10 +346,7 @@ fn pick_candidates_orders_and_dedupes() {
         json!({ "site": "YouTube", "type": "Trailer", "key": "plain222222" }),
         json!({ "site": "YouTube", "type": "Trailer", "official": true, "key": "official111" }),
     ];
-    assert_eq!(
-        pick_trailer_candidates(&results, "en"),
-        vec!["official111", "plain222222", "teaser00000"]
-    );
+    assert_eq!(pick_trailer_candidates(&results, "en"), vec!["official111", "plain222222", "teaser00000"]);
 }
 
 /// The ordering prefers the FILM'S language, then English, then anything else — never the viewer's.
@@ -368,10 +398,7 @@ fn build_meta_produces_same_host_play_url() {
         &["abc123DEF01".to_string()],
         None,
     );
-    assert_eq!(
-        out["meta"]["links"][0]["trailers"],
-        "https://trailers.example.com/play/abc123DEF01.mp4"
-    );
+    assert_eq!(out["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/abc123DEF01.mp4");
 }
 
 /// With a secret configured the play URL carries the tag /play and /crop will demand — and without
@@ -404,18 +431,16 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
     seed_cache(&dir, "cachedVid07", 100);
     let mut cfg = test_cfg(dir);
     cfg.play_secret = Some("s3cret".into());
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
     let client = reqwest::Client::new();
 
     let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
     assert_eq!(r.status(), 403, "an unsigned /play was served");
 
-    let r = client
-        .get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef"))
-        .send()
-        .await
-        .unwrap();
+    let r =
+        client.get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).send().await.unwrap();
     assert_eq!(r.status(), 403, "a wrong tag was accepted");
 
     let tag = crate::sign::tag("s3cret", "cachedVid07");
@@ -519,10 +544,7 @@ fn health_reports_degraded_and_ok_states() {
     assert_eq!(crate::health_body(true, 4, 0, 0)["reason"], "upstream_unavailable");
 
     // Upstreams fine but yt-dlp can't extract anything (>= threshold) → degraded (the silent-outage gap).
-    assert_eq!(
-        crate::health_body(true, 0, 3, 0)["reason"],
-        json!("extractor_unavailable")
-    );
+    assert_eq!(crate::health_body(true, 0, 3, 0)["reason"], json!("extractor_unavailable"));
     assert_eq!(crate::health_body(true, 0, 2, 0), json!({"status": "ok"})); // below threshold → ok
 
     // Key present, everything below the threshold → ok.
@@ -537,9 +559,23 @@ async fn resolve_returns_first_playable_and_caches() {
     let fake = FakeUpstream::new(&["firstGood11"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.first().map(String::as_str), Some("firstGood11"));
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+            .await
+            .ids
+            .first()
+            .map(String::as_str),
+        Some("firstGood11")
+    );
     let after = fake.calls();
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.first().map(String::as_str), Some("firstGood11"));
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+            .await
+            .ids
+            .first()
+            .map(String::as_str),
+        Some("firstGood11")
+    );
     assert_eq!(fake.calls(), after, "second lookup is a cache hit (no new upstream calls)");
 }
 
@@ -549,7 +585,8 @@ async fn resolve_returns_alternates_after_the_primary_for_fallback() {
     // the next one on a playback failure). No extra probing beyond first_playable.
     let fake = FakeUpstream::new(&["playable1", "playable2"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["playable1".to_string(), "playable2".to_string()]);
 }
 
@@ -560,7 +597,8 @@ async fn resolve_returns_candidates_in_rank_order_without_probing() {
     // validated lazily on /play — so /meta never spawns yt-dlp.
     let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["blockedUS01".to_string(), "worldwide22".to_string()]);
 }
 
@@ -570,7 +608,8 @@ async fn resolve_empty_only_when_no_candidates_at_all() {
     // candidate looked unplayable (that check moved to /play).
     let fake = FakeUpstream::new(&["someCandidate"], None);
     let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["someCandidate".to_string()]);
 }
 
@@ -582,8 +621,10 @@ async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
     fake.set_title("Backrooms 2025");
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { Some(vec!["searchOne".into(), "searchTwo".into()]) }));
-    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
+    let state =
+        build_state_full(test_cfg(temp_dir()), Box::new(fake), always_playable(), noop_prewarm(), searcher);
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
     assert_eq!(ids, vec!["searchOne".to_string(), "searchTwo".to_string()]);
 }
 
@@ -591,11 +632,15 @@ async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
 async fn resolve_no_search_when_title_unknown() {
     // No candidates AND no title → the search fallback can't build a query → empty, no panic.
     let fake = FakeUpstream::new(&[], None); // title left None
-    let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }));
+    let prober: ProbeFn =
+        Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }));
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { Some(vec!["shouldNotBeUsed".into()]) }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
-    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await.ids, Vec::<String>::new());
+    assert_eq!(
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await.ids,
+        Vec::<String>::new()
+    );
 }
 
 // (Landscape preference moved off the server: den-reel returns candidates in rank order and the CLIENT
@@ -616,7 +661,8 @@ fn parse_landscape_reads_dims_and_defaults_safely() {
 
 #[tokio::test]
 async fn get_manifest_returns_addon_manifest() {
-    let state = build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
     let body: Value = reqwest::get(format!("{base}/manifest.json")).await.unwrap().json().await.unwrap();
     assert_eq!(body["resources"][0], "meta");
@@ -627,7 +673,8 @@ async fn get_meta_rejects_non_imdb_with_no_upstream_call() {
     let fake = FakeUpstream::new(&["should-not-be-used"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
-    let body: Value = reqwest::get(format!("{base}/meta/movie/not-an-id.json")).await.unwrap().json().await.unwrap();
+    let body: Value =
+        reqwest::get(format!("{base}/meta/movie/not-an-id.json")).await.unwrap().json().await.unwrap();
     assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
     assert_eq!(fake.calls(), 0, "no upstream call for a non-imdb id");
 }
@@ -647,10 +694,7 @@ async fn get_meta_resolves_imdb_to_play_url_on_request_host() {
         .json()
         .await
         .unwrap();
-    assert_eq!(
-        body["meta"]["links"][0]["trailers"],
-        "https://trailers.example.com/play/vidKey12345.mp4"
-    );
+    assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
 }
 
 #[tokio::test]
@@ -717,7 +761,8 @@ async fn config_key_serves_pubkey_when_keyring_set() {
 #[tokio::test]
 async fn config_key_404s_when_sealing_disabled() {
     // Default test state has no REEL_CONFIG_KEY → sealing disabled.
-    let state = build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
     assert_eq!(reqwest::get(format!("{base}/config-key")).await.unwrap().status(), 404);
 }
@@ -737,7 +782,12 @@ async fn sealed_config_url_resolves_manifest_and_meta() {
         .get(format!("{base}/{SEALED_SEG}/meta/movie/tt0111161.json"))
         .header("x-forwarded-host", "trailers.example.com")
         .header("x-forwarded-proto", "https")
-        .send().await.unwrap().json().await.unwrap();
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
 }
 
@@ -758,9 +808,13 @@ async fn legacy_plaintext_config_resolves_with_a_keyring_present() {
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let base = spawn_server(sealed_state(fake)).await;
     let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"tmdbKey":"legacy"}"#);
-    let body: Value = reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json"))
-        .await.unwrap().json().await.unwrap();
-    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 1, "legacy plaintext config must still resolve");
+    let body: Value =
+        reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        body["meta"]["links"].as_array().unwrap().len(),
+        1,
+        "legacy plaintext config must still resolve"
+    );
 }
 
 // --- /play serve contract (seed a cached file so fetch_trailer never spawns yt-dlp) ---
@@ -880,12 +934,14 @@ fn refine_plays_full_frame_for_portrait_and_pillarbox() {
 
     // Portrait source (landscape clip padded into a 720x1280 frame): the huge top/bottom padding is NOT
     // a cinematic letterbox — cropping it to a thin strip is what broke the billboard. Must play full.
-    let portrait = refine_report(report_from("x", Some((720, 1280)), RawCrop { w: 640, h: 404, x: 40, y: 438 }));
+    let portrait =
+        refine_report(report_from("x", Some((720, 1280)), RawCrop { w: 640, h: 404, x: 40, y: 438 }));
     assert!(!portrait.letterboxed, "a portrait source must not be letterbox-cropped");
     assert_eq!(portrait.content.as_ref().map(|c| (c.w, c.h)), Some((720, 1280)));
 
     // Pillarbox (side bars, not top/bottom) → not our job → full frame.
-    let pillar = refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1200, h: 1080, x: 360, y: 0 }));
+    let pillar =
+        refine_report(report_from("x", Some((1920, 1080)), RawCrop { w: 1200, h: 1080, x: 360, y: 0 }));
     assert!(!pillar.letterboxed);
     assert_eq!(pillar.content.as_ref().map(|c| c.w), Some(1920));
 
@@ -904,11 +960,19 @@ fn parse_source_dims_reads_the_video_stream_line() {
 #[test]
 fn report_flags_letterbox_but_not_pixel_noise() {
     // 1080 → 816 content = 264px bars (~24%) → letterboxed, ~2.35 aspect.
-    let boxed = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 });
+    let boxed = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    );
     assert!(boxed.letterboxed);
     assert_eq!(boxed.aspect, Some(2.35));
     // 1080 → 1072 content = 8px (<2%) → treated as noise, not letterboxed.
-    let noise = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 1072, x: 0, y: 4 });
+    let noise = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 1072, x: 0, y: 4 },
+    );
     assert!(!noise.letterboxed);
 }
 
@@ -921,24 +985,45 @@ async fn clap_pipeline_bakes_box_end_to_end() {
     let fp = dir.join("clapvid0001.mp4");
     // 1920x1080 with a 1920x816 testsrc content region and 132px black bars top/bottom.
     let ok = std::process::Command::new("ffmpeg")
-        .args(["-y", "-f", "lavfi", "-i", "testsrc=size=1920x816:rate=24:d=2",
-               "-vf", "pad=1920:1080:0:132:color=black", "-c:v", "libx264",
-               "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=1920x816:rate=24:d=2",
+            "-vf",
+            "pad=1920:1080:0:132:color=black",
+            "-c:v",
+            "libx264",
+            "-g",
+            "6",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ])
         .arg(&fp)
-        .status().unwrap().success();
+        .status()
+        .unwrap()
+        .success();
     assert!(ok, "ffmpeg failed to build the letterbox fixture");
 
     let cfg = test_cfg(dir);
     let report = crate::crop::detect(&cfg, "clapvid0001", &fp).await.expect("detect returned a rect");
     assert!(report.letterboxed, "132px bars should read as letterboxed");
     assert_eq!(report.content.as_ref().unwrap().h, 816);
-    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Baked,
-               "MP4Box should write the clap box");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Baked,
+        "MP4Box should write the clap box"
+    );
 
     // ffprobe reads the clap back as frame cropping — 132px top & bottom.
     let out = std::process::Command::new("ffprobe")
-        .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
-        .output().unwrap();
+        .args(["-hide_banner", "-v", "error", "-show_streams"])
+        .arg(&fp)
+        .output()
+        .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
 }
@@ -970,12 +1055,17 @@ async fn clap_pipeline_crops_transient_logo_end_to_end() {
     // The logo appears in a minority of keyframes, so the typical box is still the 816 letterbox and
     // the logo is cropped away — a union would have reported a taller box here and kept the bar.
     assert_eq!(report.content.as_ref().unwrap().h, 816, "a transient logo must not hold the bar open");
-    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Baked,
-               "MP4Box should write the clap box");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Baked,
+        "MP4Box should write the clap box"
+    );
 
     let out = std::process::Command::new("ffprobe")
-        .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
-        .output().unwrap();
+        .args(["-hide_banner", "-v", "error", "-show_streams"])
+        .arg(&fp)
+        .output()
+        .unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
 }
@@ -1007,8 +1097,11 @@ async fn detect_does_not_crop_mixed_framing_end_to_end() {
     assert!(!report.letterboxed, "a trailer with genuine full-frame shots must not be cropped");
     assert_eq!(report.content.as_ref().unwrap().h, 1080, "full frame kept, not sliced to the letterbox");
     // And nothing is baked, so an AVPlayer sees the full frame.
-    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped,
-               "no clap baked for a full-frame report");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "no clap baked for a full-frame report"
+    );
 }
 
 // A PORTRAIT trailer (landscape clip padded into a tall frame) must NOT be letterbox-cropped — that
@@ -1022,20 +1115,37 @@ async fn detect_does_not_crop_portrait_end_to_end() {
     // A 720x404 landscape testsrc padded into a 720x1280 portrait frame (huge top/bottom padding).
     let ok = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-f", "lavfi", "-i", "testsrc=size=720x404:rate=24:d=3",
-            "-vf", "pad=720:1280:0:438:color=black",
-            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=720x404:rate=24:d=3",
+            "-vf",
+            "pad=720:1280:0:438:color=black",
+            "-c:v",
+            "libx264",
+            "-g",
+            "6",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
         ])
         .arg(&fp)
-        .status().unwrap().success();
+        .status()
+        .unwrap()
+        .success();
     assert!(ok, "ffmpeg failed to build the portrait fixture");
 
     let cfg = test_cfg(dir);
     let report = crate::crop::detect(&cfg, "portrait0001", &fp).await.expect("detect returned a report");
     assert!(!report.letterboxed, "a portrait source must not be letterbox-cropped");
     assert_eq!(report.content.as_ref().unwrap().h, 1280, "full portrait frame kept, not a thin strip");
-    assert_eq!(crate::crop::bake_clap(&cfg, &fp, &report).await, crate::crop::Bake::Skipped,
-               "no clap baked for a portrait trailer");
+    assert_eq!(
+        crate::crop::bake_clap(&cfg, &fp, &report).await,
+        crate::crop::Bake::Skipped,
+        "no clap baked for a portrait trailer"
+    );
 }
 
 #[tokio::test]
@@ -1074,15 +1184,27 @@ fn error_responses_are_no_store() {
 #[test]
 fn clap_params_are_center_relative() {
     // Symmetric 2.35 letterbox → offsets 0 (content centre == frame centre).
-    let centered = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 });
+    let centered = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
+    );
     assert_eq!(crate::crop::clap_params(&centered), Some((1920, 816, 0, 0)));
 
     // Logo kept in the bottom bar → content off-centre downward → positive vertOff (num over 2).
-    let off = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 922, x: 0, y: 132 });
+    let off = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 922, x: 0, y: 132 },
+    );
     assert_eq!(crate::crop::clap_params(&off), Some((1920, 922, 0, 106))); // 106/2 = 53px
 
     // Not letterboxed → nothing to bake.
-    let full = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 });
+    let full = crate::crop::report_from(
+        "x",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 },
+    );
     assert_eq!(crate::crop::clap_params(&full), None);
 }
 
@@ -1232,21 +1354,20 @@ async fn an_unknown_crop_is_not_cached_by_the_client() {
 #[test]
 fn the_format_ladder_never_exceeds_the_configured_cap() {
     let heights_in = |fmt: &str| -> Vec<u32> {
-        fmt.split("height<=")
-            .skip(1)
-            .filter_map(|t| t.split(']').next()?.parse::<u32>().ok())
-            .collect()
+        fmt.split("height<=").skip(1).filter_map(|t| t.split(']').next()?.parse::<u32>().ok()).collect()
     };
-    for (cap, expect_rungs) in [("1080", vec![1080, 1080, 720, 720, 480, 480]), ("720", vec![720, 720, 480, 480]), ("480", vec![480, 480]), ("360", vec![360, 360])] {
+    for (cap, expect_rungs) in [
+        ("1080", vec![1080, 1080, 720, 720, 480, 480]),
+        ("720", vec![720, 720, 480, 480]),
+        ("480", vec![480, 480]),
+        ("360", vec![360, 360]),
+    ] {
         std::env::set_var("MAX_HEIGHT", cap);
         let cfg = crate::config::Config::from_env();
         std::env::remove_var("MAX_HEIGHT");
         let cap_n: u32 = cap.parse().unwrap();
         let got = heights_in(&cfg.ytdlp_format);
-        assert!(
-            got.iter().all(|h| *h <= cap_n),
-            "cap {cap}: ladder reaches above it: {got:?}"
-        );
+        assert!(got.iter().all(|h| *h <= cap_n), "cap {cap}: ladder reaches above it: {got:?}");
         assert_eq!(got, expect_rungs, "cap {cap}");
     }
     // A MAX_HEIGHT the ladder cannot use must cost the setting, not the service. yt-dlp rejects a
@@ -1388,12 +1509,13 @@ async fn killing_the_group_reaches_a_grandchild() {
     let marker = dir.join("grandchild-alive");
     // A parent that forks a long-lived child, exactly like yt-dlp spawning ffmpeg.
     let script = dir.join("parent.sh");
-    std::fs::write(
+    std::fs::write(&script, format!("#!/bin/sh\nsh -c 'sleep 30; : > {}' &\nsleep 30\n", marker.display()))
+        .unwrap();
+    std::fs::set_permissions(
         &script,
-        format!("#!/bin/sh\nsh -c 'sleep 30; : > {}' &\nsleep 30\n", marker.display()),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
     )
     .unwrap();
-    std::fs::set_permissions(&script, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755)).unwrap();
 
     let mut cmd = std::process::Command::new(&script);
     cmd.process_group(0);
@@ -1446,12 +1568,8 @@ async fn an_imdb_id_is_bounded_before_it_reaches_a_cache_key() {
     let base = spawn_server(state.clone()).await;
 
     let huge = format!("tt{}", "1".repeat(60));
-    let body: serde_json::Value = reqwest::get(format!("{base}/meta/movie/{huge}.json"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let body: serde_json::Value =
+        reqwest::get(format!("{base}/meta/movie/{huge}.json")).await.unwrap().json().await.unwrap();
 
     assert!(
         body["meta"]["links"].as_array().is_some_and(|a| a.is_empty()),
@@ -1546,7 +1664,10 @@ fn stale_partials_are_reclaimed_but_live_ones_are_left_alone() {
     for name in abandoned {
         assert!(!dir.join(name).exists(), "{name} was left on disk");
     }
-    assert!(dir.join(".bbbbbb.2.0.partial.mp4.part").exists(), "a live download was deleted under its writer");
+    assert!(
+        dir.join(".bbbbbb.2.0.partial.mp4.part").exists(),
+        "a live download was deleted under its writer"
+    );
     assert!(dir.join("cccccc.mp4").exists(), "the sweep touched a finished trailer");
 
     // yt-dlp keeps its player-JS cache in a subdirectory here; the sweep must not touch it.
@@ -1602,7 +1723,8 @@ async fn a_warm_serve_stamps_atime_and_never_reaches_yt_dlp() {
     let mut cfg = test_cfg(dir.clone());
     // If the warm path tries to download, this fails loudly rather than quietly succeeding.
     cfg.ytdlp = "/nonexistent/yt-dlp".into();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     let resp = crate::play::handle_play(state, &hyper::HeaderMap::new(), "warmVid0001".into()).await;
     assert_eq!(resp.status(), 200, "a cached trailer was not served from cache");
@@ -1641,18 +1763,25 @@ async fn a_failed_lookup_cools_down_instead_of_caching_no_trailer() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_next();
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     // Within the cooldown the failure is not re-asked — that is what bounds the stampede.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS / 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     assert_eq!(fake.calls(), after, "a failed lookup is not rate-limited at all");
 
     // Past it — and long before a real negative would have expired — the recovery is visible.
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_FAIL_TTL_MS);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1688,10 +1817,14 @@ async fn a_keyless_answer_does_not_blank_the_title_for_keyed_installs() {
     let fake = FakeUpstream::new(&[], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     fake.set_tmdb(&["realTrailer"]);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1709,12 +1842,16 @@ async fn a_kinocheck_keyless_answer_does_not_blank_the_alternate_for_keyed_insta
     let fake = FakeUpstream::new(&["primaryVid1"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids, vec!["primaryVid1"], "no KinoCheck key, so no fallback candidate");
 
     // Now the source that install could not ask has something to say.
     fake.set_kc(Some("kcAltVid111"));
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", Some("kc-key"), "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", Some("kc-key"), "tt0111161", "movie", "en")
+            .await
+            .ids;
     assert_eq!(
         ids,
         vec!["primaryVid1", "kcAltVid111"],
@@ -1730,10 +1867,16 @@ async fn a_keyless_answer_is_cached_for_a_full_negative_ttl() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     assert_eq!(fake.calls(), after, "a missing key was priced as a transient blip and re-asked");
 }
 
@@ -1746,21 +1889,27 @@ async fn a_real_empty_answer_is_cached_for_the_full_negative_ttl() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     let after = fake.calls();
 
     // Well past the failure cooldown — a real answer must not be re-asked on that schedule.
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     assert_eq!(fake.calls(), after, "a real 'no trailer' was re-asked at the failure cooldown");
 
     // ...and it does expire eventually, so a geo-block or a late-added trailer is picked up.
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_NEG_TTL_MS);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids.first().map(String::as_str), Some("realTrailer"), "the negative cache never expired");
 }
-
 
 /// A cache cap smaller than one trailer parses cleanly and inverts the setting: eviction runs right
 /// after the rename and sees the file it just published, so every /play downloads, deletes its own
@@ -1853,8 +2002,14 @@ fn a_cacheable_body_names_the_headers_its_urls_came_from() {
     );
     let vary = res.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
     let vary = vary.unwrap_or_default();
-    assert!(vary.contains("x-forwarded-host"), "cacheable body did not vary on the host it embedded: {vary:?}");
-    assert!(vary.contains("x-forwarded-proto"), "cacheable body did not vary on the scheme it embedded: {vary:?}");
+    assert!(
+        vary.contains("x-forwarded-host"),
+        "cacheable body did not vary on the host it embedded: {vary:?}"
+    );
+    assert!(
+        vary.contains("x-forwarded-proto"),
+        "cacheable body did not vary on the scheme it embedded: {vary:?}"
+    );
 }
 
 /// A broken yt-dlp made the search fallback return the same empty list as "YouTube has nothing",
@@ -1878,11 +2033,15 @@ async fn a_failed_search_is_not_cached_as_no_trailer() {
         st.clock = clock.as_fn();
     }
 
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     fake.set_tmdb(&["realTrailer"]);
     clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("realTrailer"),
@@ -1902,7 +2061,9 @@ async fn serve_once_stalling(content_length: usize) -> String {
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n");
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n"
+    );
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let _ = sock.write_all(head.as_bytes()).await;
@@ -1917,7 +2078,9 @@ async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let head = format!("{status_line}\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n");
+    let head = format!(
+        "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {content_length}\r\n\r\n"
+    );
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let _ = sock.write_all(head.as_bytes()).await;
@@ -1994,10 +2157,7 @@ async fn a_200_that_fails_late_also_degrades_health() {
 
     assert_eq!(up.recent_failures(), 0);
     assert_eq!(up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await, Err(NoAnswer));
-    assert!(
-        up.recent_failures() > 0,
-        "/health stayed green through an outage that empties every resolve"
-    );
+    assert!(up.recent_failures() > 0, "/health stayed green through an outage that empties every resolve");
 }
 
 /// A body over the cap is the third late-failure shape. The body must stay VALID JSON past the cap:
@@ -2052,12 +2212,18 @@ async fn a_keyless_lookup_does_not_pin_a_fallback_outage_for_an_hour() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_fallback();
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     // Past the cooldown but far short of a real negative: the outage must be re-asked.
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS + 1);
-    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     assert!(
         fake.calls() > after,
         "a keyless install pinned its only source's outage as 'no trailer' for a full hour"
@@ -2073,11 +2239,17 @@ async fn a_keyed_lookup_still_ignores_a_fallback_outage() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_fallback();
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     let after = fake.calls();
     clock.advance(crate::YT_FAIL_TTL_MS * 2);
-    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     assert_eq!(fake.calls(), after, "a fallback outage shortened a real answer's TTL");
 }
 
@@ -2150,14 +2322,16 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     // A healthy install caches a real answer, which then expires.
-    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(ids.first().map(String::as_str), Some("goodTrailer"));
     clock.advance(crate::YT_TTL_MS + 1);
 
     // An install with a wrong key resolves the same title and gets nothing.
     fake.set_tmdb(&[]);
     fake.fail_next();
-    let broken = crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await.ids;
+    let broken =
+        crate::addon::resolve_youtube_ids(&state, "wrong-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         broken.first().map(String::as_str),
         Some("goodTrailer"),
@@ -2166,7 +2340,8 @@ async fn a_failing_install_does_not_blank_a_cached_trailer_for_everyone() {
 
     // The healthy install must still see its trailer, and the failure must not be serving as a hit.
     fake.set_tmdb(&["goodTrailer"]);
-    let ids = crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
+    let ids =
+        crate::addon::resolve_youtube_ids(&state, "good-key", None, "tt0111161", "movie", "en").await.ids;
     assert_eq!(
         ids.first().map(String::as_str),
         Some("goodTrailer"),
@@ -2220,7 +2395,10 @@ async fn one_titles_outage_does_not_touch_another_title() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_next();
-    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt9999999", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     // A different title, resolved successfully right after, must be cached at the FULL TTL.
     fake.set_tmdb(&["goodTrailer"]);
@@ -2245,7 +2423,10 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     // A persistent outage, browsed repeatedly.
@@ -2258,10 +2439,7 @@ async fn serving_a_stale_answer_still_rate_limits_the_outage() {
         calls.push(fake.calls());
         clock.advance(crate::YT_FAIL_TTL_MS / 4);
     }
-    assert!(
-        calls[4] - calls[0] <= 1,
-        "each browse during the outage paid a full upstream round: {calls:?}"
-    );
+    assert!(calls[4] - calls[0] <= 1, "each browse during the outage paid a full upstream round: {calls:?}");
 }
 
 /// Serving the last known answer must expire. Re-serving rewrites the entry's expiry, so without an
@@ -2273,7 +2451,10 @@ async fn a_stale_answer_stops_being_served_eventually() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     // The trailer is gone upstream, and the lookups keep failing. Browse repeatedly, well past the
@@ -2299,7 +2480,10 @@ async fn a_stale_answer_survives_a_long_outage() {
     let clock = TestClock::default();
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     clock.advance(crate::YT_TTL_MS + 1);
 
     fake.set_tmdb(&[]);
@@ -2487,7 +2671,8 @@ fn a_stand_in_answer_survives_being_parked() {
 #[test]
 fn the_parked_resolve_cache_is_not_swept_away() {
     let dir = temp_dir();
-    let state = build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let now = (state.clock)();
     state.yt_cache.lock().unwrap().insert(
         "tt0111161:en".into(),
@@ -2511,7 +2696,10 @@ async fn the_cache_sweep_drops_only_expired_entries() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     // A live answer, then enough expired junk to trip the sweep on the next insert.
-    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(!crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
     {
         let mut cache = state.yt_cache.lock().unwrap();
         for i in 0..crate::YT_CACHE_MAX {
@@ -2544,7 +2732,10 @@ async fn a_failed_title_lookup_is_not_an_answer() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
 
     fake.fail_title();
-    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en").await.ids.is_empty());
+    assert!(crate::addon::resolve_youtube_ids(&state, "k", None, "tt0111161", "movie", "en")
+        .await
+        .ids
+        .is_empty());
 
     // Past the failure cooldown but well short of a negative TTL: it must be re-asked.
     let after = fake.calls();
@@ -2613,9 +2804,7 @@ async fn meta_shortens_max_age_for_a_stand_in_answer() {
     let state = build_state_clock(temp_dir(), Box::new(fake.clone()), clock.as_fn());
     let base = spawn_server(state.clone()).await;
 
-    let cc = |r: &reqwest::Response| {
-        r.headers().get("cache-control").unwrap().to_str().unwrap().to_string()
-    };
+    let cc = |r: &reqwest::Response| r.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
 
     let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
     assert!(cc(&fresh).contains("604800"), "a fresh answer lost its long cache: {}", cc(&fresh));
@@ -2626,10 +2815,7 @@ async fn meta_shortens_max_age_for_a_stand_in_answer() {
     fake.fail_next();
     let stale = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
     let header = cc(&stale);
-    assert!(
-        !header.contains("604800"),
-        "a stand-in answer was pinned in the client for a week: {header}"
-    );
+    assert!(!header.contains("604800"), "a stand-in answer was pinned in the client for a week: {header}");
     assert!(header.contains("max-age"), "a stand-in answer lost caching entirely: {header}");
 }
 
@@ -2698,7 +2884,8 @@ async fn an_unreadable_crop_does_not_re_download_the_trailer() {
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
     cfg.ffmpeg = ff.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     seed_cache(&dir, "unreadable2", 100);
     let _ = crate::crop::handle_crop(state.clone(), "unreadable2".into()).await;
@@ -2762,7 +2949,8 @@ async fn crop_detection_is_bounded_by_the_probe_budget() {
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ffmpeg = fake.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     // More concurrent /crop calls than the probe budget allows.
     let over = crate::PROBE_CONCURRENCY + 4;
@@ -2872,8 +3060,18 @@ async fn a_cancelled_subprocess_leaves_nothing_in_the_kill_registry() {
             _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
         }
         // The child is ours and still running; its pid is its pgid (process_group(0)).
-        let out = std::process::Command::new("pgrep").arg("-f").arg(slow.to_string_lossy().as_ref()).output().unwrap();
-        let pid: u32 = String::from_utf8_lossy(&out.stdout).lines().next().expect("the fake is running").trim().parse().unwrap();
+        let out = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(slow.to_string_lossy().as_ref())
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .expect("the fake is running")
+            .trim()
+            .parse()
+            .unwrap();
         assert!(crate::ytdlp::is_group_live(pid), "a running subprocess was not registered");
         pid
         // `fut` is dropped here — the cancellation the client hangup causes.
@@ -3144,7 +3342,8 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
     cfg.ytdlp = yt.to_string_lossy().into_owned();
     cfg.ffmpeg = ff.to_string_lossy().into_owned();
     cfg.mp4box = mp.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     let err = crate::play::fetch_trailer(state.clone(), "bakevid0002".into())
         .await
@@ -3160,10 +3359,7 @@ async fn a_damaged_bake_is_not_renamed_into_the_cache() {
         err.detail.contains("bake"),
         "this asserts a blocked bake, but the failure was something else: {err:?}"
     );
-    assert!(
-        !dir.join("bakevid0002.mp4").exists(),
-        "a half-rewritten trailer was published to the cache"
-    );
+    assert!(!dir.join("bakevid0002.mp4").exists(), "a half-rewritten trailer was published to the cache");
     // ...and it has to be visible. An instance failing every download this way reported `ok`.
     assert!(
         state.local_fails.load(std::sync::atomic::Ordering::Relaxed) > 0,
@@ -3188,7 +3384,8 @@ async fn a_download_that_produces_no_file_degrades_health_locally() {
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = fake.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     let err = crate::play::fetch_trailer(state.clone(), "nofilevid01".into())
         .await
@@ -3217,7 +3414,8 @@ async fn a_produced_trailer_clears_the_local_failure_signal() {
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
     cfg.bake_clap = false;
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     state.local_fails.store(5, std::sync::atomic::Ordering::Relaxed);
 
     crate::play::fetch_trailer(state.clone(), "goodvid0001".into())
@@ -3253,7 +3451,8 @@ async fn a_failed_publish_is_local_and_visible() {
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
     cfg.bake_clap = false;
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     let err = crate::play::fetch_trailer(state.clone(), "blockedvid1".into())
         .await
@@ -3290,7 +3489,8 @@ async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
     cfg.bake_clap = false;
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     // A finished download whose file is gone: exactly what the retry is supposed to recover from.
     let gone = dir.join("evictedvid1.mp4");
@@ -3299,11 +3499,7 @@ async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
         Box::pin(async move { Ok(gone) });
     let shared = fut.shared();
     let _ = shared.clone().await; // resolve it, so it is a COMPLETED entry
-    state
-        .in_flight
-        .lock()
-        .unwrap()
-        .insert("evictedvid1".to_string(), (0, shared));
+    state.in_flight.lock().unwrap().insert("evictedvid1".to_string(), (0, shared));
 
     let resp = crate::play::handle_play(state.clone(), &hyper::HeaderMap::new(), "evictedvid1".into()).await;
     assert_eq!(
@@ -3336,7 +3532,8 @@ async fn a_flood_of_distinct_ids_cannot_grow_the_in_flight_map_without_bound() {
 
     let mut cfg = test_cfg(dir.clone());
     cfg.ytdlp = yt.to_string_lossy().into_owned();
-    let state = build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
 
     // Well past the cap, all distinct and all well-formed.
     for i in 0..(crate::IN_FLIGHT_MAX + 20) {
@@ -3374,10 +3571,7 @@ async fn a_removed_video_is_not_re_extracted_on_every_request() {
     let yt = dir.join("yt-dead");
     std::fs::write(
         &yt,
-        format!(
-            "#!/bin/sh\necho x >> {}\necho 'ERROR: Video unavailable' >&2\nexit 1\n",
-            spawns.display()
-        ),
+        format!("#!/bin/sh\necho x >> {}\necho 'ERROR: Video unavailable' >&2\nexit 1\n", spawns.display()),
     )
     .unwrap();
     std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3388,16 +3582,13 @@ async fn a_removed_video_is_not_re_extracted_on_every_request() {
     let clock = TestClock::default();
     let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
 
-    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into())
-        .await
-        .expect_err("the video is gone");
+    let err =
+        crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await.expect_err("the video is gone");
     assert_eq!(err.reason, "unavailable");
     assert_eq!(spawn_count(&spawns), 1, "the first request extracts");
 
     // Same answer, and it must cost nothing.
-    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into())
-        .await
-        .expect_err("still gone");
+    let err = crate::play::fetch_trailer(state.clone(), "deadvideo01".into()).await.expect_err("still gone");
     assert_eq!(err.reason, "unavailable", "the cached failure lost its reason");
     assert_eq!(spawn_count(&spawns), 1, "a removed video was re-extracted on the next request");
 

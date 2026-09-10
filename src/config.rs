@@ -108,9 +108,8 @@ const DEFAULT_MAX_HEIGHT: u32 = 1080;
 impl Config {
     pub fn from_env() -> Config {
         let port = env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8092);
-        let cache_dir = env_opt("CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
+        let cache_dir =
+            env_opt("CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| env::temp_dir().join("den-reel-cache"));
         let max_height = env_opt("MAX_HEIGHT").unwrap_or_else(|| DEFAULT_MAX_HEIGHT.to_string());
         // Sized to fit den's ~10 GB container volume with headroom (was 8 GB, which could fill it).
         // Floored, for the same reason MAX_HEIGHT is: a cap smaller than one trailer parses fine and
@@ -121,12 +120,9 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|b| *b >= 256 * 1024 * 1024)
             .unwrap_or(4 * 1024 * 1024 * 1024); // 4 GB
-        // Last-access TTL: evict trailers not served within CACHE_TTL_DAYS (default 14). 0 disables it.
+                                                // Last-access TTL: evict trailers not served within CACHE_TTL_DAYS (default 14). 0 disables it.
         let cache_ttl = Duration::from_secs(
-            env_opt("CACHE_TTL_DAYS")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(14)
-                * 24 * 60 * 60,
+            env_opt("CACHE_TTL_DAYS").and_then(|v| v.parse::<u64>().ok()).unwrap_or(14) * 24 * 60 * 60,
         );
         let ytdlp_cache = cache_dir.join("yt-dlp");
         let resolve_cache = cache_dir.join("state").join("resolve.json");
@@ -161,9 +157,8 @@ impl Config {
         // Unset = pass no flag = yt-dlp chooses. See the field's doc for why pinning was removed:
         // the pinned client no longer existed, and an unknown name is skipped with a warning that
         // `--no-warnings` hid.
-        let ytdlp_extractor_args = env::var("YTDLP_PLAYER_CLIENTS")
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
+        let ytdlp_extractor_args =
+            env::var("YTDLP_PLAYER_CLIENTS").map(|v| v.trim().to_string()).unwrap_or_default();
         let ytdlp_extractor_args = if ytdlp_extractor_args.is_empty() {
             None
         } else {

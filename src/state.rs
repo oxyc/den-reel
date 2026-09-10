@@ -267,14 +267,13 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     // direction: build the whole document in memory rather than stream it. The read side is the
     // larger half, because what it materialises is a HashMap and not a byte vector.
     let Ok(file) = std::fs::File::open(&cfg.resolve_cache) else { return HashMap::new() };
-    let mut parsed: HashMap<String, YtEntry> =
-        match serde_json::from_reader(std::io::BufReader::new(file)) {
-            Ok(m) => m,
-            Err(_) => {
-                eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
-                return HashMap::new();
-            }
-        };
+    let mut parsed: HashMap<String, YtEntry> = match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!("resolve cache at {} is not readable; starting empty", cfg.resolve_cache.display());
+            return HashMap::new();
+        }
+    };
     let mut kept = 0usize;
     parsed.retain(|_, e| {
         if kept >= crate::YT_CACHE_MAX {
@@ -389,8 +388,5 @@ pub fn save_resolve_cache(state: &AppState) {
 }
 
 pub fn default_clock() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

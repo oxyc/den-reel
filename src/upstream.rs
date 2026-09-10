@@ -38,8 +38,20 @@ pub trait Upstream: Send + Sync {
     /// `tmdb_key` / `kinocheck_key` are the per-request BYOK credentials (from the URL config, or the
     /// env fallback during migration) — resolved by the caller so the upstream holds no key of its own.
     /// An empty `tmdb_key` is `Ok(vec![])`: TMDB was not consulted, which is not a failure.
-    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, lang: &str) -> Answered<Vec<String>>;
-    async fn kinocheck_youtube_id(&self, kinocheck_key: Option<&str>, imdb: &str, ty: &str, lang: &str) -> Answered<Option<String>>;
+    async fn tmdb_candidates(
+        &self,
+        tmdb_key: &str,
+        imdb: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Vec<String>>;
+    async fn kinocheck_youtube_id(
+        &self,
+        kinocheck_key: Option<&str>,
+        imdb: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Option<String>>;
     /// imdb → the title (+ year, e.g. "Backrooms 2025") for a YouTube-search fallback query, or None on
     /// miss. Used only when TMDB/KinoCheck carry no trailer for the title.
     async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Answered<Option<String>>;
@@ -116,11 +128,7 @@ pub struct HttpUpstream {
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream {
-            cfg,
-            http,
-            fails: AtomicU32::new(0),
-        }
+        HttpUpstream { cfg, http, fails: AtomicU32::new(0) }
     }
 
     /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
@@ -259,24 +267,23 @@ impl Upstream for HttpUpstream {
     /// imdb → TMDB id (via /find) → /videos → ordered YouTube trailer candidates ([] on miss).
     // `_lang` is the VIEWER's language, and TMDB video selection deliberately does not use it — see
     // the `include_video_language` reasoning below. KinoCheck still does.
-    async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, _lang: &str) -> Answered<Vec<String>> {
+    async fn tmdb_candidates(
+        &self,
+        tmdb_key: &str,
+        imdb: &str,
+        ty: &str,
+        _lang: &str,
+    ) -> Answered<Vec<String>> {
         if tmdb_key.is_empty() {
             return Ok(Vec::new()); // not consulted, which is not a failure
         }
         let key = tmdb_key;
         let tmdb_type = if ty == "series" { "tv" } else { "movie" };
-        let find_url = format!(
-            "{}/find/{imdb}?external_source=imdb_id&api_key={key}",
-            self.cfg.tmdb_base
-        );
+        let find_url = format!("{}/find/{imdb}?external_source=imdb_id&api_key={key}", self.cfg.tmdb_base);
         let Some(found) = self.get_json(&find_url, &[]).await? else {
             return Ok(Vec::new());
         };
-        let results = if tmdb_type == "movie" {
-            &found["movie_results"]
-        } else {
-            &found["tv_results"]
-        };
+        let results = if tmdb_type == "movie" { &found["movie_results"] } else { &found["tv_results"] };
         let Some(hit_id) = results.get(0).and_then(|h| h["id"].as_i64()) else {
             return Ok(Vec::new());
         };
@@ -320,18 +327,13 @@ impl Upstream for HttpUpstream {
             return Ok(None); // not consulted, which is not a failure
         }
         let tmdb_type = if ty == "series" { "tv" } else { "movie" };
-        let find_url = format!(
-            "{}/find/{imdb}?external_source=imdb_id&api_key={tmdb_key}",
-            self.cfg.tmdb_base
-        );
+        let find_url =
+            format!("{}/find/{imdb}?external_source=imdb_id&api_key={tmdb_key}", self.cfg.tmdb_base);
         let Some(found) = self.get_json(&find_url, &[]).await? else {
             return Ok(None);
         };
-        let hit = if tmdb_type == "movie" {
-            found["movie_results"].get(0)
-        } else {
-            found["tv_results"].get(0)
-        };
+        let hit =
+            if tmdb_type == "movie" { found["movie_results"].get(0) } else { found["tv_results"].get(0) };
         let Some(hit) = hit else { return Ok(None) };
         // Movies carry `title` + `release_date`; TV carries `name` + `first_air_date`.
         let Some(title) = hit["title"].as_str().or_else(|| hit["name"].as_str()) else {
@@ -353,7 +355,13 @@ impl Upstream for HttpUpstream {
     }
 
     /// KinoCheck discovery fallback: imdb → official trailer's YouTube id (or None).
-    async fn kinocheck_youtube_id(&self, kinocheck_key: Option<&str>, imdb: &str, ty: &str, lang: &str) -> Answered<Option<String>> {
+    async fn kinocheck_youtube_id(
+        &self,
+        kinocheck_key: Option<&str>,
+        imdb: &str,
+        ty: &str,
+        lang: &str,
+    ) -> Answered<Option<String>> {
         let endpoint = if ty == "series" { "shows" } else { "movies" };
         let language = if lang.starts_with("de") { "de" } else { "en" };
         let url = format!(
