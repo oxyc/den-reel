@@ -206,6 +206,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         kinocheck_key: None,
         config_key: String::new(),
         config_keys_prev: String::new(),
+        revocation: Default::default(),
         play_secret: None,
         play_secrets_prev: Vec::new(),
         play_signing_grace: None,
@@ -1218,6 +1219,101 @@ async fn a_bad_config_segment_fails_closed() {
     assert_eq!(bad.status(), 400);
     let body: Value = bad.json().await.unwrap();
     assert_eq!(body["error"], "bad_config");
+}
+
+// Issue #8 R3: an install id as /configure mints it (bytes 0..16).
+const IID: &str = "AAECAwQFBgcICQoLDA0ODw";
+
+fn plain_segment(json: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+/// A state refusing the installs in `revoked` and every link stamped below `epoch`.
+fn revoking_state(revoked: &str, epoch: &str) -> Arc<AppState> {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.revocation = crate::userconfig::Revocation::from_env(revoked, Some(epoch));
+    build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["vidKey12345"], None)),
+        always_playable(),
+        noop_prewarm(),
+    )
+}
+
+/// Both config-scoped routes refuse a revoked install, with exactly the answer an undecodable segment
+/// gets. `/play` and `/crop` carry no config — a play URL names a video, not an install — so there is
+/// nothing on them for a revocation to reach.
+#[tokio::test]
+async fn a_revoked_install_is_refused_on_every_config_route() {
+    let seg = plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#));
+    let base = spawn_server(revoking_state(IID, "0")).await;
+    for route in ["manifest.json", "meta/movie/tt0111161.json", "meta/series/tt0944947.json"] {
+        let revoked = reqwest::get(format!("{base}/{seg}/{route}")).await.unwrap();
+        let garbage = reqwest::get(format!("{base}/not-a-valid-config/{route}")).await.unwrap();
+        assert_eq!(revoked.status(), 400, "{route}");
+        assert_eq!(garbage.status(), 400, "{route}");
+        let body: Value = revoked.json().await.unwrap();
+        assert_eq!(body, json!({"error": "bad_config"}), "{route}");
+        assert_eq!(body, garbage.json::<Value>().await.unwrap(), "{route}");
+    }
+    // The same install, not revoked, is served.
+    let base = spawn_server(revoking_state("", "0")).await;
+    assert_eq!(reqwest::get(format!("{base}/{seg}/manifest.json")).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn an_install_stamped_below_config_epoch_is_refused() {
+    let base = spawn_server(revoking_state("", "2")).await;
+    for (json, want) in [
+        (r#"{"tmdbKey":"k","ep":1}"#, 400u16),
+        (r#"{"tmdbKey":"k"}"#, 400), // no epoch reads as 0
+        (r#"{"tmdbKey":"k","ep":2}"#, 200),
+        (r#"{"tmdbKey":"k","ep":3}"#, 200),
+    ] {
+        let r = reqwest::get(format!("{base}/{}/manifest.json", plain_segment(json))).await.unwrap();
+        assert_eq!(r.status(), want, "{json}");
+    }
+}
+
+/// Links built before install ids existed carry neither field, and keep working until an epoch is
+/// raised.
+#[tokio::test]
+async fn a_config_without_an_install_id_works_at_epoch_zero() {
+    let base = spawn_server(revoking_state(IID, "0")).await;
+    let r =
+        reqwest::get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// /configure stamps the epoch into every link, sealed or not, so both answers carry it.
+#[tokio::test]
+async fn config_key_carries_the_config_epoch() {
+    for (key, want) in [(VEC_PRIV, 200u16), ("", 404)] {
+        let mut cfg = test_cfg(temp_dir());
+        cfg.config_key = key.into();
+        cfg.revocation = crate::userconfig::Revocation::from_env("", Some("4"));
+        let state =
+            build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+        let r = reqwest::get(format!("{}/config-key", spawn_server(state).await)).await.unwrap();
+        assert_eq!(r.status(), want);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["epoch"], 4, "{body}");
+    }
+}
+
+/// Every link the page builds names its install and the epoch it was minted in, and both are inside
+/// what gets sealed.
+#[tokio::test]
+async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let page =
+        reqwest::get(format!("{}/configure", spawn_server(state).await)).await.unwrap().text().await.unwrap();
+    assert!(page.contains("crypto.getRandomValues(bytes)"), "the install id is not minted from the CSPRNG");
+    assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
+    assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
+    assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
 }
 
 #[tokio::test]

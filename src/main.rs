@@ -496,17 +496,20 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     }
     // The current X25519 public key (base64) so /configure can seal the config to it; 404 when sealed
     // configs are disabled (no key) — the page then keeps plaintext. Five minutes, not an hour: the key
-    // rotates, and the ETag lets a revalidation after that cost nothing.
+    // rotates, and the ETag lets a revalidation after that cost nothing. Both answers carry
+    // CONFIG_EPOCH, which the page stamps into every link it builds, sealed or not: a link stamped
+    // below it would be refused the moment it was built.
     if path == "/config-key" {
+        let epoch = state.cfg.revocation.epoch();
         return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
             Some(k) if !k.is_empty() => httputil::json(
                 StatusCode::OK,
-                &serde_json::json!({"key": k}),
+                &serde_json::json!({"key": k, "epoch": epoch}),
                 &[("cache-control", "public, max-age=300")],
             ),
             _ => httputil::json(
                 StatusCode::NOT_FOUND,
-                &serde_json::json!({"error": "no_key"}),
+                &serde_json::json!({"error": "no_key", "epoch": epoch}),
                 &[("cache-control", "no-store")],
             ),
         };
@@ -524,15 +527,28 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
     if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
         if rest == "manifest.json" || rest.starts_with("meta/") {
-            let cfg = match userconfig::decode(state.config_keyring.as_ref(), cfg_seg) {
-                Some(c) => c,
-                None => {
+            let cfg = match userconfig::decode_checked(
+                state.config_keyring.as_ref(),
+                &state.cfg.revocation,
+                cfg_seg,
+            ) {
+                Ok(c) => c,
+                Err(why) => {
                     // Say something. A key rolled out of CONFIG_KEYS_PREV makes every install
                     // 400 at once, and this path logged nothing at all — leaving the operator to
                     // guess. Length only: the segment carries the key. Once a minute, because that
-                    // is also every request those installs make.
-                    log_limited("bad_config", || {
-                        format!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len())
+                    // is also every request those installs make. A revoked install gets the same
+                    // 400 as an undecodable one; this line is the only place the two differ.
+                    let condition = match why {
+                        userconfig::Rejected::Undecodable => "bad_config",
+                        userconfig::Rejected::Revoked { .. } => "install_revoked",
+                        userconfig::Rejected::EpochTooOld { .. } => "install_epoch_too_old",
+                    };
+                    log_limited(condition, || match why {
+                        userconfig::Rejected::Undecodable => {
+                            format!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len())
+                        }
+                        refused => format!("bad_config: {rest} refused — {refused}"),
                     });
                     return httputil::json(
                         StatusCode::BAD_REQUEST,
@@ -750,12 +766,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
-        "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} play_signing={} \
-         env_tmdb_key={} cache={cache_disp} max_height={max_h}",
+        "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
+         play_signing={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
         env!("CARGO_PKG_VERSION"),
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
         on(state.config_keyring.is_some()),
+        state.cfg.revocation.revoked_count(),
+        state.cfg.revocation.epoch(),
         play_signing_state(&state.cfg, (state.clock)()),
         on(state.cfg.tmdb_key.is_some()),
     );

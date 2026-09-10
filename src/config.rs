@@ -2,6 +2,7 @@
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_SECS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
+//!      REVOKED_INSTALLS / CONFIG_EPOCH (refuse one install, or every link stamped before an epoch);
 //!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
 //!      PLAY_SIGNING_GRACE_UNTIL (still serve unsigned URLs until then, while turning signing on);
 //!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response).
@@ -46,6 +47,10 @@ pub struct Config {
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
     pub config_keys_prev: String,
+    /// Installs refused outright (`REVOKED_INSTALLS`) and the oldest config epoch still admitted
+    /// (`CONFIG_EPOCH`). See `userconfig::Revocation`. Only the config-scoped routes read it: a
+    /// `/play` or `/crop` URL names a video, not an install, so there is nothing there to refuse.
+    pub revocation: crate::userconfig::Revocation,
     /// `PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
     /// require the signature (see `sign.rs`). `None` disables it, which is the default and has to
     /// be: `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
@@ -301,6 +306,10 @@ impl Config {
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
+            revocation: crate::userconfig::Revocation::from_env(
+                &env_opt("REVOKED_INSTALLS").unwrap_or_default(),
+                env_opt("CONFIG_EPOCH").as_deref(),
+            ),
             play_secret,
             play_secrets_prev: env_opt("PLAY_SECRETS_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
