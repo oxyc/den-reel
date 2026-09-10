@@ -1,6 +1,6 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
-//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
+//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_SECS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
 //!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
 //!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response).
@@ -28,7 +28,7 @@ pub struct Config {
     pub cache_max_bytes: u64,
     /// Last-access TTL: a cached trailer not served within this window is evicted regardless of the
     /// size cap. atime is bumped on every serve, so a rewatched trailer keeps a fresh timestamp and
-    /// survives; only genuinely-stale ones age out. `CACHE_TTL_DAYS=0` disables it (size cap only).
+    /// survives; only genuinely-stale ones age out. `CACHE_TTL_SECS=0` disables it (size cap only).
     pub cache_ttl: Duration,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
     pub ytdlp_cache: PathBuf,
@@ -133,9 +133,9 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .filter(|b| *b >= 256 * 1024 * 1024)
             .unwrap_or(4 * 1024 * 1024 * 1024); // 4 GB
-                                                // Last-access TTL: evict trailers not served within CACHE_TTL_DAYS (default 14). 0 disables it.
+                                                // Last-access TTL: evict trailers not served within CACHE_TTL_SECS (default 14 days). 0 disables it.
         let cache_ttl = Duration::from_secs(
-            env_opt("CACHE_TTL_DAYS").and_then(|v| v.parse::<u64>().ok()).unwrap_or(14) * 24 * 60 * 60,
+            env_opt("CACHE_TTL_SECS").and_then(|v| v.parse::<u64>().ok()).unwrap_or(14 * 24 * 60 * 60),
         );
         let ytdlp_cache = cache_dir.join("yt-dlp");
         let resolve_cache = cache_dir.join("state").join("resolve.json");

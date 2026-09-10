@@ -390,7 +390,9 @@ pub async fn handle_meta(
         // grounds that a block can lift; a week in the client's cache defeats exactly that.
         &[("cache-control", "public, max-age=3600")]
     } else if has_link {
-        &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400")]
+        // stale-if-error: a restart or an outage here should not blank a trailer the client already
+        // holds. Only on this branch — the stale and demoted answers above must not outlive their hour.
+        &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400, stale-if-error=86400")]
     } else {
         &[("cache-control", "no-store")]
     };

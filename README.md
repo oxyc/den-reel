@@ -151,7 +151,7 @@ so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see th
 `/play` failures return a real status + JSON so the caller can say *why*:
 
 ```
-451 {"error":"geo_blocked","message":"This trailer is not available in your region.","id":…}
+451 {"error":"geo_blocked","detail":"This trailer is not available in your region.","id":…}
 403 {"error":"restricted", …}   # private / age-restricted
 404 {"error":"unavailable", …}  # removed
 503 {"error":"busy", …}           # IN_FLIGHT_MAX distinct ids already downloading
@@ -203,7 +203,7 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 | `CLAP` | `1` | set `0`/`false`/`off`/`no` to disable baking the `clap` letterbox-crop box |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube; below 144 (no rendition can match) it falls back to the default |
 | `CACHE_MAX_BYTES` | `4294967296` (4 GB) | LRU eviction threshold; below 256 MB (under one trailer) it falls back to the default |
-| `CACHE_TTL_DAYS` | `14` | Drop a trailer this long after it was last served |
+| `CACHE_TTL_SECS` | `1209600` (14 days) | Drop a trailer this many seconds after it was last served; `0` = size cap only |
 | `YTDLP_PLAYER_CLIENTS` | *(unset — yt-dlp chooses)* | Pin the YouTube innertube client(s) for `--extractor-args player_client`, comma-separated. **Normally leave this alone.** It used to default to `tv_embedded,android`; yt-dlp has since retired `tv_embedded`, and an unrecognised client is answered with a *warning* (`Skipping unsupported client`) that `--no-warnings` hides — so the pin silently degraded to `android` alone, which now needs a PO token for both HTTPS and DASH. Which client works is a judgement about what YouTube is enforcing this month, it is the judgement the yt-dlp team makes daily, and bumping `YTDLP_VERSION` is how we receive it. Set this only to ride out a specific outage, and check the name against the yt-dlp release you have pinned — a retired one fails quietly. |
 
 ## Run

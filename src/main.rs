@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
@@ -204,15 +204,17 @@ fn health_verdict(
 }
 
 /// May this request read `/metrics`? Only when a token is configured and the request presents it as
-/// `Authorization: Bearer <token>`. Compared in constant time, so a caller cannot recover the token
-/// a byte at a time from how long a refusal took.
+/// `Authorization: Bearer <token>` — the prefix required, the token trimmed, as every Den addon reads
+/// it. Compared in constant time, so a caller cannot recover the token a byte at a time from how
+/// long a refusal took.
 fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
     use subtle::ConstantTimeEq;
     let Some(token) = state.cfg.metrics_token.as_deref() else { return false };
     let presented = headers
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
     presented.is_some_and(|p| p.as_bytes().ct_eq(token.as_bytes()).into())
 }
 
@@ -284,11 +286,7 @@ fn metrics_body(state: &AppState) -> String {
         "Outstanding ids past which /play answers 503 busy.",
         &[("", IN_FLIGHT_MAX as u64)],
     );
-    gauge(
-        "reel_downloads_concurrency_limit",
-        "Downloads that may run at once.",
-        &[("", DOWNLOAD_CONCURRENCY as u64)],
-    );
+    gauge("reel_downloads_max", "Downloads that may run at once.", &[("", DOWNLOAD_CONCURRENCY as u64)]);
     gauge(
         "reel_prewarm_permits_available",
         "Speculative downloads that could start now.",
@@ -343,12 +341,20 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("access-control-allow-origin", "*")
-            .header("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
+            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
             .header("access-control-allow-headers", "*")
             // A day, so a browser stops preflighting every request.
             .header("access-control-max-age", "86400")
             .body(httputil::full(""))
             .unwrap()
+    } else if !matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
+        // Every route here is a read. Routing on the path alone meant a POST to /play started a
+        // download like a GET would.
+        httputil::json(
+            StatusCode::METHOD_NOT_ALLOWED,
+            &serde_json::json!({"error": "method_not_allowed"}),
+            &[("allow", "GET, HEAD, OPTIONS"), ("cache-control", "no-store")],
+        )
     } else {
         let resp = route(state, &parts).await;
         // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
@@ -458,16 +464,21 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     }
     // The /configure UI seals a BYOK TMDB key into the install URL (den-scout/docs/SEALED-CONFIG.md).
     if path == "/" || path == "/configure" || path == "/configure/" {
-        return httputil::html(StatusCode::OK, CONFIGURE_PAGE, &[("cache-control", "public, max-age=3600")]);
+        return httputil::html(
+            StatusCode::OK,
+            CONFIGURE_PAGE,
+            &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
+        );
     }
     // The current X25519 public key (base64) so /configure can seal the config to it; 404 when sealed
-    // configs are disabled (no key) — the page then keeps plaintext.
+    // configs are disabled (no key) — the page then keeps plaintext. Five minutes, not an hour: the key
+    // rotates, and the ETag lets a revalidation after that cost nothing.
     if path == "/config-key" {
         return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
             Some(k) if !k.is_empty() => httputil::json(
                 StatusCode::OK,
                 &serde_json::json!({"key": k}),
-                &[("cache-control", "public, max-age=3600")],
+                &[("cache-control", "public, max-age=300")],
             ),
             _ => httputil::json(
                 StatusCode::NOT_FOUND,
@@ -547,7 +558,13 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     }
     let vid = match vid {
         Some(v) if is_valid_vid(&v) => v,
-        _ => return httputil::text(StatusCode::BAD_REQUEST, "bad video id"),
+        _ => {
+            return httputil::error(
+                StatusCode::BAD_REQUEST,
+                "bad_video_id",
+                "Expected an 11-character YouTube id.",
+            )
+        }
     };
     if !signature_ok(&state, &vid, query) {
         return bad_signature();
@@ -574,7 +591,7 @@ fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
 fn bad_signature() -> Response<Body> {
     httputil::json(
         StatusCode::FORBIDDEN,
-        &serde_json::json!({"error": "bad_signature", "message": "This trailer URL is not signed for this server."}),
+        &serde_json::json!({"error": "bad_signature", "detail": "This trailer URL is not signed for this server."}),
         &[("cache-control", "no-store")],
     )
 }
@@ -607,7 +624,6 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         );
     }
     let port = cfg.port;
-    let addon_on = cfg.tmdb_key.is_some();
     let cache_disp = cfg.cache_dir.display().to_string();
     let max_h = cfg.max_height.clone();
 
@@ -647,22 +663,32 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    eprintln!(
-        "den-reel {} listening on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
-        env!("CARGO_PKG_VERSION"),
-        if addon_on { "on" } else { "off \u{2014} set TMDB_KEY" }
-    );
-
-    // Built ONCE, before serving. Constructing it per accept dropped the Signal each time accept()
-    // won the select, and tokio's signal subscribes at the current watch version — so a SIGTERM
-    // delivered while no Signal existed was simply not seen by the next one.
+    // Built ONCE, before serving — and before the startup line, since until the handlers are
+    // registered SIGTERM keeps its default disposition and a stop in that window killed the process
+    // outright. Constructing it per accept dropped the Signal each time accept() won the select, and
+    // tokio's signal subscribes at the current watch version — so a SIGTERM delivered while no
+    // Signal existed was simply not seen by the next one.
     //
     // A redeploy sends SIGTERM. Without handling it the process is killed outright: every in-flight
     // subprocess keeps running in its own process group, and the partial files it was writing sit on
     // the cache volume — invisible to the size cap and unreclaimable until the sweep's 30-minute
     // grace, under a pid that no longer exists.
-    serve_until(listener, state.clone(), shutdown_signal(), DRAIN_GRACE).await;
+    let shutdown = shutdown_signal();
+
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let on = |b: bool| if b { "on" } else { "off" };
+    eprintln!(
+        "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} play_signing={} \
+         env_tmdb_key={} cache={cache_disp} max_height={max_h}",
+        env!("CARGO_PKG_VERSION"),
+        on(state.cfg.metrics_token.is_some()),
+        on(state.cfg.log_requests),
+        on(state.config_keyring.is_some()),
+        on(state.cfg.play_secret.is_some()),
+        on(state.cfg.tmdb_key.is_some()),
+    );
+
+    let drained = serve_until(listener, state.clone(), shutdown, DRAIN_GRACE, HEADER_READ_TIMEOUT).await;
 
     // In-flight responses have finished, or run out of time.
     //
@@ -678,6 +704,9 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     }
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     state::save_resolve_cache(&state);
+    if drained {
+        eprintln!("shut down cleanly");
+    }
     Ok(())
 }
 
@@ -686,8 +715,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
 /// has reached the box.
 const DRAIN_GRACE: Duration = Duration::from_secs(8);
 
-/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`. Before
-/// this, SIGTERM stopped the loop and returned at once, cutting every response mid-stream.
+/// How long a client may take to send a request head. Without it a connection that sends half a
+/// head and goes quiet is held open for as long as the client likes — and at a stop, holds the drain
+/// until the deadline.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`; `true`
+/// when they all did. Before this, SIGTERM stopped the loop and returned at once, cutting every
+/// response mid-stream.
 ///
 /// The bound is the point: a graceful shutdown waits for every connection, and a client that sends
 /// half a request head and stops — or a /play parked on a download that has minutes left — would
@@ -697,7 +732,8 @@ async fn serve_until(
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
-) {
+    header_timeout: Duration,
+) -> bool {
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
     loop {
@@ -722,7 +758,10 @@ async fn serve_until(
             let state = state.clone();
             async move { Ok::<_, Infallible>(handle_request(state, req).await) }
         });
-        let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(header_timeout)
+            .serve_connection(TokioIo::new(stream), service);
         let conn = graceful.watch(conn);
         // A client hanging up mid-response is normal; don't log it.
         tokio::spawn(async move {
@@ -730,36 +769,66 @@ async fn serve_until(
         });
     }
     drop(listener);
-    eprintln!("shutting down — draining in-flight requests");
     tokio::select! {
-        _ = graceful.shutdown() => {}
+        _ = graceful.shutdown() => true,
         _ = tokio::time::sleep(grace) => {
             eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
+            false
         }
     }
 }
 
-/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal). On a platform without unix signals only
-/// ctrl-c is available, which is what a dev run sends anyway.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("cannot listen for SIGTERM ({e}); a redeploy will strand in-flight work");
-                return std::future::pending().await;
-            }
-        };
+/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal).
+///
+/// Both are registered NOW, by the caller, not lazily when the future is first polled — polling
+/// starts once the server is already accepting, and until then SIGTERM keeps its default
+/// disposition. They are registered independently, so one failing does not discard the other.
+fn shutdown_signal() -> impl Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
         tokio::select! {
-            _ = term.recv() => {},
-            _ = tokio::signal::ctrl_c() => {},
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
+        }
+        // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
+        // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C would
+        // be caught and discarded, and an operator could not get out of the drain short of SIGKILL.
+        // Exit 0: asking twice is a deliberate choice, not a failure.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            eprintln!("second signal — exiting without finishing the drain");
+            std::process::exit(0);
+        });
+    }
+}
+
+/// Resolve when this signal arrives, or never if it could not be registered — returning at once
+/// would stop the server the moment it started, so an unregisterable signal stays a hard kill.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            eprintln!("{name} — draining in-flight requests");
+        }
+        Err(e) => {
+            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Like `wait_for`, but says nothing — for a caller that prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
     }
 }
 

@@ -468,7 +468,8 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
 /// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
 async fn start_serve(
     grace: std::time::Duration,
-) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    header_timeout: std::time::Duration,
+) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state =
@@ -477,12 +478,28 @@ async fn start_serve(
     let stop = async move {
         let _ = rx.await;
     };
-    (addr, tx, tokio::spawn(crate::serve_until(listener, state, stop, grace)))
+    (addr, tx, tokio::spawn(crate::serve_until(listener, state, stop, grace, header_timeout)))
+}
+
+/// A client that opens a socket and dribbles half a request head is dropped once the head is overdue,
+/// rather than holding a connection (and, at a stop, the drain) for as long as it likes.
+#[tokio::test]
+async fn a_request_head_that_never_finishes_is_dropped() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (addr, _stop, _server) =
+        start_serve(std::time::Duration::from_secs(5), std::time::Duration::from_millis(200)).await;
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), sock.read_to_end(&mut rest))
+        .await
+        .expect("a half-sent request head held its connection open")
+        .ok();
 }
 
 #[tokio::test]
 async fn an_idle_server_stops_at_once() {
-    let (_, stop, server) = start_serve(std::time::Duration::from_secs(5)).await;
+    let (_, stop, server) = start_serve(std::time::Duration::from_secs(5), crate::HEADER_READ_TIMEOUT).await;
     stop.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), server)
         .await
@@ -495,7 +512,8 @@ async fn an_idle_server_stops_at_once() {
 #[tokio::test]
 async fn a_half_sent_request_cannot_hold_the_stop_open() {
     use tokio::io::AsyncWriteExt;
-    let (addr, stop, server) = start_serve(std::time::Duration::from_millis(300)).await;
+    let (addr, stop, server) =
+        start_serve(std::time::Duration::from_millis(300), crate::HEADER_READ_TIMEOUT).await;
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
     sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
     tokio::time::sleep(std::time::Duration::from_millis(50)).await; // let the server accept it first
@@ -556,8 +574,42 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
         has(&body, &format!("reel_cache_free_bytes {}", state.cfg.cache_max_bytes - 4096)),
         "free space must account for what trailers already hold"
     );
-    assert!(has(&body, &format!("reel_downloads_concurrency_limit {}", crate::DOWNLOAD_CONCURRENCY)));
+    assert!(has(&body, &format!("reel_downloads_max {}", crate::DOWNLOAD_CONCURRENCY)));
     assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
+}
+
+/// The fleet reads the token one way: `Bearer ` required, the rest trimmed. A bare token is a refusal,
+/// answered like any unknown path.
+#[tokio::test]
+async fn metrics_wants_the_bearer_prefix_and_trims_the_token() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let with = |auth: &'static str| {
+        reqwest::Client::new().get(format!("{base}/metrics")).header("authorization", auth).send()
+    };
+    assert_eq!(with("scrape-me").await.unwrap().status(), 404, "a bare token was accepted");
+    assert_eq!(with("Bearer  scrape-me").await.unwrap().status(), 200, "the token was not trimmed");
+}
+
+/// Every route is a read, so anything but GET/HEAD/OPTIONS is refused before routing — a POST to
+/// /play must not start a download.
+#[tokio::test]
+async fn an_unsafe_method_is_405_before_any_route_runs() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid09", 100);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for path in ["/play/cachedVid09.mp4", "/health", "/nope"] {
+        let r = reqwest::Client::new().post(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 405, "{path}");
+        assert_eq!(r.headers()["cache-control"], "no-store", "{path}");
+        assert_eq!(r.headers()["allow"], "GET, HEAD, OPTIONS", "{path}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "method_not_allowed", "{path}");
+    }
 }
 
 async fn scrape_metrics(base: &str, token: Option<&str>) -> reqwest::Response {
@@ -624,7 +676,7 @@ async fn options_is_a_cors_preflight_on_any_path() {
         assert_eq!(r.status(), 204, "{path}");
         let h = r.headers();
         assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
-        assert_eq!(h.get("access-control-allow-methods").unwrap(), "GET, HEAD, POST, OPTIONS");
+        assert_eq!(h.get("access-control-allow-methods").unwrap(), "GET, HEAD, OPTIONS");
         assert_eq!(h.get("access-control-allow-headers").unwrap(), "*");
         assert_eq!(h.get("access-control-max-age").unwrap(), "86400");
     }
@@ -1107,6 +1159,30 @@ async fn play_with_range_is_206() {
     assert_eq!(r.headers().get("accept-ranges").unwrap(), "bytes");
 }
 
+/// A plain GET revalidating a cached trailer gets a 304, not the whole file again — but a Range
+/// request carrying the same validator still gets its bytes, or a player seek would read nothing.
+#[tokio::test]
+async fn play_revalidation_is_304_but_a_range_still_gets_its_bytes() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid03", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/play/cachedVid03.mp4");
+    let etag = client.get(&url).send().await.unwrap().headers().get("etag").unwrap().clone();
+
+    let again = client.get(&url).header("if-none-match", etag.clone()).send().await.unwrap();
+    assert_eq!(again.status(), 304);
+    assert_eq!(again.headers().get("etag").unwrap(), &etag);
+    assert!(again.headers().get("cache-control").unwrap().to_str().unwrap().contains("immutable"));
+    assert!(again.bytes().await.unwrap().is_empty());
+
+    let ranged =
+        client.get(&url).header("if-none-match", etag).header("range", "bytes=0-99").send().await.unwrap();
+    assert_eq!(ranged.status(), 206);
+    assert_eq!(ranged.bytes().await.unwrap().len(), 100);
+}
+
 // --- cropdetect parsing ---
 
 #[test]
@@ -1421,16 +1497,31 @@ async fn cache_available_reflects_dir_usability() {
     assert!(crate::play::cache_available(&cfg_ok).await, "a working volume must still be usable");
 }
 
-#[test]
-fn error_responses_are_no_store() {
+#[tokio::test]
+async fn error_responses_are_no_store_json() {
+    use http_body_util::BodyExt;
     let e = crate::httputil::error(hyper::StatusCode::SERVICE_UNAVAILABLE, "cache_unavailable", "x");
     assert_eq!(e.headers().get("cache-control").unwrap(), "no-store");
-    // 404 text path too.
-    let t = crate::httputil::text(hyper::StatusCode::NOT_FOUND, "not found");
+    assert_eq!(e.headers().get("content-type").unwrap(), "application/json");
+    let body: serde_json::Value =
+        serde_json::from_slice(&e.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body, json!({"error": "cache_unavailable", "detail": "x"}));
+    // The 404 too.
+    let t = crate::httputil::not_found();
     assert_eq!(t.headers().get("cache-control").unwrap(), "no-store");
-    // ...but a 2xx isn't forced to no-store.
-    let ok = crate::httputil::text(hyper::StatusCode::OK, "ok");
-    assert!(ok.headers().get("cache-control").is_none());
+}
+
+/// A malformed id was a plain-text 400; it is the same JSON shape as every other refusal now.
+#[tokio::test]
+async fn a_bad_video_id_is_a_json_400() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let r = reqwest::get(format!("{base}/play?v=short")).await.unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "bad_video_id");
 }
 
 #[test]
@@ -3975,7 +4066,7 @@ async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
 
     assert_eq!(
         resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("public, max-age=604800, stale-while-revalidate=86400"),
+        Some("public, max-age=604800, stale-while-revalidate=86400, stale-if-error=86400"),
         "a response the demotion never touched lost six days of cacheability"
     );
     let body: serde_json::Value = resp.json().await.unwrap();

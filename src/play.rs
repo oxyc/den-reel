@@ -265,7 +265,7 @@ pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
     }
     // TTL pass: drop anything not accessed within cache_ttl, independent of the size cap. atime is
     // bumped on every serve (touch_atime), so a rewatched trailer keeps a fresh timestamp and survives;
-    // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_DAYS=0) disables it.
+    // only genuinely-stale ones age out. cache_ttl == 0 (CACHE_TTL_SECS=0) disables it.
     if !cfg.cache_ttl.is_zero() {
         if let Some(cutoff) = SystemTime::now().checked_sub(cfg.cache_ttl) {
             files.retain(|(p, _size, atime)| {
@@ -872,7 +872,7 @@ fn remaining_fail_ms(state: &AppState, vid: &str) -> Option<u64> {
 /// 5h59m of a 6h window to wait another six hours: up to twice the real cooldown, and unbounded if
 /// it keeps polling. The remainder is right there in the entry, so use it.
 fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response<Body> {
-    let body = serde_json::json!({ "error": e.reason, "message": e.message, "id": vid });
+    let body = serde_json::json!({ "error": e.reason, "detail": e.message, "id": vid });
     // No entry means nothing is being cached for this id, so the full TTL is the honest estimate of
     // when asking again could help. Never zero: a client reading `Retry-After: 0` will come straight
     // back, which is the one answer that is never useful here.
@@ -927,5 +927,5 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
             drop_if_finished(&state, &vid);
         }
     }
-    httputil::text(StatusCode::INTERNAL_SERVER_ERROR, "serve failed")
+    httputil::error(StatusCode::INTERNAL_SERVER_ERROR, "serve_failed", "The trailer could not be served.")
 }

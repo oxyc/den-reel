@@ -1,10 +1,10 @@
-//! Tiny HTTP plumbing shared by the handlers: a unified response-body type, JSON/text/error
+//! Tiny HTTP plumbing shared by the handlers: a unified response-body type, JSON/HTML/error
 //! response builders, and hand-rolled query/percent-decode helpers (no url/regex dependency).
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{HeaderMap, HeaderValue, ACCEPT_RANGES, CACHE_CONTROL, ETAG, IF_NONE_MATCH, RANGE};
+use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_NONE_MATCH, RANGE};
 use hyper::{Method, Response, StatusCode};
 
 /// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can
@@ -110,18 +110,10 @@ pub fn not_found() -> Response<Body> {
     json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), &[("cache-control", "no-store")])
 }
 
-/// A typed error body `{ "error": <code>, "message": <msg> }` (no-store applied via `json`).
-pub fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
-    json(status, &serde_json::json!({ "error": code, "message": message }), &[])
-}
-
-/// Plain-text response (health, bad-request bodies). Non-2xx get `Cache-Control: no-store`.
-pub fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
-    let mut b = Response::builder().status(status).header("content-length", msg.len());
-    if !status.is_success() {
-        b = b.header("cache-control", "no-store");
-    }
-    b.body(full(msg)).unwrap()
+/// A typed error body `{ "error": <code>, "detail": <text> }` — the shape every Den addon answers
+/// with (no-store applied via `json`).
+pub fn error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
+    json(status, &serde_json::json!({ "error": code, "detail": detail }), &[])
 }
 
 /// Honor a conditional GET/HEAD: if the request's `If-None-Match` matches the response's `ETag`,
@@ -132,13 +124,11 @@ pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Respons
     if !matches!(*method, Method::GET | Method::HEAD) {
         return resp;
     }
-    // Never collapse a range-able resource (e.g. the `/play` video, which advertises `Accept-Ranges`),
-    // a partial/non-200, or a `Range` request to a bare `304`: a range request must get its bytes, not
-    // an empty body — a 304 there silently breaks player seeks. Such responses still get HEAD-stripped.
-    if resp.status() != StatusCode::OK
-        || resp.headers().contains_key(ACCEPT_RANGES)
-        || req_headers.contains_key(RANGE)
-    {
+    // Never collapse a partial/non-200 or a `Range` request to a bare `304`: a range request must get
+    // its bytes, not an empty body — a 304 there silently breaks player seeks. Such responses still
+    // get HEAD-stripped. A plain GET of the `/play` video DOES collapse: its ETag is stable for the
+    // cached file, and a revalidation that re-sent the whole trailer was tens of megabytes for nothing.
+    if resp.status() != StatusCode::OK || req_headers.contains_key(RANGE) {
         return head_stripped(method, resp);
     }
     let Some(etag) = resp.headers().get(ETAG) else {
