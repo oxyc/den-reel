@@ -87,6 +87,12 @@ COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
 RUN ldconfig
 COPY --from=build /src/target/release/den-reel /usr/local/bin/den-reel
 
+# Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532), so the box chowns
+# one uid for every writable host dir. A real account rather than a bare number: deno keeps its cache
+# under $HOME. /cache is created owned by it, so a fresh volume mounted there is writable too.
+RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/nonroot nonroot \
+    && mkdir -p /cache && chown nonroot:nonroot /cache
+
 WORKDIR /app
 ENV PORT=8092 \
     CACHE_DIR=/cache \
@@ -95,6 +101,7 @@ ENV PORT=8092 \
 VOLUME ["/cache"]
 EXPOSE 8092
 
-# The binary self-checks (no curl needed on the health path). start-period covers cold startup.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD ["den-reel", "healthcheck"]
+# No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake. Health is checked when it
+# matters — by the deploy (den/deploy/den-update.sh), against /health and /manifest.json over HTTP.
+USER 65532:65532
 CMD ["den-reel"]
