@@ -110,6 +110,44 @@ pub fn is_valid_vid(id: &str) -> bool {
     id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// How often one failure condition may write a line.
+const LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Log a failure at most once per `LOG_EVERY` per `condition`, saying how many were held back since
+/// the last line. The log is for state changes: in an outage every lookup and every download fails
+/// the same way, and one line a minute says so as well as a thousand.
+///
+/// No timer. A held-back count is reported when the condition next occurs after its window, and a
+/// condition that has stopped occurring has nothing left to say. `line` is only built when it is
+/// written. Conditions are a closed set — an upstream and a status, a failure reason — so the list
+/// stays a handful long.
+pub fn log_limited(condition: &str, line: impl FnOnce() -> String) {
+    static SEEN: std::sync::Mutex<Vec<(String, std::time::Instant, u32)>> = std::sync::Mutex::new(Vec::new());
+    let now = std::time::Instant::now();
+    let held = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.iter_mut().find(|(c, _, _)| c == condition) {
+            Some((_, at, held)) if now.duration_since(*at) < LOG_EVERY => {
+                *held += 1;
+                return;
+            }
+            Some((_, at, held)) => {
+                *at = now;
+                std::mem::take(held)
+            }
+            None => {
+                seen.push((condition.to_string(), now, 0));
+                0
+            }
+        }
+    };
+    // Written after the lock is released: stderr is a pipe someone else drains.
+    match held {
+        0 => eprintln!("{}", line()),
+        n => eprintln!("{} ({n} more like it since the last line)", line()),
+    }
+}
+
 /// Consecutive hard upstream faults before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
 
@@ -124,22 +162,44 @@ fn health_body(
     extract_fails: u32,
     local_fails: u32,
 ) -> serde_json::Value {
+    match health_verdict(tmdb_available, recent_failures, extract_fails, local_fails) {
+        Some((reason, detail)) => {
+            serde_json::json!({"status": "degraded", "reason": reason, "detail": detail})
+        }
+        None => serde_json::json!({"status": "ok"}),
+    }
+}
+
+/// The /health verdict: `None` when ok, else its reason and detail. Shared by the body above and by
+/// the line `AppState::note_health` writes when the verdict changes.
+fn health_verdict(
+    tmdb_available: bool,
+    recent_failures: u32,
+    extract_fails: u32,
+    local_fails: u32,
+) -> Option<(&'static str, &'static str)> {
     if !tmdb_available {
-        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
+        Some(("tmdb_key_missing", "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"))
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
-        serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
+        Some(("upstream_unavailable", "TMDB has been failing"))
     } else if extract_fails >= HEALTH_FAIL_THRESHOLD {
         // Trailers resolve upstream but yt-dlp can't extract any of them here — YouTube BotGuard or a
         // stale yt-dlp / broken nsig-JS runtime. Bumping YTDLP_VERSION is the fix that usually works,
         // and is named FIRST on purpose: pinning a client with YTDLP_PLAYER_CLIENTS is the advice that
         // produced a dead client name silently degrading extraction for who knows how long.
-        serde_json::json!({"status": "degraded", "reason": "extractor_unavailable", "detail": "yt-dlp can't extract YouTube here — bump YTDLP_VERSION first; pin YTDLP_PLAYER_CLIENTS only as a stopgap"})
+        Some((
+            "extractor_unavailable",
+            "yt-dlp can't extract YouTube here — bump YTDLP_VERSION first; pin YTDLP_PLAYER_CLIENTS only as a stopgap",
+        ))
     } else if local_fails >= HEALTH_FAIL_THRESHOLD {
         // Downloads are failing for a reason that is ours, not YouTube's — no output file, or a
         // clap bake killed part-way. Named separately because "bump yt-dlp" is the wrong advice.
-        serde_json::json!({"status": "degraded", "reason": "downloads_failing", "detail": "yt-dlp extracts fine but no trailer file is being produced — check the cache volume and MP4Box"})
+        Some((
+            "downloads_failing",
+            "yt-dlp extracts fine but no trailer file is being produced — check the cache volume and MP4Box",
+        ))
     } else {
-        serde_json::json!({"status": "ok"})
+        None
     }
 }
 
@@ -352,10 +412,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
         // no server TMDB key AND no sealed-config keyring, or TMDB failing. KinoCheck is a
         // fallback: its outage does not mean trailers are broken, so it does not move this.
-        let tmdb_available = state.cfg.tmdb_key.is_some() || state.config_keyring.is_some();
-        let extract_fails = state.extract_fails.load(std::sync::atomic::Ordering::Relaxed);
-        let local_fails = state.local_fails.load(std::sync::atomic::Ordering::Relaxed);
-        let body = health_body(tmdb_available, state.upstream.recent_failures(), extract_fails, local_fails);
+        let (tmdb_available, recent_failures, extract_fails, local_fails) = state.health_inputs();
+        let body = health_body(tmdb_available, recent_failures, extract_fails, local_fails);
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     // Operational detail /health has no room for. /health answers one question — can this instance
@@ -429,8 +487,11 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 None => {
                     // Say something. A key rolled out of CONFIG_KEYS_PREV makes every install
                     // 400 at once, and this path logged nothing at all — leaving the operator to
-                    // guess. Length only: the segment carries the key.
-                    eprintln!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len());
+                    // guess. Length only: the segment carries the key. Once a minute, because that
+                    // is also every request those installs make.
+                    log_limited("bad_config", || {
+                        format!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len())
+                    });
                     return httputil::json(
                         StatusCode::BAD_REQUEST,
                         &serde_json::json!({"error": "bad_config"}),
@@ -545,6 +606,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
 
     let state = AppState::new(cfg);
     let cfg_for_shutdown = state.cfg.clone();
+    // A verdict that is degraded from the start — no discovery key at all — is said once, here.
+    state.note_health();
 
     // Pick up where the last process left off. A resolve is a TMDB round-trip per title, and a
     // redeploy otherwise makes the next browse pay for every title on screen again.
@@ -579,7 +642,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     eprintln!(
-        "listening on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
+        "den-reel {} listening on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
+        env!("CARGO_PKG_VERSION"),
         if addon_on { "on" } else { "off \u{2014} set TMDB_KEY" }
     );
 
@@ -636,7 +700,7 @@ async fn serve_until(
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("accept: {e}");
+                    log_limited("accept", || format!("accept: {e}"));
                     continue;
                 }
             },

@@ -223,8 +223,7 @@ pub async fn resolve_youtube_ids(
         // the empty result below is not an answer either.
         search_failed = title.is_err();
         if let Ok(Some(title)) = title {
-            let query = format!("{title} trailer");
-            match (state.searcher)(query.clone()).await {
+            match (state.searcher)(format!("{title} trailer")).await {
                 Some(found) => {
                     for c in found {
                         if seen.insert(c.clone()) {
@@ -232,10 +231,6 @@ pub async fn resolve_youtube_ids(
                         }
                     }
                     ids.truncate(MAX_PROBE);
-                    eprintln!(
-                        "trailer {imdb} ({ty}/{lang}): no candidates → search {query:?} → {} result(s)",
-                        ids.len()
-                    );
                 }
                 // The third source has the same two-failures-one-value problem as the other two: a
                 // broken yt-dlp returned the same empty list as "YouTube has nothing".
@@ -246,16 +241,10 @@ pub async fn resolve_youtube_ids(
         timing.push_str(", ");
         timing.push_str(&httputil::timing("search", search_started.elapsed()));
     }
-    // A title with no trailer at all is a normal empty (short-cached), not an extraction failure.
-    if ids.is_empty() {
-        // Two different failures, and the log used to call both the second one: if `tmdb_title`
-        // returned None no search ever ran, which means TMDB does not know this id at all.
-        if search_failed {
-            eprintln!("trailer {imdb} ({ty}/{lang}): the search could not run (see above)");
-        } else {
-            eprintln!("trailer {imdb} ({ty}/{lang}): nothing found");
-        }
-    }
+    // Every upstream this resolve asked has answered or failed by now, which is when the counter
+    // /health reads can have moved. A title with no trailer is a normal empty and says nothing; a
+    // failed lookup was logged where it failed, and a stand-in answer says so in X-Den-Degraded.
+    state.note_health();
     // An empty result is only an ANSWER if we actually got one. Every failure mode — transport
     // error, a wrong BYOK key's 401, a 429, a 5xx — arrives here as the same empty Vec as a title
     // with no trailer, and caching that pinned "no trailer" for an hour under a key that
@@ -329,9 +318,6 @@ pub async fn resolve_youtube_ids(
             }
         }
         cache.insert(cache_key, YtEntry { ids: ids.clone(), exp: now + ttl, confirmed });
-    }
-    if substituted {
-        eprintln!("trailer {imdb} ({ty}/{lang}): lookup failed, serving the last known answer");
     }
     // A stand-in is the last known answer; an empty result from a lookup that could not be made is
     // no answer at all, and must not read as "this title has no trailer".

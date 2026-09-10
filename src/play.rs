@@ -589,13 +589,15 @@ async fn fetch_trailer_inner(
             // exactly what the de-duplication is for, so a viewer waiting on a trailer someone else
             // triggered is never turned away by this.
             let outstanding = map.len();
-            // Guard released BEFORE logging. Once the map is full every new id takes this branch, so
-            // the line is request-driven and unbounded — and stderr is a pipe someone else drains.
-            // A write that blocks would block it holding this mutex, stalling every /play, /crop and
-            // prewarm on a single-threaded runtime; a write that fails would panic with the guard
-            // held. Neither is worth risking to save a `drop`.
+            // Guard released BEFORE logging. Once the map is full every new id takes this branch —
+            // request-driven, which is why the line is rate-limited — and stderr is a pipe someone
+            // else drains. A write that blocks would block it holding this mutex, stalling every
+            // /play, /crop and prewarm on a single-threaded runtime; a write that fails would panic
+            // with the guard held. Neither is worth risking to save a `drop`.
             drop(map);
-            eprintln!("[{vid}] refused: {outstanding} downloads already outstanding");
+            crate::log_limited("busy", || {
+                format!("[{vid}] refused: {outstanding} downloads already outstanding")
+            });
             return Err(PlayError::overloaded());
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
@@ -620,10 +622,16 @@ async fn fetch_trailer_inner(
                             // serve path, so an id inside a one-hour window produced a syscall and a
                             // log line per request saying the same thing. Repeats are supposed to be
                             // free; this is the last part of them that was not.
-                            eprintln!("[{v}] {}", e.detail);
+                            // And at most once a minute per reason: in an extractor outage every
+                            // download fails the same way, and one line says it.
+                            crate::log_limited(&format!("download {}", e.reason), || {
+                                format!("[{v}] {}", e.detail)
+                            });
                             record_failure(&st, &v, e);
                         }
                     }
+                    // The counters /health reads move inside the download; say so if that flipped it.
+                    st.note_health();
                     out
                 })
             };

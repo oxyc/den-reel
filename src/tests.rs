@@ -284,6 +284,7 @@ fn build_state_full(
         cache_measured_at: std::sync::atomic::AtomicU64::new(0),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
         local_fails: std::sync::atomic::AtomicU32::new(0),
+        health_logged: Mutex::new(None),
     })
 }
 
@@ -679,6 +680,25 @@ fn log_requests_is_off_only_when_unset_empty_or_zero() {
     for v in ["1", "true", "yes", " 0", "00"] {
         assert!(on(Some(v)), "{v:?} should turn the request log on");
     }
+}
+
+/// /health's verdict is logged when it changes — into degraded with its reason, and back to ok —
+/// not once per failure behind it.
+#[test]
+fn health_is_logged_on_the_way_into_degraded_and_back_out() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    assert_eq!(state.note_health(), None, "an ok instance has nothing to say");
+
+    state.extract_fails.store(crate::HEALTH_FAIL_THRESHOLD, Ordering::Relaxed);
+    let line = state.note_health().expect("the flip to degraded was not logged");
+    assert!(line.contains("extractor_unavailable"), "{line}");
+    state.extract_fails.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(state.note_health(), None, "a further failure is not a change");
+
+    state.extract_fails.store(0, Ordering::Relaxed);
+    assert_eq!(state.note_health().as_deref(), Some("health: ok"));
+    assert_eq!(state.note_health(), None, "staying ok is not a change");
 }
 
 fn server_timing(r: &reqwest::Response) -> String {

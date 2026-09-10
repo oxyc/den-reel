@@ -48,6 +48,12 @@ would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full di
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
 answering while every trailer silently comes back empty.
 
+The log is state changes, not events: one line when `/health` turns degraded (with its reason) and
+one when it recovers; upstream, search and download failures at most once a minute per condition,
+with a count of what was held back; the version and a secret-free summary at startup. It never
+carries a key, a config segment, a play signature or a query string. `LOG_REQUESTS` adds a
+per-request line.
+
 `/metrics` is the detail behind that verdict, as Prometheus gauges prefixed `reel_`: bytes and
 trailers on the volume against `CACHE_MAX_BYTES` (plus the scratch that also counts against it),
 downloads in flight against their caps, the size of each in-memory cache, the three

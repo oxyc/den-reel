@@ -262,15 +262,19 @@ pub async fn search(cfg: &Config, query: &str, n: usize) -> Option<Vec<String>> 
             .collect::<Vec<_>>()
             .into(),
         Ok(Ok(o)) => {
-            eprintln!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
+            crate::log_limited("search exit", || {
+                format!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr))
+            });
             None
         }
         Ok(Err(e)) => {
-            eprintln!("search {query:?}: yt-dlp spawn error — {e}");
+            crate::log_limited("search spawn", || format!("search {query:?}: yt-dlp spawn error — {e}"));
             None
         }
         Err(_) => {
-            eprintln!("search {query:?}: timed out after {PROBE_TIMEOUT_SECS}s");
+            crate::log_limited("search timeout", || {
+                format!("search {query:?}: timed out after {PROBE_TIMEOUT_SECS}s")
+            });
             None
         }
     }

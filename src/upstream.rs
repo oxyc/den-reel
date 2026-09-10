@@ -138,6 +138,15 @@ impl HttpUpstream {
         url.starts_with(&self.cfg.tmdb_base)
     }
 
+    /// Which upstream a URL is, for naming a logged failure's condition.
+    fn source(&self, url: &str) -> &'static str {
+        if self.counts_toward_health(url) {
+            "tmdb"
+        } else {
+            "kinocheck"
+        }
+    }
+
     /// `Ok(Some(v))` parsed; `Ok(None)` the upstream said "not there" (404); `Err(NoAnswer)` we did
     /// not get an answer at all.
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Answered<Option<Value>> {
@@ -152,8 +161,11 @@ impl HttpUpstream {
                 // with the path only. redact() strips the api_key from OUR url, but reqwest's own
                 // Display re-appends the whole thing ("… for url (…?api_key=…)"), so redacting one
                 // side and interpolating the error beside it published the BYOK key on every
-                // outage. without_url() drops reqwest's copy; keep both, or neither works.
-                eprintln!("{}", transport_fault_line(url, e));
+                // outage. without_url() drops reqwest's copy; keep both, or neither works. Once a
+                // minute per upstream: an outage fails every lookup the same way.
+                crate::log_limited(&format!("{} transport", self.source(url)), || {
+                    transport_fault_line(url, e)
+                });
                 if self.counts_toward_health(url) {
                     self.fails.fetch_add(1, Ordering::Relaxed);
                 }
@@ -162,9 +174,16 @@ impl HttpUpstream {
         };
         let status = res.status();
         if !status.is_success() {
-            // Surface the faults that mean "misconfigured / throttled / upstream down" — but not 404
-            // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
-            eprintln!("upstream {} -> {status}", redact(url));
+            // A 404 is a real "this title is not there": a miss, not a fault. KinoCheck answers it
+            // for every title it has no trailer for, so it is neither counted nor logged.
+            if status == 404 {
+                return Ok(None);
+            }
+            // Surface the faults that mean "misconfigured / throttled / upstream down", so a broken
+            // TMDB_KEY isn't a silent empty result — once a minute per upstream and status.
+            crate::log_limited(&format!("{} {}", self.source(url), status.as_u16()), || {
+                format!("upstream {} -> {status}", redact(url))
+            });
             // 401/403 is THIS install's key, not the upstream — and /health is process-wide while
             // keys are per-install, so counting them let one bad key report "TMDB has been failing"
             // for everyone, and a healthy install's traffic cleared the counter so a persistently
@@ -172,10 +191,6 @@ impl HttpUpstream {
             // request got no answer, which is a different question from whether TMDB is up.
             if (status == 429 || status.is_server_error()) && self.counts_toward_health(url) {
                 self.fails.fetch_add(1, Ordering::Relaxed);
-            }
-            // A 404 is a real "this title is not there". Everything else is an absent answer.
-            if status == 404 {
-                return Ok(None);
             }
             return Err(NoAnswer);
         }
@@ -211,7 +226,9 @@ impl HttpUpstream {
     /// after the status line is the same outage as one that lands before it — reqwest's timeout
     /// spans the body read, so which side of the line a wedged upstream falls on is arbitrary.
     fn no_answer(&self, url: &str, why: &str) -> Answered<Option<Value>> {
-        eprintln!("upstream {}: {why}", redact(url));
+        crate::log_limited(&format!("{} body", self.source(url)), || {
+            format!("upstream {}: {why}", redact(url))
+        });
         if self.counts_toward_health(url) {
             self.fails.fetch_add(1, Ordering::Relaxed);
         }
