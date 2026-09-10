@@ -96,7 +96,7 @@ pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
 ///
 /// Rotating the secret would otherwise 403 every play URL a client is holding — and `/meta` tells
 /// clients to hold them for a week — so a rotation without this is a week-long outage. Exactly the
-/// problem `REEL_CONFIG_KEYS_PREV` already exists to solve for the sealing key.
+/// problem `CONFIG_KEYS_PREV` already exists to solve for the sealing key.
 ///
 /// The scan is not constant-time *across* the set, only within each comparison. What that leaks is
 /// how many secrets are configured, which is not a secret.

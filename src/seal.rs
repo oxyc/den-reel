@@ -45,7 +45,7 @@ impl Keyring {
                                                             // whole ring (which would silently take sealing offline for the good current key too).
         for p in prev.split(',') {
             if let Err(e) = add(p) {
-                eprintln!("den-reel: skipping a malformed REEL_CONFIG_KEYS_PREV entry: {e}");
+                eprintln!("den-reel: skipping a malformed CONFIG_KEYS_PREV entry: {e}");
             }
         }
         Ok(Some(Keyring { keys }))

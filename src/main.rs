@@ -125,7 +125,7 @@ fn health_body(
     local_fails: u32,
 ) -> serde_json::Value {
     if !tmdb_available {
-        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
+        serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
         serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     } else if extract_fails >= HEALTH_FAIL_THRESHOLD {
@@ -265,7 +265,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             let cfg = match userconfig::decode(state.config_keyring.as_ref(), cfg_seg) {
                 Some(c) => c,
                 None => {
-                    // Say something. A key rolled out of REEL_CONFIG_KEYS_PREV makes every install
+                    // Say something. A key rolled out of CONFIG_KEYS_PREV makes every install
                     // 400 at once, and this path logged nothing at all — leaving the operator to
                     // guess. Length only: the segment carries the key.
                     eprintln!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len());

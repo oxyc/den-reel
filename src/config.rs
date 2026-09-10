@@ -1,7 +1,7 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
-//!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL);
+//!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
 //!      REEL_PLAY_SECRET (optional signing of the /play + /crop URLs).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
@@ -185,8 +185,8 @@ impl Config {
             resolve_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),
-            config_key: env_opt("REEL_CONFIG_KEY").unwrap_or_default(),
-            config_keys_prev: env_opt("REEL_CONFIG_KEYS_PREV").unwrap_or_default(),
+            config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
+            config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
             play_secret: env_opt("REEL_PLAY_SECRET"),
             play_secrets_prev: env_opt("REEL_PLAY_SECRET_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())

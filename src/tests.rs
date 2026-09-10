@@ -572,7 +572,7 @@ fn health_reports_degraded_and_ok_states() {
     // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
     assert_eq!(
         crate::health_body(false, 0, 0, 0),
-        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
+        json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     );
     // A missing key wins even if upstreams / the extractor are also failing.
     assert_eq!(crate::health_body(false, 99, 99, 0)["reason"], "tmdb_key_missing");
@@ -801,7 +801,7 @@ async fn config_key_serves_pubkey_when_keyring_set() {
 
 #[tokio::test]
 async fn config_key_404s_when_sealing_disabled() {
-    // Default test state has no REEL_CONFIG_KEY → sealing disabled.
+    // Default test state has no CONFIG_KEY → sealing disabled.
     let state =
         build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
