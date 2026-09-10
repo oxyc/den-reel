@@ -22,7 +22,12 @@ FROM debian:bookworm-slim AS mp4box
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential zlib1g-dev git ca-certificates && rm -rf /var/lib/apt/lists/*
 ARG GPAC_VERSION=v2.4.0
+# The commit that tag named when it was pinned. A tag can be moved and a commit cannot, and this source
+# is compiled into the image with nothing else checking it — the same reason yt-dlp and deno are
+# checksummed below.
+ARG GPAC_COMMIT=5d70253ac94e5840be7b86054131dd753af63cc7
 RUN git clone --depth 1 --branch ${GPAC_VERSION} https://github.com/gpac/gpac.git /gpac \
+    && test "$(git -C /gpac rev-parse HEAD)" = "${GPAC_COMMIT}" \
     && cd /gpac && ./configure && make -j"$(nproc)"
 
 # ---- fetch extractor tools (curl/unzip stay OUT of the runtime image) ------
