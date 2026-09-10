@@ -722,6 +722,28 @@ fn the_request_log_redacts_the_config_segment() {
     }
 }
 
+/// The caller's X-Request-Id ends the line, so it can be matched to the app's own log; a hostile
+/// value is cut down to the safe alphabet and 32 characters, and no header means no `rid`.
+#[test]
+fn the_request_log_carries_the_callers_request_id() {
+    let line = |rid: Option<&str>| {
+        let mut b = hyper::Request::builder().method("GET").uri("/sealed.AbC-_9/manifest.json?s=secret");
+        if let Some(rid) = rid {
+            b = b.header("x-request-id", rid);
+        }
+        let (parts, _) = b.body(()).unwrap().into_parts();
+        crate::request_line(&parts, hyper::StatusCode::OK, std::time::Duration::from_millis(12))
+    };
+    assert_eq!(line(Some("a1B2-c_3")), "GET /<config>/manifest.json 200 12ms rid=a1B2-c_3");
+    assert_eq!(line(None), "GET /<config>/manifest.json 200 12ms");
+    assert_eq!(line(Some("\"; DROP fake=200")), "GET /<config>/manifest.json 200 12ms rid=DROPfake200");
+    assert_eq!(
+        line(Some(&"x".repeat(40))),
+        format!("GET /<config>/manifest.json 200 12ms rid={}", "x".repeat(32))
+    );
+    assert_eq!(line(Some("!!!")), "GET /<config>/manifest.json 200 12ms", "nothing left is no rid");
+}
+
 /// Off when unset, empty or exactly "0"; on for anything else — the rule every Den addon shares.
 #[test]
 fn log_requests_is_off_only_when_unset_empty_or_zero() {

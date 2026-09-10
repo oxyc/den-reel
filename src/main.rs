@@ -384,15 +384,39 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         resp.headers_mut().insert("server-timing", v);
     }
     if log {
-        eprintln!(
-            "{} {} {} {}ms",
-            parts.method,
-            redact_path(parts.uri.path()),
-            resp.status().as_u16(),
-            elapsed.as_millis()
-        );
+        eprintln!("{}", request_line(&parts, resp.status(), elapsed));
     }
     resp
+}
+
+/// `<METHOD> <redacted path> <status> <ms>ms[ rid=<id>]`. The `rid` is the caller's `X-Request-Id`, so a
+/// line here can be matched to the one the app logged for the same request.
+fn request_line(
+    parts: &hyper::http::request::Parts,
+    status: StatusCode,
+    elapsed: std::time::Duration,
+) -> String {
+    let mut line = format!(
+        "{} {} {} {}ms",
+        parts.method,
+        redact_path(parts.uri.path()),
+        status.as_u16(),
+        elapsed.as_millis()
+    );
+    if let Some(rid) = request_id(&parts.headers) {
+        line.push_str(" rid=");
+        line.push_str(&rid);
+    }
+    line
+}
+
+/// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is written into the
+/// log verbatim, so nothing that could forge a line or carry a secret gets through. Empty = absent.
+fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let id: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(32).collect();
+    (!id.is_empty()).then_some(id)
 }
 
 /// The request path as the request log may show it. The query string never gets this far — `?s=`
