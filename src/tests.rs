@@ -208,6 +208,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         config_keys_prev: String::new(),
         play_secret: None,
         play_secrets_prev: Vec::new(),
+        metrics_token: None,
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
@@ -522,32 +523,76 @@ async fn an_unsigned_install_is_completely_unchanged() {
 /// only by reading logs. The figures come from the eviction pass, which already walks the directory,
 /// because an ops endpoint that stats a few thousand files per request makes a busy box busier.
 #[tokio::test]
-async fn stats_reports_the_measured_cache_rather_than_walking_it() {
+async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
     let dir = temp_dir();
     seed_cache(&dir, "statsVid001", 4096);
-    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let mut cfg = test_cfg(dir);
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state.clone()).await;
 
-    // Nothing has measured the volume yet — and /stats must not be the thing that does, even though
-    // there is a trailer sitting right there.
-    let body: serde_json::Value = reqwest::get(format!("{base}/stats")).await.unwrap().json().await.unwrap();
-    assert_eq!(body["cache"]["measured_at_ms"], 0, "/stats walked the cache directory itself");
-    assert_eq!(body["cache"]["trailers"], 0, "/stats walked the cache directory itself");
+    let r = scrape_metrics(&base, Some("scrape-me")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "text/plain; version=0.0.4; charset=utf-8");
+    let body = r.text().await.unwrap();
+    let has = |body: &str, line: &str| body.lines().any(|l| l == line);
+    assert!(has(&body, &format!("reel_build_info{{version=\"{}\"}} 1", env!("CARGO_PKG_VERSION"))));
+    // Nothing has measured the volume yet — and /metrics must not be the thing that does, even
+    // though there is a trailer sitting right there.
+    assert!(has(&body, "reel_cache_measured_at_seconds 0"), "/metrics walked the cache directory itself");
+    assert!(has(&body, "reel_cache_trailers 0"), "/metrics walked the cache directory itself");
 
-    // The eviction pass measures; /stats reports what it found.
+    // The eviction pass measures; /metrics reports what it found.
     let u = crate::play::evict_if_needed(&state.cfg).expect("the cache dir is readable");
     state.record_cache_usage(u);
 
-    let body: serde_json::Value = reqwest::get(format!("{base}/stats")).await.unwrap().json().await.unwrap();
-    assert_eq!(body["cache"]["trailers"], 1);
-    assert_eq!(body["cache"]["trailer_bytes"], 4096);
-    assert!(body["cache"]["measured_at_ms"].as_u64().unwrap() > 0, "the measurement was not timestamped");
-    assert_eq!(
-        body["cache"]["free_bytes"],
-        state.cfg.cache_max_bytes - 4096,
+    let body = scrape_metrics(&base, Some("scrape-me")).await.text().await.unwrap();
+    assert!(has(&body, "reel_cache_trailers 1"));
+    assert!(has(&body, "reel_cache_trailer_bytes 4096"));
+    assert!(!has(&body, "reel_cache_measured_at_seconds 0"), "the measurement was not timestamped");
+    assert!(
+        has(&body, &format!("reel_cache_free_bytes {}", state.cfg.cache_max_bytes - 4096)),
         "free space must account for what trailers already hold"
     );
-    assert_eq!(body["downloads"]["limit"], crate::DOWNLOAD_CONCURRENCY);
+    assert!(has(&body, &format!("reel_downloads_concurrency_limit {}", crate::DOWNLOAD_CONCURRENCY)));
+    assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
+}
+
+async fn scrape_metrics(base: &str, token: Option<&str>) -> reqwest::Response {
+    let mut req = reqwest::Client::new().get(format!("{base}/metrics"));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    req.send().await.unwrap()
+}
+
+/// With no METRICS_TOKEN the endpoint does not exist — whatever the caller sends.
+#[tokio::test]
+async fn metrics_is_off_without_a_token() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    assert_eq!(scrape_metrics(&base, None).await.status(), 404);
+    assert_eq!(scrape_metrics(&base, Some("anything")).await.status(), 404);
+}
+
+/// A wrong token is refused exactly as an unknown path is, so a refusal says nothing about whether a
+/// token is configured.
+#[tokio::test]
+async fn metrics_refuses_a_wrong_token_like_a_missing_route() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.metrics_token = Some("scrape-me".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let wrong = scrape_metrics(&base, Some("scrape-me-not")).await;
+    assert_eq!(wrong.status(), 404);
+    let missing = reqwest::get(format!("{base}/no-such-route")).await.unwrap();
+    assert_eq!(missing.status(), 404);
+    assert_eq!(wrong.text().await.unwrap(), missing.text().await.unwrap());
+    assert_eq!(scrape_metrics(&base, None).await.status(), 404);
 }
 
 #[test]

@@ -218,7 +218,7 @@ fn is_published_trailer(name: &str) -> bool {
     name.strip_suffix(".mp4").is_some_and(crate::is_valid_vid)
 }
 
-/// What the volume held when eviction last looked, so `/stats` can answer without walking the cache
+/// What the volume held when eviction last looked, so `/metrics` can answer without walking the cache
 /// directory on a request. Measured after any eviction, so it describes the state we left behind.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheUsage {
@@ -234,7 +234,7 @@ pub struct CacheUsage {
 /// is neither counted nor deleted out from under its writer; `sweep_partials` reclaims stale ones.
 ///
 /// Returns what it saw, or `None` if the cache directory could not be read at all. It already walks
-/// the directory, so reporting the totals costs nothing and spares `/stats` from doing it again on
+/// the directory, so reporting the totals costs nothing and spares `/metrics` from doing it again on
 /// the request path.
 pub(crate) fn evict_if_needed(cfg: &Config) -> Option<CacheUsage> {
     // Everything on the volume counts toward the cap, but only published trailers are EVICTABLE.

@@ -48,7 +48,7 @@ GET /crop/<youtube_id>.json               →  detected content rectangle (lette
      …/play requires ?s=<tag> when REEL_PLAY_SECRET is set (403 without); the same tag
        opens /crop, which without it answers "play the full frame" instead of refusing
 GET /health                               →  200 {status} — ok, or degraded (see below)
-GET /stats                                →  cache usage, in-flight downloads, cache sizes, counters
+GET /metrics                              →  Prometheus text (bearer METRICS_TOKEN; 404 without it)
 ```
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
@@ -154,6 +154,7 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting) |
 | `REEL_PLAY_SECRET` | — | sign the play URLs. Set it and `/meta` emits `…/play/<id>.mp4?s=<tag>` (keyed BLAKE2b over the id), which `/play` then requires. Without it, `/play` and `/crop` will extract and cache any YouTube id anyone asks for, which matters the moment the instance is reachable off-LAN. **Unset by default, and it must stay unset on an existing install until its clients have re-fetched `/meta`** — those responses carry `max-age=604800`, so turning it on strands already-issued unsigned URLs for up to 7 days. Any string. `/crop` takes the same tag (it covers the id, not the path, so a client can carry the one from the play URL across) but an unsigned `/crop` is answered `letterboxed:false` rather than refused — it is a hint, and the download behind it is what the gate protects. |
 | `REEL_PLAY_SECRET_PREV` | — | comma-separated prior play secrets, accepted when verifying and never used to sign. Rotate through it for the same reason `CONFIG_KEYS_PREV` exists: clients hold signed URLs for up to 7 days, so rotating without it is a week of 403s. |
+| `METRICS_TOKEN` | — | turns on `/metrics`, which then requires `Authorization: Bearer <token>`. Unset, `/metrics` answers 404 like any unknown path. |
 | `TMDB_KEY` | — | **migration fallback** only: the legacy server-side discovery key, used when a request carries no per-install config. New installs seal their own key; drop this once migrated. |
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
@@ -182,17 +183,18 @@ would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full di
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
 answering while every trailer silently comes back empty.
 
-`/stats` is the detail behind that verdict: bytes and trailers on the volume against
-`CACHE_MAX_BYTES` (plus the scratch that also counts against it), downloads in flight against the
-concurrency cap, the size of each in-memory cache, and the three consecutive-failure counters
-`/health` collapses into one word. The cache figures come from the eviction pass — which runs after
-every download and hourly — not from a directory walk per request, so `measured_at_ms` says how
-fresh they are and reads `0` until the first pass on a new process.
+`/metrics` is the detail behind that verdict, as Prometheus gauges prefixed `reel_`: bytes and
+trailers on the volume against `CACHE_MAX_BYTES` (plus the scratch that also counts against it),
+downloads in flight against their caps, the size of each in-memory cache, the three
+consecutive-failure counters `/health` collapses into one word (`reel_consecutive_failures{kind}`),
+and `reel_build_info{version}`. The cache figures come from the eviction pass — which runs after
+every download and hourly — not from a directory walk per request, so
+`reel_cache_measured_at_seconds` says how fresh they are and reads `0` until the first pass on a new
+process. Nothing is computed until a scrape asks.
 
-`/stats` is **operational detail, served without a gate** — block it at the reverse proxy on an
-instance that is reachable off-LAN. It is a smaller step than it looks: the version it reports is
-already public in `/manifest.json`, and `/health` already tells an anonymous caller whether
-extraction is currently broken. What it adds is volume occupancy and in-flight counts.
+It is **off unless `METRICS_TOKEN` is set**, and then answers only
+`Authorization: Bearer <METRICS_TOKEN>`; every refusal is the same 404 an unknown path gets. In-flight
+counts and occupancy polled over time say when the household is watching, which is why it is gated.
 
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent

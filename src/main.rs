@@ -143,48 +143,132 @@ fn health_body(
     }
 }
 
-/// The `/stats` body. Every number is either an atomic load or the length of a map we hold briefly —
-/// no I/O, no directory walk.
-fn stats_body(state: &Arc<AppState>) -> serde_json::Value {
+/// May this request read `/metrics`? Only when a token is configured and the request presents it as
+/// `Authorization: Bearer <token>`. Compared in constant time, so a caller cannot recover the token
+/// a byte at a time from how long a refusal took.
+fn metrics_authorized(state: &AppState, headers: &hyper::HeaderMap) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(token) = state.cfg.metrics_token.as_deref() else { return false };
+    let presented = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    presented.is_some_and(|p| p.as_bytes().ct_eq(token.as_bytes()).into())
+}
+
+/// The `/metrics` body in the Prometheus text exposition format, written by hand: the format is a
+/// few dozen lines of printing, and a client library would be a dependency for it. Every number is
+/// either an atomic load or the length of a map we hold briefly — no I/O, no directory walk — and
+/// none of it is computed until a scrape asks.
+fn metrics_body(state: &AppState) -> String {
+    use std::fmt::Write;
     use std::sync::atomic::Ordering::Relaxed;
-    fn len<K, V>(m: &std::sync::Mutex<std::collections::HashMap<K, V>>) -> usize {
-        m.lock().unwrap_or_else(|e| e.into_inner()).len()
+    fn len<K, V>(m: &std::sync::Mutex<std::collections::HashMap<K, V>>) -> u64 {
+        m.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
     }
+    let mut b = String::with_capacity(4096);
+    // One HELP/TYPE block and its samples; an empty label set is an unlabelled series. Every series
+    // here is a gauge — a level read now. Even the failure counts go down: a success resets them.
+    let mut gauge = |name: &str, help: &str, samples: &[(&str, u64)]| {
+        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} gauge");
+        for (labels, v) in samples {
+            if labels.is_empty() {
+                let _ = writeln!(b, "{name} {v}");
+            } else {
+                let _ = writeln!(b, "{name}{{{labels}}} {v}");
+            }
+        }
+    };
     let trailer_bytes = state.cache_trailer_bytes.load(Relaxed);
     let scratch_bytes = state.cache_scratch_bytes.load(Relaxed);
     let cap = state.cfg.cache_max_bytes;
-    let measured_at = state.cache_measured_at.load(Relaxed);
-    serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "cache": {
-            // From the last eviction pass, not from this request. 0 means no pass has run yet, which
-            // on a fresh process lasts until the first download or the first hourly tick.
-            "measured_at_ms": measured_at,
-            "trailers": state.cache_trailer_count.load(Relaxed),
-            "trailer_bytes": trailer_bytes,
-            "scratch_bytes": scratch_bytes,
-            "max_bytes": cap,
-            // What a new trailer can still take. Scratch counts against the cap, so this is the
-            // number that actually decides whether the next download evicts something.
-            "free_bytes": cap.saturating_sub(trailer_bytes + scratch_bytes),
-        },
-        "downloads": {
-            "in_flight": len(&state.in_flight),
-            "limit": DOWNLOAD_CONCURRENCY,
-            "prewarm_available": state.prewarm_sem.available_permits(),
-            "probe_available": state.probe_sem.available_permits(),
-        },
-        "resolve_cache": { "entries": len(&state.yt_cache), "max": YT_CACHE_MAX },
-        "crop_cache": { "entries": len(&state.crop_cache), "unreadable": len(&state.crop_unknown) },
-        // Ids /play has found unplayable and is not re-extracting yet.
-        "play_failures": { "entries": len(&state.play_fails), "max": PLAY_FAIL_MAX },
-        // The same three counters /health turns into a one-word verdict.
-        "consecutive_failures": {
-            "upstream": state.upstream.recent_failures(),
-            "extract": state.extract_fails.load(Relaxed),
-            "local": state.local_fails.load(Relaxed),
-        },
-    })
+
+    gauge(
+        "reel_build_info",
+        "The running build.",
+        &[(concat!("version=\"", env!("CARGO_PKG_VERSION"), "\""), 1)],
+    );
+    // The cache figures come from the last eviction pass, not from this request. 0 means no pass has
+    // run yet, which on a fresh process lasts until the first download or the first hourly tick.
+    gauge(
+        "reel_cache_measured_at_seconds",
+        "When the eviction pass last measured the cache volume, unix seconds (0 = not yet).",
+        &[("", state.cache_measured_at.load(Relaxed) / 1000)],
+    );
+    gauge(
+        "reel_cache_trailers",
+        "Trailers on the cache volume.",
+        &[("", state.cache_trailer_count.load(Relaxed))],
+    );
+    gauge("reel_cache_trailer_bytes", "Bytes of trailers on the cache volume.", &[("", trailer_bytes)]);
+    gauge(
+        "reel_cache_scratch_bytes",
+        "Bytes of partial downloads and other scratch, counted against the cap.",
+        &[("", scratch_bytes)],
+    );
+    gauge("reel_cache_max_bytes", "The cache size cap (CACHE_MAX_BYTES).", &[("", cap)]);
+    // What a new trailer can still take. Scratch counts against the cap, so this is the number that
+    // actually decides whether the next download evicts something.
+    gauge(
+        "reel_cache_free_bytes",
+        "What the cap leaves after trailers and scratch.",
+        &[("", cap.saturating_sub(trailer_bytes + scratch_bytes))],
+    );
+    gauge(
+        "reel_downloads_in_flight",
+        "Distinct ids with a download outstanding.",
+        &[("", len(&state.in_flight))],
+    );
+    gauge(
+        "reel_downloads_in_flight_max",
+        "Outstanding ids past which /play answers 503 busy.",
+        &[("", IN_FLIGHT_MAX as u64)],
+    );
+    gauge(
+        "reel_downloads_concurrency_limit",
+        "Downloads that may run at once.",
+        &[("", DOWNLOAD_CONCURRENCY as u64)],
+    );
+    gauge(
+        "reel_prewarm_permits_available",
+        "Speculative downloads that could start now.",
+        &[("", state.prewarm_sem.available_permits() as u64)],
+    );
+    gauge(
+        "reel_probe_permits_available",
+        "yt-dlp probes or searches that could start now.",
+        &[("", state.probe_sem.available_permits() as u64)],
+    );
+    gauge("reel_resolve_cache_entries", "Titles in the resolve cache.", &[("", len(&state.yt_cache))]);
+    gauge(
+        "reel_resolve_cache_max",
+        "Resolve cache size past which expired entries are swept.",
+        &[("", YT_CACHE_MAX as u64)],
+    );
+    gauge("reel_crop_cache_entries", "Crop reports cached.", &[("", len(&state.crop_cache))]);
+    gauge(
+        "reel_crop_unreadable_entries",
+        "Ids cropdetect could not read, waiting out their retry.",
+        &[("", len(&state.crop_unknown))],
+    );
+    // Ids /play has found unplayable and is not re-extracting yet.
+    gauge(
+        "reel_play_failure_cache_entries",
+        "Ids /play is refusing to re-extract yet.",
+        &[("", len(&state.play_fails))],
+    );
+    gauge("reel_play_failure_cache_max", "Bound on the /play failure cache.", &[("", PLAY_FAIL_MAX as u64)]);
+    // The same three counters /health turns into a one-word verdict.
+    gauge(
+        "reel_consecutive_failures",
+        "Consecutive failures by kind; /health reports degraded at 3.",
+        &[
+            ("kind=\"upstream\"", state.upstream.recent_failures() as u64),
+            ("kind=\"extract\"", state.extract_fails.load(Relaxed) as u64),
+            ("kind=\"local\"", state.local_fails.load(Relaxed) as u64),
+        ],
+    );
+    b
 }
 
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
@@ -219,8 +303,23 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // Deliberately does NOT walk the cache directory: the figures come from the eviction pass, which
     // already walks it after every download and once an hour. An ops endpoint that stats a few
     // thousand files per request is a way to make a busy box busier.
-    if path == "/stats" {
-        return httputil::json(StatusCode::OK, &stats_body(&state), &[("cache-control", "no-store")]);
+    //
+    // Behind a bearer token, and OFF when none is configured. In-flight downloads and cache
+    // occupancy polled over time are a timeline of when the household is watching, which /health
+    // does not give away. A refusal is the same 404 an unknown path gets, with or without a token
+    // configured, so nobody is told there is something here to poke at.
+    if path == "/metrics" {
+        if !metrics_authorized(&state, &parts.headers) {
+            return httputil::text(StatusCode::NOT_FOUND, "not found");
+        }
+        let body = metrics_body(&state);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+            .header("content-length", body.len())
+            .header("cache-control", "no-store")
+            .body(httputil::full(body))
+            .unwrap();
     }
     if path == "/manifest.json" {
         return httputil::json(

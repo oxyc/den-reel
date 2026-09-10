@@ -2,7 +2,7 @@
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
-//!      REEL_PLAY_SECRET (optional signing of the /play + /crop URLs).
+//!      REEL_PLAY_SECRET (optional signing of the /play + /crop URLs); METRICS_TOKEN (turns on /metrics).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
 //!      sealed in the URL (den-scout/docs/SEALED-CONFIG.md). Drop the env keys once installs migrate.
@@ -54,6 +54,9 @@ pub struct Config {
     /// `/meta` ships `max-age=604800`, so a client can present a tag made with the previous secret
     /// for up to a week after it is rotated. Without this, rotating means a week of 403s.
     pub play_secrets_prev: Vec<String>,
+    /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off: it
+    /// answers 404, the same as a path that does not exist.
+    pub metrics_token: Option<String>,
     pub public_base_url: Option<String>,
     /// The yt-dlp format string we serve — H.264(avc1) + AAC(mp4a), ≤max_height (avc1's ceiling on
     /// YouTube), faststart-muxable. Forced so trailers play on AVPlayer's HARDWARE decode path
@@ -191,6 +194,7 @@ impl Config {
             play_secrets_prev: env_opt("REEL_PLAY_SECRET_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default(),
+            metrics_token: env_opt("METRICS_TOKEN"),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,

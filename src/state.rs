@@ -90,7 +90,7 @@ pub struct AppState {
     /// which is otherwise invisible to /health (upstream TMDB/KinoCheck still answer fine). Reset to 0
     /// on any resolve that DOES yield a playable trailer, so only a real run of failures accumulates.
     /// Surfaced as `degraded: extractor_unavailable` past the threshold (ADDON-02).
-    /// What the cache volume held when eviction last walked it, for `/stats`. Published from the
+    /// What the cache volume held when eviction last walked it, for `/metrics`. Published from the
     /// pass that already does the walk — after each download and once an hour — so an operations
     /// endpoint never turns into a directory scan on the request path. `cache_measured_at` is 0
     /// until the first pass has run.
@@ -152,7 +152,7 @@ impl AppState {
         })
     }
 
-    /// Publish what the eviction pass just measured, so `/stats` can read it instead of walking the
+    /// Publish what the eviction pass just measured, so `/metrics` can read it instead of walking the
     /// volume. Relaxed throughout: these four are a report, not a decision anything is made on.
     pub fn record_cache_usage(&self, u: crate::play::CacheUsage) {
         use std::sync::atomic::Ordering::Relaxed;
