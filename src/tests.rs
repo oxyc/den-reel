@@ -209,6 +209,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         play_secret: None,
         play_secrets_prev: Vec::new(),
         metrics_token: None,
+        log_requests: false,
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
@@ -652,6 +653,20 @@ async fn every_response_allows_any_origin() {
         client.get(format!("{base}/configure")).header("if-none-match", etag).send().await.unwrap();
     assert_eq!(revalidated.status(), 304);
     assert_eq!(acao(&revalidated).unwrap(), "*");
+}
+
+/// The request log never shows a config segment: it carries a BYOK key, sealed or not. Our own
+/// routes pass through untouched.
+#[test]
+fn the_request_log_redacts_the_config_segment() {
+    let r = |p: &str| crate::redact_path(p).into_owned();
+    assert_eq!(r("/eyJ0bWRiIjoieCJ9/manifest.json"), "/<config>/manifest.json");
+    assert_eq!(r("/sealed.AbC-_9/meta/movie/tt0111161.json"), "/<config>/meta/movie/tt0111161.json");
+    assert_eq!(r("/sealed.AbC-_9/configure"), "/<config>/configure");
+    assert_eq!(r("/sealed.AbC-_9"), "/<config>");
+    for own in ["/", "/health", "/manifest.json", "/meta/movie/tt0111161.json", "/play/abc123DEF01.mp4"] {
+        assert_eq!(r(own), own);
+    }
 }
 
 #[test]

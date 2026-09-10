@@ -274,11 +274,13 @@ fn metrics_body(state: &AppState) -> String {
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
+    let start = std::time::Instant::now();
+    let log = state.cfg.log_requests;
     let (parts, _body) = req.into_parts();
-    // CORS preflight, on any path: everything here is credential-free, and a browser-based client
-    // asks before it sends anything with a header of its own.
-    if parts.method == hyper::Method::OPTIONS {
-        return Response::builder()
+    let mut resp = if parts.method == hyper::Method::OPTIONS {
+        // CORS preflight, on any path: everything here is credential-free, and a browser-based
+        // client asks before it sends anything with a header of its own.
+        Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("access-control-allow-origin", "*")
             .header("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
@@ -286,17 +288,50 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
             // A day, so a browser stops preflighting every request.
             .header("access-control-max-age", "86400")
             .body(httputil::full(""))
-            .unwrap();
-    }
-    let resp = route(state, &parts).await;
-    // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
-    // collapses to a 304 (a no-op for unsafe methods, errors, and `no-store` bodies).
-    let mut resp = httputil::apply_conditional(&parts.method, &parts.headers, resp);
+            .unwrap()
+    } else {
+        let resp = route(state, &parts).await;
+        // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
+        // collapses to a 304 (a no-op for unsafe methods, errors, and `no-store` bodies).
+        httputil::apply_conditional(&parts.method, &parts.headers, resp)
+    };
     // Stamped here rather than in each builder, so no response can go out without it — the video,
     // the page, a plain-text error and a 304 included. A browser that cannot read an error body
     // reports a CORS failure instead of the error.
     resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
+    // Time to headers: a streamed /play body is still being written when this runs.
+    if log {
+        eprintln!(
+            "{} {} {} {}ms",
+            parts.method,
+            redact_path(parts.uri.path()),
+            resp.status().as_u16(),
+            start.elapsed().as_millis()
+        );
+    }
     resp
+}
+
+/// The request path as the request log may show it. The query string never gets this far — `?s=`
+/// is a play signature — and a per-install config segment carries a BYOK key, sealed or not, so any
+/// first segment that is not one of our own routes is written as `<config>`. That covers
+/// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
+/// or pasting the bare segment, which would otherwise put the key in the log through a 404.
+fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
+    const ROUTES: [&str; 9] =
+        ["", "health", "metrics", "manifest.json", "configure", "config-key", "meta", "crop", "play"];
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    let (first, tail) = match rest.split_once('/') {
+        Some((first, tail)) => (first, Some(tail)),
+        None => (rest, None),
+    };
+    if ROUTES.contains(&first) {
+        return path.into();
+    }
+    match tail {
+        Some(tail) => format!("/<config>/{tail}").into(),
+        None => "/<config>".into(),
+    }
 }
 
 async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
