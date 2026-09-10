@@ -597,7 +597,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 }
 
 /// May this request spend a download on this id? `true` for every request when `PLAY_SECRET` is
-/// unset, which is the default.
+/// unset, which is the default, and for one carrying no tag at all while `PLAY_SIGNING_GRACE_UNTIL`
+/// is still ahead.
 ///
 /// A predicate, not a response. The two callers disagree about what a refusal looks like — `/play`
 /// says 403, `/crop` degrades to "play the full frame" — and the `/crop` refusal is the EXPECTED
@@ -608,7 +609,54 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 /// client can carry the `s` it was handed on the play URL straight over to `/crop`.
 fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
     let Some(secret) = state.cfg.play_secret.as_deref() else { return true };
-    sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, query_param(query, "s").as_deref())
+    let presented = query_param(query, "s");
+    // Only a MISSING tag rides the grace window. A URL issued before signing was turned on carries
+    // none; a wrong one was never issued by this server under any setting.
+    if presented.is_none() && in_grace(&state.cfg, (state.clock)()) {
+        note_unsigned_in_grace(vid);
+        return true;
+    }
+    sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, presented.as_deref())
+}
+
+fn in_grace(cfg: &Config, now_ms: u64) -> bool {
+    cfg.play_signing_grace.as_ref().is_some_and(|g| now_ms < g.until_ms)
+}
+
+/// Ids remembered by `note_unsigned_in_grace`. Anyone who can reach `/play` can invent ids, so the
+/// set is bounded; past it the rest share one rate-limited line.
+const GRACE_LOGGED_IDS: usize = 4096;
+
+/// Say, once per id, that an unsigned URL was served only because of the grace window, so the
+/// operator can see which trailers clients are still holding pre-signing URLs for — and that the
+/// stragglers have stopped before the deadline arrives.
+fn note_unsigned_in_grace(vid: &str) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let fresh = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(vid) {
+            return;
+        }
+        seen.len() < GRACE_LOGGED_IDS && seen.insert(vid.to_string())
+    };
+    if fresh {
+        eprintln!("play signing grace: served {vid} without a tag");
+    } else {
+        log_limited("unsigned_in_grace", || {
+            format!("play signing grace: served {vid} without a tag (past {GRACE_LOGGED_IDS} distinct ids)")
+        });
+    }
+}
+
+/// The startup line's `play_signing=` value: `off`, `on`, or `grace(until=<ts>)` while untagged
+/// requests are still served. A grace whose moment has passed reads `on`, because that is what it is.
+fn play_signing_state(cfg: &Config, now_ms: u64) -> String {
+    match &cfg.play_signing_grace {
+        _ if cfg.play_secret.is_none() => "off".into(),
+        Some(g) if now_ms < g.until_ms => format!("grace(until={})", g.until),
+        _ => "on".into(),
+    }
 }
 
 /// The `/play` refusal: terse, and no hint about what a correct tag would look like.
@@ -708,7 +756,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
         on(state.config_keyring.is_some()),
-        on(state.cfg.play_secret.is_some()),
+        play_signing_state(&state.cfg, (state.clock)()),
         on(state.cfg.tmdb_key.is_some()),
     );
 

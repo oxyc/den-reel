@@ -3,6 +3,7 @@
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_SECS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
 //!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
+//!      PLAY_SIGNING_GRACE_UNTIL (still serve unsigned URLs until then, while turning signing on);
 //!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
@@ -55,6 +56,11 @@ pub struct Config {
     /// `/meta` ships `max-age=604800`, so a client can present a tag made with the previous secret
     /// for up to a week after it is rotated. Without this, rotating means a week of 403s.
     pub play_secrets_prev: Vec<String>,
+    /// `PLAY_SIGNING_GRACE_UNTIL` — the way to turn `PLAY_SECRET` on over an install whose clients
+    /// still hold a week of unsigned `/meta` answers. `/meta` signs from the start; until this moment
+    /// a `/play` or `/crop` with NO tag is still served. A present-but-wrong tag is refused throughout.
+    /// `None` when unset, when it does not parse (fail closed) and when `PLAY_SECRET` is unset.
+    pub play_signing_grace: Option<PlayGrace>,
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off: it
     /// answers 404, the same as a path that does not exist.
     pub metrics_token: Option<String>,
@@ -113,6 +119,98 @@ fn env_opt(key: &str) -> Option<String> {
 /// and `yes` all turn it on. Every Den addon reads it by this rule, and nothing is trimmed.
 pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
     v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The end of the unsigned-URL grace window: epoch ms, to compare against `AppState::clock`, and the
+/// value as the operator wrote it, for the startup line.
+pub struct PlayGrace {
+    pub until_ms: u64,
+    pub until: String,
+}
+
+/// `PLAY_SIGNING_GRACE_UNTIL`, honoured only when `PLAY_SECRET` is set — with no secret nothing is
+/// refused, so there is nothing to be lenient about. A value that does not parse is said loudly and
+/// treated as no grace: a typo then costs the stragglers a 403 and says why, instead of opening a
+/// gate that never closes.
+pub(crate) fn play_grace(secret_set: bool, raw: Option<&str>) -> Option<PlayGrace> {
+    let raw = raw.filter(|_| secret_set)?.trim();
+    match parse_rfc3339_ms(raw) {
+        Some(until_ms) => Some(PlayGrace { until_ms, until: raw.to_string() }),
+        None => {
+            eprintln!(
+                "warning: PLAY_SIGNING_GRACE_UNTIL={raw:?} is not an RFC 3339 timestamp such as \
+                 2026-09-17T12:00:00Z — ignoring it, so unsigned /play is refused from now on"
+            );
+            None
+        }
+    }
+}
+
+/// Epoch milliseconds for an RFC 3339 timestamp: `2026-09-17T12:00:00Z` or `…+02:00`, fractional
+/// seconds allowed. There is no date crate in the tree, and one env var does not justify adding one.
+/// `None` for anything else — including a missing offset, since a local time means whatever zone the
+/// container happens to run in — and for a moment before 1970.
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<u64> {
+    fn digits(part: &str) -> Option<i64> {
+        (!part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())).then(|| part.parse().ok())?
+    }
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (year, month, day) = (digits(s.get(0..4)?)?, digits(s.get(5..7)?)?, digits(s.get(8..10)?)?);
+    let (hour, min, sec) = (digits(s.get(11..13)?)?, digits(s.get(14..16)?)?, digits(s.get(17..19)?)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&month)
+        || !(1..=month_days[month as usize - 1]).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
+    let mut rest = s.get(19..)?;
+    let mut ms = 0i64;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return None;
+        }
+        for (i, c) in frac.bytes().take(n.min(3)).enumerate() {
+            ms += i64::from(c - b'0') * 10i64.pow(2 - i as u32);
+        }
+        rest = &frac[n..];
+    }
+    let offset_min = match rest.as_bytes() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (h, m) = (digits(rest.get(1..3)?)?, digits(rest.get(4..6)?)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            if *sign == b'-' {
+                -(h * 60 + m)
+            } else {
+                h * 60 + m
+            }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + hour * 3600 + min * 60 + sec - offset_min * 60;
+    u64::try_from(secs * 1000 + ms).ok()
 }
 
 /// Fallback when MAX_HEIGHT is unset or not a number. avc1's practical ceiling on YouTube.
@@ -177,6 +275,9 @@ impl Config {
         } else {
             Some(format!("youtube:player_client={ytdlp_extractor_args}"))
         };
+        let play_secret = env_opt("PLAY_SECRET");
+        let play_signing_grace =
+            play_grace(play_secret.is_some(), env_opt("PLAY_SIGNING_GRACE_UNTIL").as_deref());
         Config {
             port,
             cache_dir,
@@ -200,10 +301,11 @@ impl Config {
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
-            play_secret: env_opt("PLAY_SECRET"),
+            play_secret,
             play_secrets_prev: env_opt("PLAY_SECRETS_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default(),
+            play_signing_grace,
             metrics_token: env_opt("METRICS_TOKEN"),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
             public_base_url: env_opt("PUBLIC_BASE_URL"),

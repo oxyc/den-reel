@@ -208,6 +208,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         config_keys_prev: String::new(),
         play_secret: None,
         play_secrets_prev: Vec::new(),
+        play_signing_grace: None,
         metrics_token: None,
         log_requests: false,
         public_base_url: None,
@@ -463,6 +464,97 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
 
     let r = client.get(format!("{base}/crop/cachedVid07.json?s={tag}")).send().await.unwrap();
     assert_eq!(r.status(), 200, "the play URL's tag must open /crop for the same id");
+}
+
+/// Turning signing on over an install whose clients hold a week of unsigned `/meta` answers: until
+/// the deadline a request with NO tag is still served, a WRONG tag never is, and after it the gate
+/// is exactly the one above.
+#[tokio::test]
+async fn a_signing_grace_serves_untagged_urls_until_its_deadline() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.play_signing_grace = Some(crate::config::PlayGrace { until_ms: 60_000, until: "deadline".into() });
+    let clock = TestClock::default();
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let tag = crate::sign::tag("s3cret", "cachedVid07");
+
+    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "a URL cached before signing was turned on 403'd inside the grace");
+    let r =
+        client.get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "the grace is for a missing tag, not a wrong one");
+    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "signed URLs must play during the grace too");
+
+    clock.advance(60_000);
+    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
+    assert_eq!(r.status(), 403, "the grace outlived its deadline");
+    let body: Value =
+        client.get(format!("{base}/crop/cachedVid07.json")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["letterboxed"], false, "an untagged /crop after the deadline degrades as before");
+    assert!(body.get("content").is_none());
+    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
+    assert_eq!(r.status(), 200, "signed URLs outlive the grace");
+}
+
+/// `PLAY_SIGNING_GRACE_UNTIL` is RFC 3339 with an offset, read to the millisecond.
+#[test]
+fn a_grace_timestamp_parses_to_epoch_ms() {
+    use crate::config::parse_rfc3339_ms as p;
+    assert_eq!(p("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(p("2026-09-17T10:00:00Z"), Some(1_789_639_200_000));
+    assert_eq!(p("2026-09-17T12:00:00+02:00"), Some(1_789_639_200_000), "an offset east of UTC");
+    assert_eq!(p("2026-09-17T05:30:00-04:30"), Some(1_789_639_200_000), "an offset west of UTC");
+    assert_eq!(p("2026-09-17t10:00:00z"), Some(1_789_639_200_000), "RFC 3339 allows a lowercase t and z");
+    assert_eq!(p("2024-02-29T23:59:59.5Z"), Some(1_709_251_199_500), "a leap day, and a fraction");
+}
+
+/// A mistyped deadline must enforce signing now, not open a gate that never closes.
+#[test]
+fn a_bad_grace_timestamp_fails_closed() {
+    use crate::config::play_grace;
+    for bad in [
+        "next tuesday",
+        "1789639200",
+        "2026-09-17",
+        "2026-09-17T10:00:00",
+        "2026-02-29T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-09-17T24:00:00Z",
+        "2026-09-17T10:00:00.Z",
+        "2026-09-17T10:00:00+2:00",
+        "1969-12-31T23:59:59Z",
+    ] {
+        assert!(play_grace(true, Some(bad)).is_none(), "{bad:?} opened a grace window");
+    }
+    let good = play_grace(true, Some(" 2026-09-17T10:00:00Z ")).expect("a valid deadline");
+    assert_eq!((good.until_ms, good.until.as_str()), (1_789_639_200_000, "2026-09-17T10:00:00Z"));
+}
+
+/// With no secret nothing is refused, so a grace has nothing to relax and is not read at all.
+#[test]
+fn a_grace_without_a_secret_is_ignored() {
+    assert!(crate::config::play_grace(false, Some("2099-01-01T00:00:00Z")).is_none());
+    assert!(crate::config::play_grace(false, Some("garbage")).is_none(), "nor warned about");
+}
+
+/// The startup line is where an operator checks what the gate is doing right now.
+#[test]
+fn the_startup_line_says_whether_signing_is_in_grace() {
+    use crate::play_signing_state as state;
+    let mut cfg = test_cfg(temp_dir());
+    assert_eq!(state(&cfg, 0), "off");
+    cfg.play_signing_grace = crate::config::play_grace(true, Some("2026-09-17T10:00:00Z"));
+    assert_eq!(state(&cfg, 0), "off", "a grace without a secret is not signing");
+    cfg.play_secret = Some("s3cret".into());
+    assert_eq!(state(&cfg, 1_789_639_199_999), "grace(until=2026-09-17T10:00:00Z)");
+    assert_eq!(state(&cfg, 1_789_639_200_000), "on", "a grace that has passed is plain signing");
+    cfg.play_signing_grace = None;
+    assert_eq!(state(&cfg, 0), "on");
 }
 
 /// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
