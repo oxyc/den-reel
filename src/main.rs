@@ -359,6 +359,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // the page, a plain-text error and a 304 included. A browser that cannot read an error body
     // reports a CORS failure instead of the error.
     resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
+    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
+    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+    resp.headers_mut().insert(
+        "access-control-expose-headers",
+        hyper::header::HeaderValue::from_static("Server-Timing, X-Den-Degraded"),
+    );
+    resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // Time to headers: a streamed /play body is still being written when this runs.
     let elapsed = start.elapsed();
     // `total` only where a handler named its phases, so it is never the whole of the header.
