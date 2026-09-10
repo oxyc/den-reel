@@ -320,7 +320,7 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     // strictly smaller than what was just freed.
     parsed.shrink_to_fit();
     if kept > 0 {
-        println!("resolve cache: {kept} entr{} still good", if kept == 1 { "y" } else { "ies" });
+        eprintln!("resolve cache: {kept} entr{} still good", if kept == 1 { "y" } else { "ies" });
     }
     parsed
 }

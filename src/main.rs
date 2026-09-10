@@ -416,8 +416,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     }
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    println!(
-        "den-reel on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
+    eprintln!(
+        "listening on :{port} (cache {cache_disp}, \u{2264}{max_h}p, addon {})",
         if addon_on { "on" } else { "off \u{2014} set TMDB_KEY" }
     );
 
@@ -493,11 +493,11 @@ async fn serve_until(
         });
     }
     drop(listener);
-    eprintln!("den-reel: shutting down — draining in-flight requests");
+    eprintln!("shutting down — draining in-flight requests");
     tokio::select! {
         _ = graceful.shutdown() => {}
         _ = tokio::time::sleep(grace) => {
-            eprintln!("den-reel: drain deadline ({grace:?}) reached with requests still in flight");
+            eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
         }
     }
 }
