@@ -42,14 +42,14 @@ fn cacheable(status: StatusCode, cache_control: Option<&str>) -> bool {
     status == StatusCode::OK && cache_control.is_some_and(|cc| !cc.is_empty() && !cc.contains("no-store"))
 }
 
-/// `sendJson` equivalent: JSON + permissive CORS + explicit Content-Length, plus any extra headers
-/// (e.g. Cache-Control). Serialization can't fail for our own types, but stay total just in case.
+/// `sendJson` equivalent: JSON + explicit Content-Length, plus any extra headers (e.g.
+/// Cache-Control). CORS is not set here: `handle_request` stamps it on every response on the way
+/// out. Serialization can't fail for our own types, but stay total just in case.
 pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)]) -> Response<Body> {
     let s = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let mut b = Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .header("access-control-allow-origin", "*")
         .header("content-length", s.len());
     let cc = cache_control_of(extra);
     for (k, v) in extra {
@@ -86,6 +86,12 @@ pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> R
         b = b.header(ETAG, etag_of(body.as_bytes()));
     }
     b.body(full(body)).unwrap()
+}
+
+/// The one 404 every Den addon answers, for an unknown path and a refused `/metrics` alike, so a
+/// refusal cannot be told apart from a route that does not exist.
+pub fn not_found() -> Response<Body> {
+    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), &[("cache-control", "no-store")])
 }
 
 /// A typed error body `{ "error": <code>, "message": <msg> }` (no-store applied via `json`).

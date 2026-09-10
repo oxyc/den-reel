@@ -594,6 +594,66 @@ async fn metrics_refuses_a_wrong_token_like_a_missing_route() {
     assert_eq!(scrape_metrics(&base, None).await.status(), 404);
 }
 
+/// An unknown path and a refused /metrics answer the same JSON 404 every Den addon gives.
+#[tokio::test]
+async fn a_missing_route_is_the_shared_json_404() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for r in [reqwest::get(format!("{base}/no-such-route")).await.unwrap(), scrape_metrics(&base, None).await]
+    {
+        assert_eq!(r.status(), 404);
+        assert_eq!(r.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(r.text().await.unwrap(), r#"{"error":"not_found"}"#);
+    }
+}
+
+/// A preflight is answered on any path, before routing — including one that would otherwise 404.
+#[tokio::test]
+async fn options_is_a_cors_preflight_on_any_path() {
+    let state =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    for path in ["/play/cachedVid09.mp4", "/no-such-route"] {
+        let r = client.request(reqwest::Method::OPTIONS, format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 204, "{path}");
+        let h = r.headers();
+        assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(h.get("access-control-allow-methods").unwrap(), "GET, HEAD, POST, OPTIONS");
+        assert_eq!(h.get("access-control-allow-headers").unwrap(), "*");
+        assert_eq!(h.get("access-control-max-age").unwrap(), "86400");
+    }
+}
+
+/// CORS is on every response, not just the JSON ones: the video, a plain-text error, the page, and
+/// a 304.
+#[tokio::test]
+async fn every_response_allows_any_origin() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid10", 4096);
+    let state = build_state(dir, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let acao = |r: &reqwest::Response| r.headers().get("access-control-allow-origin").cloned();
+
+    let play = client.get(format!("{base}/play/cachedVid10.mp4")).send().await.unwrap();
+    assert_eq!(play.status(), 200);
+    assert_eq!(acao(&play).unwrap(), "*");
+    let bad_id = client.get(format!("{base}/play?v=nope")).send().await.unwrap();
+    assert_eq!(bad_id.status(), 400);
+    assert_eq!(acao(&bad_id).unwrap(), "*");
+    let page = client.get(format!("{base}/configure")).send().await.unwrap();
+    assert_eq!(acao(&page).unwrap(), "*");
+    let etag = page.headers().get("etag").unwrap().clone();
+    let revalidated =
+        client.get(format!("{base}/configure")).header("if-none-match", etag).send().await.unwrap();
+    assert_eq!(revalidated.status(), 304);
+    assert_eq!(acao(&revalidated).unwrap(), "*");
+}
+
 #[test]
 fn classify_maps_geoblock_to_451() {
     let e = classify(

@@ -275,10 +275,28 @@ fn metrics_body(state: &AppState) -> String {
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
+    // CORS preflight, on any path: everything here is credential-free, and a browser-based client
+    // asks before it sends anything with a header of its own.
+    if parts.method == hyper::Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, HEAD, POST, OPTIONS")
+            .header("access-control-allow-headers", "*")
+            // A day, so a browser stops preflighting every request.
+            .header("access-control-max-age", "86400")
+            .body(httputil::full(""))
+            .unwrap();
+    }
     let resp = route(state, &parts).await;
     // Honor a conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
     // collapses to a 304 (a no-op for unsafe methods, errors, and `no-store` bodies).
-    httputil::apply_conditional(&parts.method, &parts.headers, resp)
+    let mut resp = httputil::apply_conditional(&parts.method, &parts.headers, resp);
+    // Stamped here rather than in each builder, so no response can go out without it — the video,
+    // the page, a plain-text error and a 304 included. A browser that cannot read an error body
+    // reports a CORS failure instead of the error.
+    resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
+    resp
 }
 
 async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
@@ -310,7 +328,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // configured, so nobody is told there is something here to poke at.
     if path == "/metrics" {
         if !metrics_authorized(&state, &parts.headers) {
-            return httputil::text(StatusCode::NOT_FOUND, "not found");
+            return httputil::not_found();
         }
         let body = metrics_body(&state);
         return Response::builder()
@@ -386,7 +404,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             if let Some(resp) = meta_from_rest(&state, &parts.headers, Some(&cfg), meta_rest, query).await {
                 return resp;
             }
-            return httputil::text(StatusCode::NOT_FOUND, "not found");
+            return httputil::not_found();
         }
     }
 
@@ -412,7 +430,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     if let Some(id) = play_match {
         vid = Some(id.to_string());
     } else if path != "/play" {
-        return httputil::text(StatusCode::NOT_FOUND, "not found");
+        return httputil::not_found();
     }
     let vid = match vid {
         Some(v) if is_valid_vid(&v) => v,
