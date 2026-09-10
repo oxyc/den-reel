@@ -6,7 +6,7 @@
 # npm, no python3 (yt-dlp's standalone build bundles its own interpreter). Builds amd64, the box's arch.
 
 # ---- build ----------------------------------------------------------------
-FROM rust:1-bookworm AS build
+FROM rust:1-trixie AS build
 WORKDIR /src
 # Cache deps: build against manifests + a dummy main first, so a code-only change re-runs only the
 # final (LTO'd) link of our crate, not the whole dependency compile.
@@ -18,7 +18,7 @@ RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in th
 # ---- build MP4Box (GPAC) — writes the clap box; gpac is gone from Debian repos ----------
 # Plain default build → MP4Box + libgpac.so (~10 MB total), linking only libc/libm/libz. Copying the
 # two artifacts keeps the runtime debian-slim instead of pulling gpac's ~200-package apt tree.
-FROM debian:bookworm-slim AS mp4box
+FROM debian:trixie-slim AS mp4box
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential zlib1g-dev git ca-certificates && rm -rf /var/lib/apt/lists/*
 ARG GPAC_VERSION=v2.4.0
@@ -31,7 +31,7 @@ RUN git clone --depth 1 --branch ${GPAC_VERSION} https://github.com/gpac/gpac.gi
     && cd /gpac && ./configure && make -j"$(nproc)"
 
 # ---- fetch extractor tools (curl/unzip stay OUT of the runtime image) ------
-FROM debian:bookworm-slim AS tools
+FROM debian:trixie-slim AS tools
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -72,7 +72,7 @@ RUN set -eux; \
     chmod +x /usr/local/bin/yt-dlp
 
 # ---- runtime --------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # ffmpeg (mux/faststart + cropdetect) + ca-certificates (TLS roots). curl/unzip were build-only, so
 # they're gone; MP4Box comes from the build stage below, not apt.
@@ -104,4 +104,4 @@ EXPOSE 8092
 # No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake. Health is checked when it
 # matters — by the deploy (den/deploy/den-update.sh), against /health and /manifest.json over HTTP.
 USER 65532:65532
-CMD ["den-reel"]
+ENTRYPOINT ["den-reel"]
