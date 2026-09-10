@@ -706,6 +706,7 @@ async fn get_manifest_returns_addon_manifest() {
         build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let base = spawn_server(state).await;
     let body: Value = reqwest::get(format!("{base}/manifest.json")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["id"], "com.den.reel");
     assert_eq!(body["resources"][0], "meta");
 }
 
