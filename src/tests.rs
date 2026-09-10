@@ -669,6 +669,18 @@ fn the_request_log_redacts_the_config_segment() {
     }
 }
 
+/// Off when unset, empty or exactly "0"; on for anything else — the rule every Den addon shares.
+#[test]
+fn log_requests_is_off_only_when_unset_empty_or_zero() {
+    use crate::config::log_requests_on as on;
+    assert!(!on(None));
+    assert!(!on(Some("")));
+    assert!(!on(Some("0")));
+    for v in ["1", "true", "yes", " 0", "00"] {
+        assert!(on(Some(v)), "{v:?} should turn the request log on");
+    }
+}
+
 fn server_timing(r: &reqwest::Response) -> String {
     r.headers().get("server-timing").expect("no Server-Timing").to_str().unwrap().to_string()
 }

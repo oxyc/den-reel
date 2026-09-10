@@ -109,6 +109,12 @@ fn env_opt(key: &str) -> Option<String> {
     }
 }
 
+/// `LOG_REQUESTS`: off when unset, empty, or exactly `0`; on for any other value, so `1`, `true`
+/// and `yes` all turn it on. Every Den addon reads it by this rule, and nothing is trimmed.
+pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Fallback when MAX_HEIGHT is unset or not a number. avc1's practical ceiling on YouTube.
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
 
@@ -199,7 +205,7 @@ impl Config {
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default(),
             metrics_token: env_opt("METRICS_TOKEN"),
-            log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v.trim() != "0"),
+            log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,
