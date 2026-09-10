@@ -1,5 +1,4 @@
 /target
 cache/
 *.mp4
-.dev.vars
 .env

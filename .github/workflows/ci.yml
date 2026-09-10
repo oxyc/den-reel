@@ -33,7 +33,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --locked --release
+        run: cargo test --locked
 
   # On a PR (e.g. an automated yt-dlp bump) — build the image WITHOUT pushing. This is the merge gate:
   # it runs the SHA-verified yt-dlp download + full image assembly, so a bad checksum or broken build

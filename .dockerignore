@@ -3,5 +3,5 @@
 target
 *.md
 !README.md
-.dev.vars
 cache
+.env

@@ -34,7 +34,41 @@ fetches from us, not from YouTube.
 - **Cached + seekable**: first play fetches (~3–6s), later plays are instant; HTTP range supported.
 - **Bounded cache**: LRU eviction at `CACHE_MAX_BYTES`.
 
-## API
+## Maintenance
+
+`/health` always returns 200 (liveness) with a JSON `status`: `ok`, or `degraded` with a `reason` —
+`tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
+fallback and its outage is deliberately invisible here), or
+`extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
+YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` — pinning
+`YTDLP_PLAYER_CLIENTS` is a stopgap, not the fix),
+or `downloads_failing` (yt-dlp extracts fine but no file is produced — check the cache volume and
+MP4Box). The two are separate because the remedy is: an outage where every download fails locally
+would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full disk.
+The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
+answering while every trailer silently comes back empty.
+
+`/metrics` is the detail behind that verdict, as Prometheus gauges prefixed `reel_`: bytes and
+trailers on the volume against `CACHE_MAX_BYTES` (plus the scratch that also counts against it),
+downloads in flight against their caps, the size of each in-memory cache, the three
+consecutive-failure counters `/health` collapses into one word (`reel_consecutive_failures{kind}`),
+and `reel_build_info{version}`. The cache figures come from the eviction pass — which runs after
+every download and hourly — not from a directory walk per request, so
+`reel_cache_measured_at_seconds` says how fresh they are and reads `0` until the first pass on a new
+process. Nothing is computed until a scrape asks.
+
+It is **off unless `METRICS_TOKEN` is set**, and then answers only
+`Authorization: Bearer <METRICS_TOKEN>`; every refusal is the same 404 an unknown path gets. In-flight
+counts and occupancy polled over time say when the household is watching, which is why it is gated.
+
+YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
+when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
+yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
+degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
++ `cargo test` on every push and PR; it publishes `ghcr.io/oxyc/den-reel` only on a `v*` tag or a
+manual run.
+
+## Routes
 
 ```
 GET /configure                            →  the page that seals a BYOK key into an install URL
@@ -49,7 +83,11 @@ GET /crop/<youtube_id>.json               →  detected content rectangle (lette
        opens /crop, which without it answers "play the full frame" instead of refusing
 GET /health                               →  200 {status} — ok, or degraded (see below)
 GET /metrics                              →  Prometheus text (bearer METRICS_TOKEN; 404 without it)
+OPTIONS <any path>                        →  204 CORS preflight
+anything else                             →  404 {"error":"not_found"}
 ```
+
+Every response carries `Access-Control-Allow-Origin: *`.
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
 following `/play` is warm. Two knobs:
@@ -125,33 +163,11 @@ trailer reached the cache — it exited 0 with no file, or the `clap` bake was k
 its in-place rewrite and the result cannot be trusted. Nothing about yt-dlp or the player clients
 will help, so it feeds `downloads_failing` rather than `extractor_unavailable`.
 
-## Run
+## Configuration
 
-```bash
-docker build -t den-reel .
-docker run -d --name trailers -p 8092:8092 -v den-reel-cache:/cache \
-  -e TMDB_KEY=<your-tmdb-key> den-reel
-curl http://localhost:8092/meta/movie/tt0111161.json          # → a /play URL
-curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke test
-```
+Every variable is optional; `.env.example` lists them all with their defaults.
 
-In the homelab it runs as a Podman Quadlet unit, `den-reel.container`, from the `den` repo's
-`deploy/`: LAN host port 8092, every capability dropped, `no-new-privileges`, a 1 GiB memory cap,
-and the cache bind-mounted from `/var/lib/den/reel-cache` (owned by uid 65532, the image's non-root
-user). New images reach it through the health-gated `den-update` script. The env files, digest
-pinning and rollback are described once, in that repo's `deploy/README.md`. Nothing sits in front of
-it, so play URLs are built from the host the client asked for (`http://<den-ip>:8092/play/…`). Add
-the URL `/configure` gives you — `http://<den-ip>:8092/<config>/manifest.json` — to Den
-(Settings → Plugins, or `dev-addons.json`). The config-less `/manifest.json` works only while
-`TMDB_KEY` is still set, and resolves with that shared key rather than the install's own.
-
-Without Docker (needs `ffmpeg`, `yt-dlp`, and a JS runtime like `deno` on PATH):
-`TMDB_KEY=… cargo run --release`.
-Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, no yt-dlp).
-
-## Config (env)
-
-| Var | Default | Notes |
+| Variable | Default | Purpose |
 |---|---|---|
 | `CONFIG_KEY` | — | sealed config-in-URL: base64 32-byte X25519 private key. Set it and `/configure` seals a BYOK TMDB key into the install URL (`crypto_box_seal`) so no discovery key lives on the server. Generate: `head -c 32 /dev/urandom \| base64` — and **back it up** (losing it breaks sealed installs). Unset = sealed disabled, legacy plaintext URLs still work. See `den-scout/docs/SEALED-CONFIG.md`. |
 | `CONFIG_KEYS_PREV` | — | comma-separated prior keys for rotation (old sealed URLs keep decrypting) |
@@ -172,35 +188,31 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `CACHE_TTL_DAYS` | `14` | Drop a trailer this long after it was last served |
 | `YTDLP_PLAYER_CLIENTS` | *(unset — yt-dlp chooses)* | Pin the YouTube innertube client(s) for `--extractor-args player_client`, comma-separated. **Normally leave this alone.** It used to default to `tv_embedded,android`; yt-dlp has since retired `tv_embedded`, and an unrecognised client is answered with a *warning* (`Skipping unsupported client`) that `--no-warnings` hides — so the pin silently degraded to `android` alone, which now needs a PO token for both HTTPS and DASH. Which client works is a judgement about what YouTube is enforcing this month, it is the judgement the yt-dlp team makes daily, and bumping `YTDLP_VERSION` is how we receive it. Set this only to ride out a specific outage, and check the name against the yt-dlp release you have pinned — a retired one fails quietly. |
 
-## Maintenance
+## Run
 
-`/health` always returns 200 (liveness) with a JSON `status`: `ok`, or `degraded` with a `reason` —
-`tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
-fallback and its outage is deliberately invisible here), or
-`extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
-YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` — pinning
-`YTDLP_PLAYER_CLIENTS` is a stopgap, not the fix),
-or `downloads_failing` (yt-dlp extracts fine but no file is produced — check the cache volume and
-MP4Box). The two are separate because the remedy is: an outage where every download fails locally
-would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full disk.
-The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
-answering while every trailer silently comes back empty.
+```bash
+docker build -t den-reel .
+docker run -d --name trailers -p 8092:8092 -v den-reel-cache:/cache \
+  -e TMDB_KEY=<your-tmdb-key> den-reel
+curl http://localhost:8092/meta/movie/tt0111161.json          # → a /play URL
+curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke test
+```
 
-`/metrics` is the detail behind that verdict, as Prometheus gauges prefixed `reel_`: bytes and
-trailers on the volume against `CACHE_MAX_BYTES` (plus the scratch that also counts against it),
-downloads in flight against their caps, the size of each in-memory cache, the three
-consecutive-failure counters `/health` collapses into one word (`reel_consecutive_failures{kind}`),
-and `reel_build_info{version}`. The cache figures come from the eviction pass — which runs after
-every download and hourly — not from a directory walk per request, so
-`reel_cache_measured_at_seconds` says how fresh they are and reads `0` until the first pass on a new
-process. Nothing is computed until a scrape asks.
+Without Docker (needs `ffmpeg`, `yt-dlp`, and a JS runtime like `deno` on PATH):
+`TMDB_KEY=… cargo run --release`.
 
-It is **off unless `METRICS_TOKEN` is set**, and then answers only
-`Authorization: Bearer <METRICS_TOKEN>`; every refusal is the same 404 an unknown path gets. In-flight
-counts and occupancy polled over time say when the household is watching, which is why it is gated.
+Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, no yt-dlp).
 
-YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
-when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
-yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
-degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
-+ `cargo test` on every push; it publishes `ghcr.io/oxyc/den-reel` only on a `v*` tag or a manual run.
+## Deploy
+
+The homelab runs it as a Podman Quadlet unit, `den-reel.container`, from the `den` repo's
+`deploy/`: LAN host port 8092, a 1 GiB memory cap, every capability dropped, `no-new-privileges`,
+uid 65532 (the image's non-root user), and the cache bind-mounted from `/var/lib/den/reel-cache`
+(owned by 65532). New images reach it through the health-gated `den-update` script. The env files,
+digest pinning and rollback are described once, in that repo's `deploy/README.md`.
+
+Nothing sits in front of it, so play URLs are built from the host the client asked for
+(`http://<den-ip>:8092/play/…`). Add the URL `/configure` gives you —
+`http://<den-ip>:8092/<config>/manifest.json` — to Den (Settings → Plugins, or `dev-addons.json`).
+The config-less `/manifest.json` works only while `TMDB_KEY` is still set, and resolves with that
+shared key rather than the install's own.
