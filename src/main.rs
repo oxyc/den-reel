@@ -82,7 +82,7 @@ pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --sim
                                         // Cap on DISTINCT ids with a download outstanding. `download_sem` bounds how many run at once, but
                                         // the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
                                         // driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. That is request-driven growth: on an
-                                        // instance without REEL_PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
+                                        // instance without PLAY_SECRET, anyone who can reach /play can add to it by asking for ids that
                                         // are merely well-formed.
                                         //
                                         // Sized by what the queue can plausibly SERVE, not just by memory. The wait is un-timed — only the
@@ -424,7 +424,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     play::handle_play(state, &parts.headers, vid).await
 }
 
-/// May this request spend a download on this id? `true` for every request when `REEL_PLAY_SECRET` is
+/// May this request spend a download on this id? `true` for every request when `PLAY_SECRET` is
 /// unset, which is the default.
 ///
 /// A predicate, not a response. The two callers disagree about what a refusal looks like — `/play`

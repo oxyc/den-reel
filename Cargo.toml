@@ -34,7 +34,7 @@ base64 = "0.23"
 # byte-compatible with the Go addon (den-scout), the Rust addon (den-subtitles), and the browser bundle.
 # Decrypt-only here → no rng needed.
 crypto_box = { version = "0.9", features = ["seal"] }
-# Keyed BLAKE2b for the optional /play + /crop URL signature (REEL_PLAY_SECRET), and a constant-time
+# Keyed BLAKE2b for the optional /play + /crop URL signature (PLAY_SECRET), and a constant-time
 # compare for checking it. Both are ALREADY in the tree — crypto_box uses blake2 for the seal nonce
 # and subtle throughout — so these edges add a direct dependency, not a new crate to compile.
 blake2 = "0.10"

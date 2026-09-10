@@ -5,7 +5,7 @@
 //! is [`crate::is_valid_vid`], so an instance reachable from outside the LAN is a YouTube extraction
 //! service anyone can point at any video, and a way to fill a 4 GB cache with things nobody asked for.
 //!
-//! With `REEL_PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>` and both endpoints
+//! With `PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>` and both endpoints
 //! require a tag that verifies. Unset, nothing changes at all: this has to default off because
 //! `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and turning
 //! signing on unconditionally would break every install for that week.

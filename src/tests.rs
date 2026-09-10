@@ -3599,7 +3599,7 @@ async fn an_eviction_between_fetch_and_serve_is_actually_retried() {
 /// `download_sem` bounds how many downloads RUN at once, but the permit is taken inside
 /// `download_cached` — so every distinct well-formed id got an `in_flight` entry and a spawned
 /// driver that could sit queued for up to DOWNLOAD_TIMEOUT_SECS. On an instance without
-/// REEL_PLAY_SECRET that is request-driven growth, reachable by anyone who can hit /play.
+/// PLAY_SECRET that is request-driven growth, reachable by anyone who can hit /play.
 ///
 /// Joining a download already in flight must still be free: that is what the de-duplication is for,
 /// and a viewer waiting on a trailer someone else triggered must never be turned away by the cap.

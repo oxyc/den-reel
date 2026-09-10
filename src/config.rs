@@ -2,7 +2,8 @@
 //!
 //! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, CACHE_TTL_DAYS, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); CONFIG_KEY / CONFIG_KEYS_PREV (sealed config-in-URL);
-//!      REEL_PLAY_SECRET (optional signing of the /play + /crop URLs); METRICS_TOKEN (turns on /metrics).
+//!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
+//!      METRICS_TOKEN (turns on /metrics).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
 //!      sealed in the URL (den-scout/docs/SEALED-CONFIG.md). Drop the env keys once installs migrate.
@@ -44,12 +45,12 @@ pub struct Config {
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
     pub config_keys_prev: String,
-    /// `REEL_PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
+    /// `PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
     /// require the signature (see `sign.rs`). `None` disables it, which is the default and has to
     /// be: `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
     /// turning this on unconditionally would break every install for that week.
     pub play_secret: Option<String>,
-    /// `REEL_PLAY_SECRET_PREV` — comma-separated prior secrets, accepted when VERIFYING and never
+    /// `PLAY_SECRETS_PREV` — comma-separated prior secrets, accepted when VERIFYING and never
     /// used to sign. Same rotation shape as `config_keys_prev`, and needed for the same reason:
     /// `/meta` ships `max-age=604800`, so a client can present a tag made with the previous secret
     /// for up to a week after it is rotated. Without this, rotating means a week of 403s.
@@ -190,8 +191,8 @@ impl Config {
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
-            play_secret: env_opt("REEL_PLAY_SECRET"),
-            play_secrets_prev: env_opt("REEL_PLAY_SECRET_PREV")
+            play_secret: env_opt("PLAY_SECRET"),
+            play_secrets_prev: env_opt("PLAY_SECRETS_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default(),
             metrics_token: env_opt("METRICS_TOKEN"),
