@@ -543,6 +543,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                         userconfig::Rejected::Undecodable => "bad_config",
                         userconfig::Rejected::Revoked { .. } => "install_revoked",
                         userconfig::Rejected::EpochTooOld { .. } => "install_epoch_too_old",
+                        userconfig::Rejected::NoInstallId => "install_no_iid",
                     };
                     log_limited(condition, || match why {
                         userconfig::Rejected::Undecodable => {
@@ -767,13 +768,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
         "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
-         play_signing={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
+         require_iid={} play_signing={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
         env!("CARGO_PKG_VERSION"),
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
         on(state.config_keyring.is_some()),
         state.cfg.revocation.revoked_count(),
         state.cfg.revocation.epoch(),
+        on(state.cfg.revocation.requires_install_id()),
         play_signing_state(&state.cfg, (state.clock)()),
         on(state.cfg.tmdb_key.is_some()),
     );

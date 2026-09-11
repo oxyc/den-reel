@@ -309,7 +309,8 @@ impl Config {
             revocation: crate::userconfig::Revocation::from_env(
                 &env_opt("REVOKED_INSTALLS").unwrap_or_default(),
                 env_opt("CONFIG_EPOCH").as_deref(),
-            ),
+            )
+            .requiring_install_id(env_opt("REQUIRE_INSTALL_ID").is_some_and(|v| v != "0")),
             play_secret,
             play_secrets_prev: env_opt("PLAY_SECRETS_PREV")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
