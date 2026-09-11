@@ -541,6 +541,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                     // 400 as an undecodable one; this line is the only place the two differ.
                     let condition = match why {
                         userconfig::Rejected::Undecodable => "bad_config",
+                        userconfig::Rejected::Plaintext => "plaintext_refused",
                         userconfig::Rejected::Revoked { .. } => "install_revoked",
                         userconfig::Rejected::EpochTooOld { .. } => "install_epoch_too_old",
                         userconfig::Rejected::NoInstallId => "install_no_iid",

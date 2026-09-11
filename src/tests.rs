@@ -1317,18 +1317,17 @@ async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
 }
 
 #[tokio::test]
-async fn legacy_plaintext_config_resolves_with_a_keyring_present() {
+async fn a_plaintext_config_is_refused_while_sealing_is_on() {
+    // Every install /configure issues is sealed once a key is set, and /config-key is public: a plaintext
+    // segment is one anyone could have minted.
     use base64::Engine;
     let fake = FakeUpstream::new(&["vidKey12345"], None);
     let base = spawn_server(sealed_state(fake)).await;
-    let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"tmdbKey":"legacy"}"#);
-    let body: Value =
-        reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap().json().await.unwrap();
-    assert_eq!(
-        body["meta"]["links"].as_array().unwrap().len(),
-        1,
-        "legacy plaintext config must still resolve"
-    );
+    let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"tmdbKey":"plain"}"#);
+    let resp = reqwest::get(format!("{base}/{seg}/meta/movie/tt0111161.json")).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"error": "bad_config"}));
 }
 
 // --- /play serve contract (seed a cached file so fetch_trailer never spawns yt-dlp) ---
