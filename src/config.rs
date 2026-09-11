@@ -48,8 +48,9 @@ pub struct Config {
     pub config_key: String,
     pub config_keys_prev: String,
     /// Installs refused outright (`REVOKED_INSTALLS`) and the oldest config epoch still admitted
-    /// (`CONFIG_EPOCH`). See `userconfig::Revocation`. Only the config-scoped routes read it: a
-    /// `/play` or `/crop` URL names a video, not an install, so there is nothing there to refuse.
+    /// (`CONFIG_EPOCH`). See `userconfig::Revocation`. The config-scoped routes read it, and so do
+    /// `/play` and `/crop` for a signed link bound to an install (`sign::Binding`) — which needs
+    /// `PLAY_SECRET`: an unsigned link's install could simply be edited out of it.
     pub revocation: crate::userconfig::Revocation,
     /// `PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
     /// require the signature (see `sign.rs`). `None` disables it, which is the default and has to
@@ -63,7 +64,8 @@ pub struct Config {
     pub play_secrets_prev: Vec<String>,
     /// `PLAY_SIGNING_GRACE_UNTIL` — the way to turn `PLAY_SECRET` on over an install whose clients
     /// still hold a week of unsigned `/meta` answers. `/meta` signs from the start; until this moment
-    /// a `/play` or `/crop` with NO tag is still served. A present-but-wrong tag is refused throughout.
+    /// a `/play` or `/crop` with NO tag is still served, and so is one with a tag over the id alone —
+    /// what releases before install binding signed. Any other wrong tag is refused throughout.
     /// `None` when unset, when it does not parse (fail closed) and when `PLAY_SECRET` is unset.
     pub play_signing_grace: Option<PlayGrace>,
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off: it

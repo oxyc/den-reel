@@ -482,7 +482,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     if path == "/manifest.json" {
         return httputil::json(
             StatusCode::OK,
-            &addon::manifest(),
+            &addon::manifest(None),
             &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
         );
     }
@@ -539,14 +539,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                     // guess. Length only: the segment carries the key. Once a minute, because that
                     // is also every request those installs make. A revoked install gets the same
                     // 400 as an undecodable one; this line is the only place the two differ.
-                    let condition = match why {
-                        userconfig::Rejected::Undecodable => "bad_config",
-                        userconfig::Rejected::Plaintext => "plaintext_refused",
-                        userconfig::Rejected::Revoked { .. } => "install_revoked",
-                        userconfig::Rejected::EpochTooOld { .. } => "install_epoch_too_old",
-                        userconfig::Rejected::NoInstallId => "install_no_iid",
-                    };
-                    log_limited(condition, || match why {
+                    log_limited(refusal_condition(&why), || match why {
                         userconfig::Rejected::Undecodable => {
                             format!("bad_config: {rest} rejected a {}-byte config segment", cfg_seg.len())
                         }
@@ -562,7 +555,7 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             if rest == "manifest.json" {
                 return httputil::json(
                     StatusCode::OK,
-                    &addon::manifest(),
+                    &addon::manifest(cfg.iid.as_deref()),
                     &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
                 );
             }
@@ -614,55 +607,110 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     play::handle_play(state, &parts.headers, vid).await
 }
 
+/// The log condition for each way a config or a bound link is refused, so each is rate-limited apart.
+fn refusal_condition(why: &userconfig::Rejected) -> &'static str {
+    match why {
+        userconfig::Rejected::Undecodable => "bad_config",
+        userconfig::Rejected::Plaintext => "plaintext_refused",
+        userconfig::Rejected::Revoked { .. } => "install_revoked",
+        userconfig::Rejected::EpochTooOld { .. } => "install_epoch_too_old",
+        userconfig::Rejected::NoInstallId => "install_no_iid",
+    }
+}
+
 /// May this request spend a download on this id? `true` for every request when `PLAY_SECRET` is
-/// unset, which is the default, and for one carrying no tag at all while `PLAY_SIGNING_GRACE_UNTIL`
-/// is still ahead.
+/// unset, which is the default. Otherwise the tag must verify over the id and the install named by
+/// `i`/`e` (see `sign.rs`), and that install must still be admitted by `REVOKED_INSTALLS` /
+/// `CONFIG_EPOCH` / `REQUIRE_INSTALL_ID`. While `PLAY_SIGNING_GRACE_UNTIL` is ahead, a request with
+/// no tag, or with a tag over the id alone from before install binding, is served too.
 ///
 /// A predicate, not a response. The two callers disagree about what a refusal looks like — `/play`
 /// says 403, `/crop` degrades to "play the full frame" — and the `/crop` refusal is the EXPECTED
 /// case there, since nothing this server emits is a signed crop URL. Returning a built response
 /// meant serializing a JSON body and a header map on that path and dropping both.
 ///
-/// Both endpoints authorise the same work for the same id, and the tag covers the id alone, so a
-/// client can carry the `s` it was handed on the play URL straight over to `/crop`.
+/// Both endpoints authorise the same work for the same id, and the tag does not cover the path, so a
+/// client can carry the query it was handed on the play URL straight over to `/crop`.
 fn signature_ok(state: &Arc<AppState>, vid: &str, query: &str) -> bool {
     let Some(secret) = state.cfg.play_secret.as_deref() else { return true };
-    let presented = query_param(query, "s");
-    // Only a MISSING tag rides the grace window. A URL issued before signing was turned on carries
-    // none; a wrong one was never issued by this server under any setting.
-    if presented.is_none() && in_grace(&state.cfg, (state.clock)()) {
-        note_unsigned_in_grace(vid);
+    let prev = &state.cfg.play_secrets_prev;
+    let Some(presented) = query_param(query, "s") else {
+        // A missing tag rides the grace window: a URL issued before signing was turned on carries none.
+        if in_grace(&state.cfg, (state.clock)()) {
+            note_served_in_grace(vid, "without a tag");
+            return true;
+        }
+        return false;
+    };
+    let iid = query_param(query, "i");
+    let binding = match query_param(query, "e") {
+        None if iid.is_none() => sign::Binding::Unbound,
+        // Never minted: an install id always travels with its epoch.
+        None => return false,
+        Some(ep) => match ep.parse() {
+            Ok(ep) => sign::Binding::Install { iid: iid.as_deref(), ep },
+            Err(_) => return false,
+        },
+    };
+    if sign::verify_any(secret, prev, &sign::message(vid, binding), Some(&presented)) {
+        return install_admitted(state, vid, binding);
+    }
+    // A tag over the id alone, as releases before install binding minted it. It names no install,
+    // so nothing can revoke it: honoured only inside the grace, like an untagged URL. A bound link
+    // stripped of `i`/`e` does not land here, because its tag covers the binding.
+    if binding == sign::Binding::Unbound
+        && in_grace(&state.cfg, (state.clock)())
+        && sign::verify_any(secret, prev, vid, Some(&presented))
+    {
+        note_served_in_grace(vid, "on a tag from before install binding");
         return true;
     }
-    sign::verify_any(secret, &state.cfg.play_secrets_prev, vid, presented.as_deref())
+    false
+}
+
+/// Is the install a verified link was minted for still admitted? An unbound link, from the
+/// config-less `/meta`, names none and is. A refusal gets the same answer as a bad tag; this log
+/// line, in the style of the config routes' `bad_config`, is the only place the two differ.
+fn install_admitted(state: &AppState, vid: &str, binding: sign::Binding) -> bool {
+    let sign::Binding::Install { iid, ep } = binding else { return true };
+    match state.cfg.revocation.check_install(iid, ep) {
+        Ok(()) => true,
+        Err(why) => {
+            log_limited(&format!("play_{}", refusal_condition(&why)), || {
+                format!("bad_signature: link for {vid} refused — {why}")
+            });
+            false
+        }
+    }
 }
 
 fn in_grace(cfg: &Config, now_ms: u64) -> bool {
     cfg.play_signing_grace.as_ref().is_some_and(|g| now_ms < g.until_ms)
 }
 
-/// Ids remembered by `note_unsigned_in_grace`. Anyone who can reach `/play` can invent ids, so the
+/// Ids remembered by `note_served_in_grace`. Anyone who can reach `/play` can invent ids, so the
 /// set is bounded; past it the rest share one rate-limited line.
 const GRACE_LOGGED_IDS: usize = 4096;
 
-/// Say, once per id, that an unsigned URL was served only because of the grace window, so the
-/// operator can see which trailers clients are still holding pre-signing URLs for — and that the
+/// Say, once per id and `how`, that a URL was served only because of the grace window, so the
+/// operator can see which trailers clients are still holding old URLs for — and that the
 /// stragglers have stopped before the deadline arrives.
-fn note_unsigned_in_grace(vid: &str) {
+fn note_served_in_grace(vid: &str, how: &str) {
     static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = format!("{vid} {how}");
     let fresh = {
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.contains(vid) {
+        if seen.contains(&key) {
             return;
         }
-        seen.len() < GRACE_LOGGED_IDS && seen.insert(vid.to_string())
+        seen.len() < GRACE_LOGGED_IDS && seen.insert(key)
     };
     if fresh {
-        eprintln!("play signing grace: served {vid} without a tag");
+        eprintln!("play signing grace: served {vid} {how}");
     } else {
-        log_limited("unsigned_in_grace", || {
-            format!("play signing grace: served {vid} without a tag (past {GRACE_LOGGED_IDS} distinct ids)")
+        log_limited("served_in_grace", || {
+            format!("play signing grace: served {vid} {how} (past {GRACE_LOGGED_IDS} distinct ids)")
         });
     }
 }

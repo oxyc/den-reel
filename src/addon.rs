@@ -12,8 +12,11 @@ use crate::httputil::{self, query_param, Body};
 use crate::state::{AppState, YtEntry};
 use crate::{MAX_PROBE, STALE_GRACE_MS, YT_CACHE_MAX, YT_FAIL_TTL_MS, YT_NEG_TTL_MS, YT_TTL_MS};
 
-pub fn manifest() -> Value {
-    json!({
+/// The addon manifest. A configured install's carries `denInstallId`, its install id spelled exactly
+/// as `REVOKED_INSTALLS` takes it, so the app can show which id revokes this link; absent when the
+/// config has none and on the config-less manifest.
+pub fn manifest(install_id: Option<&str>) -> Value {
+    let mut manifest = json!({
         "id": "com.den.reel",
         // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
         // manifest can't drift from Cargo.toml, nor the tag from either.
@@ -27,7 +30,11 @@ pub fn manifest() -> Value {
         // A BYOK TMDB key is entered (and sealed) at /configure — advertise it so a Stremio client shows
         // the Configure button. The Den app builds the sealed URL directly, so this is just for parity.
         "behaviorHints": { "configurable": true },
-    })
+    });
+    if let Some(iid) = install_id {
+        manifest["denInstallId"] = json!(iid);
+    }
+    manifest
 }
 
 /// `tt` + digits, and a BOUNDED number of them. The longest real IMDb id is 8 digits; 11 leaves
@@ -81,18 +88,29 @@ fn is_sane_host(h: &str) -> bool {
 /// can fall back to the next on a playback failure. Empty ids → no links.
 ///
 /// `secret` is `PLAY_SECRET` when the operator has set it: the play URL then carries the tag
-/// that `/play` and `/crop` will demand (see `sign.rs`). `None` — the default — emits exactly the
-/// bare URL this has always emitted.
-pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String], secret: Option<&str>) -> Value {
+/// that `/play` and `/crop` will demand, bound to the install that asked (`binding`, see `sign.rs`),
+/// so revoking that install revokes its links too. `None` — the default — emits exactly the bare URL
+/// this has always emitted.
+pub fn build_meta(
+    ty: &str,
+    imdb: &str,
+    base: &str,
+    yt_ids: &[String],
+    secret: Option<&str>,
+    binding: crate::sign::Binding,
+) -> Value {
     let base = base.trim_end_matches('/');
     // Derived once, not once per link: the MAC key depends only on the secret, and this signs up to
     // MAX_PROBE ids per response.
     let signer = secret.map(crate::sign::Signer::new);
+    let bound = binding.query();
     let links: Vec<Value> = yt_ids
         .iter()
         .map(|id| {
             let url = match &signer {
-                Some(s) => format!("{base}/play/{id}.mp4?s={}", s.tag(id)),
+                Some(s) => {
+                    format!("{base}/play/{id}.mp4?s={}{bound}", s.tag(&crate::sign::message(id, binding)))
+                }
                 None => format!("{base}/play/{id}.mp4"),
             };
             json!({
@@ -342,12 +360,16 @@ pub async fn handle_meta(
 ) -> Response<Body> {
     let imdb = raw_id.split(':').next().unwrap_or(""); // series may arrive as tt…:S:E — trailers are show-level
     let base = self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
+    let binding = match cfg {
+        Some(c) => crate::sign::Binding::Install { iid: c.iid.as_deref(), ep: c.ep },
+        None => crate::sign::Binding::Unbound,
+    };
     // Only imdb ids reach the upstreams (and our URLs) — reject anything else so a crafted id
     // can't be interpolated into a TMDB/KinoCheck request.
     if !is_imdb(imdb) {
         return httputil::json(
             StatusCode::OK,
-            &build_meta(ty, imdb, &base, &[], state.cfg.play_secret.as_deref()),
+            &build_meta(ty, imdb, &base, &[], state.cfg.play_secret.as_deref(), binding),
             &[("cache-control", "no-store")],
         );
     }
@@ -374,7 +396,7 @@ pub async fn handle_meta(
             (state.prewarm)(state.clone(), primary.clone());
         }
     }
-    let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref());
+    let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());

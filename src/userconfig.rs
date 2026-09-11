@@ -96,15 +96,20 @@ impl Revocation {
         self.epoch
     }
 
-    /// Whether `cfg`'s install is still admitted. The id is checked first, as the more specific answer.
     fn check(&self, cfg: &UserConfig) -> Result<(), Rejected> {
-        if let Some(iid) = cfg.iid.as_deref().filter(|iid| self.revoked.contains(*iid)) {
+        self.check_install(cfg.iid.as_deref(), cfg.ep)
+    }
+
+    /// Whether the install with this id and epoch is still admitted — asked of a config, and of a
+    /// signed play link bound to one. The id is checked first, as the more specific answer.
+    pub fn check_install(&self, iid: Option<&str>, ep: u64) -> Result<(), Rejected> {
+        if let Some(iid) = iid.filter(|iid| self.revoked.contains(*iid)) {
             return Err(Rejected::Revoked { iid_prefix: iid.chars().take(6).collect() });
         }
-        if cfg.ep < self.epoch {
-            return Err(Rejected::EpochTooOld { ep: cfg.ep, epoch: self.epoch });
+        if ep < self.epoch {
+            return Err(Rejected::EpochTooOld { ep, epoch: self.epoch });
         }
-        if self.require_iid && cfg.iid.is_none() {
+        if self.require_iid && iid.is_none() {
             return Err(Rejected::NoInstallId);
         }
         Ok(())

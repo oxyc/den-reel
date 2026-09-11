@@ -5,16 +5,25 @@
 //! is [`crate::is_valid_vid`], so an instance reachable from outside the LAN is a YouTube extraction
 //! service anyone can point at any video, and a way to fill a 4 GB cache with things nobody asked for.
 //!
-//! With `PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>` and both endpoints
-//! require a tag that verifies. Unset, nothing changes at all: this has to default off because
-//! `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and turning
-//! signing on unconditionally would break every install for that week.
+//! With `PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>&i=<iid>&e=<ep>` and both
+//! endpoints require a tag that verifies. Unset, nothing changes at all: this has to default off
+//! because `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
+//! turning signing on unconditionally would break every install for that week.
 //!
-//! The tag covers the **id alone**, deliberately, not the path or an expiry. Not the path, so a
-//! client can carry the `s` it was given on the play URL straight over to `/crop` for the same id —
-//! the two endpoints authorise the same work. Not an expiry, because the play URL is immutable and
-//! cached hard by design (`max-age=31536000`), and an expiring URL inside an immutable response is
-//! a broken trailer waiting for a clock to tick over.
+//! The tag covers the id and the **install the link was minted for** ([`message`]): its install id
+//! and config epoch, carried in the URL as `i` and `e`. Signing them is what lets a revocation
+//! reach the links an install was already handed — `REVOKED_INSTALLS` and `CONFIG_EPOCH` are checked
+//! against them at `/play` and `/crop`, and editing either field breaks the tag. A link from the
+//! config-less `/meta` has no install to name and is signed [`Binding::Unbound`].
+//!
+//! Not the path, so a client can carry the query it was given on the play URL straight over to
+//! `/crop` for the same id — the two endpoints authorise the same work. Not an expiry, because the
+//! play URL is immutable and cached hard by design (`max-age=31536000`), and an expiring URL inside an
+//! immutable response is a broken trailer waiting for a clock to tick over.
+//!
+//! Releases before install binding signed the id alone. A tag over the bare id is still accepted
+//! while `PLAY_SIGNING_GRACE_UNTIL` is ahead, and never after; the two formats cannot be confused,
+//! because a bound message starts with a version prefix no 11-character id can spell.
 //!
 //! Keyed BLAKE2b, from the `blake2` crate already in the tree (crypto_box uses it for the seal
 //! nonce), so this adds no compiled code — only a direct dependency edge.
@@ -42,6 +51,39 @@ fn key_of(secret: &str) -> [u8; 32] {
     key
 }
 
+/// What a play URL is bound to besides its video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding<'a> {
+    /// Minted by the config-less `/meta`, which has no install to name.
+    Unbound,
+    /// Minted for a configured install: its id (`None` on a config from before ids) and its epoch.
+    Install { iid: Option<&'a str>, ep: u64 },
+}
+
+impl Binding<'_> {
+    /// The query parameters after `s=<tag>` that carry this binding: `&i=<iid>&e=<ep>`, `&e=<ep>`
+    /// for a config without an id, nothing when unbound. An install id is base64url and an epoch is
+    /// digits, so neither needs encoding.
+    pub fn query(&self) -> String {
+        match self {
+            Binding::Unbound => String::new(),
+            Binding::Install { iid: Some(iid), ep } => format!("&i={iid}&e={ep}"),
+            Binding::Install { iid: None, ep } => format!("&e={ep}"),
+        }
+    }
+}
+
+/// What a play URL's tag covers: a version prefix, the id, then the binding, NUL-separated. An absent
+/// install id is empty and an unbound link has an empty epoch, which no install's epoch can be, so
+/// each binding has exactly one message. The pre-binding format was the bare id, which never starts
+/// with `v2\0`.
+pub fn message(vid: &str, binding: Binding) -> String {
+    match binding {
+        Binding::Unbound => format!("v2\0{vid}\0\0"),
+        Binding::Install { iid, ep } => format!("v2\0{vid}\0{}\0{ep}", iid.unwrap_or("")),
+    }
+}
+
 /// A secret with its MAC key already derived, so a caller signing several ids pays for that once.
 ///
 /// `build_meta` signs up to `MAX_PROBE` links per response, and deriving the key is a full BLAKE2b
@@ -54,20 +96,20 @@ impl Signer {
         Signer(key_of(secret))
     }
 
-    /// The tag for `vid`, lowercase hex.
-    pub fn tag(&self, vid: &str) -> String {
-        tag_with_key(&self.0, vid)
+    /// The tag for `msg` (a [`message`]), lowercase hex.
+    pub fn tag(&self, msg: &str) -> String {
+        tag_with_key(&self.0, msg)
     }
 }
 
-/// The tag for `vid`, lowercase hex. Derives the key per call; use [`Signer`] to sign more than one.
-pub fn tag(secret: &str, vid: &str) -> String {
-    tag_with_key(&key_of(secret), vid)
+/// The tag for `msg`, lowercase hex. Derives the key per call; use [`Signer`] to sign more than one.
+pub fn tag(secret: &str, msg: &str) -> String {
+    tag_with_key(&key_of(secret), msg)
 }
 
-fn tag_with_key(key: &[u8; 32], vid: &str) -> String {
+fn tag_with_key(key: &[u8; 32], msg: &str) -> String {
     let mut mac = <Tag as Mac>::new_from_slice(key).expect("32 bytes is a valid BLAKE2b key");
-    mac.update(vid.as_bytes());
+    mac.update(msg.as_bytes());
     let out = mac.finalize().into_bytes();
     let mut s = String::with_capacity(out.len() * 2);
     for b in out {
@@ -77,9 +119,9 @@ fn tag_with_key(key: &[u8; 32], vid: &str) -> String {
     s
 }
 
-/// Does `presented` match the tag for `vid`? Constant-time, so a caller cannot learn the tag one
+/// Does `presented` match the tag for `msg`? Constant-time, so a caller cannot learn the tag one
 /// character at a time from how long the comparison took.
-pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
+pub fn verify(secret: &str, msg: &str, presented: Option<&str>) -> bool {
     let Some(presented) = presented else { return false };
     // Length first, before deriving anything. The length is public — it is a fixed 24 either way, so
     // checking it early leaks nothing — and it means junk costs a comparison rather than two BLAKE2b
@@ -87,7 +129,7 @@ pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
     if presented.len() != TAG_HEX_LEN {
         return false;
     }
-    let expected = tag(secret, vid);
+    let expected = tag(secret, msg);
     presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
@@ -99,8 +141,8 @@ pub fn verify(secret: &str, vid: &str, presented: Option<&str>) -> bool {
 ///
 /// The scan is not constant-time *across* the set, only within each comparison. What that leaks is
 /// how many secrets are configured, which is not a secret.
-pub fn verify_any(current: &str, prev: &[String], vid: &str, presented: Option<&str>) -> bool {
-    verify(current, vid, presented) || prev.iter().any(|s| verify(s, vid, presented))
+pub fn verify_any(current: &str, prev: &[String], msg: &str, presented: Option<&str>) -> bool {
+    verify(current, msg, presented) || prev.iter().any(|s| verify(s, msg, presented))
 }
 
 #[cfg(test)]
@@ -163,6 +205,28 @@ mod tests {
             assert_eq!(signer.tag(vid), tag("s3cret", vid), "{vid} signed differently");
             assert!(verify("s3cret", vid, Some(&signer.tag(vid))));
         }
+    }
+
+    /// Every part of the binding is covered, and no bound tag is the pre-binding tag over the bare id
+    /// — otherwise stripping `i`/`e` from a link would turn it into one the grace window accepts.
+    #[test]
+    fn a_bound_tag_covers_the_install_and_never_equals_the_bare_id_tag() {
+        let vid = "dSdWpY2Bxsc";
+        let iid = "AAECAwQFBgcICQoLDA0ODw";
+        let msgs = [
+            vid.to_string(),
+            message(vid, Binding::Unbound),
+            message(vid, Binding::Install { iid: None, ep: 0 }),
+            message(vid, Binding::Install { iid: Some(iid), ep: 0 }),
+            message(vid, Binding::Install { iid: Some(iid), ep: 1 }),
+            message(vid, Binding::Install { iid: Some("_-_-_-_-_-_-_-_-_-_-_w"), ep: 0 }),
+            message("dQw4w9WgXcQ", Binding::Install { iid: Some(iid), ep: 0 }),
+        ];
+        let tags: std::collections::HashSet<String> = msgs.iter().map(|m| tag("s3cret", m)).collect();
+        assert_eq!(tags.len(), msgs.len(), "two bindings signed alike");
+        assert_eq!(Binding::Unbound.query(), "");
+        assert_eq!(Binding::Install { iid: None, ep: 3 }.query(), "&e=3");
+        assert_eq!(Binding::Install { iid: Some(iid), ep: 3 }.query(), format!("&i={iid}&e=3"));
     }
 
     /// A secret longer than BLAKE2b's 64-byte key limit must be usable, not a startup error.

@@ -402,28 +402,46 @@ fn build_meta_produces_same_host_play_url() {
         "https://trailers.example.com/",
         &["abc123DEF01".to_string()],
         None,
+        crate::sign::Binding::Install { iid: Some(IID), ep: 2 },
     );
-    assert_eq!(out["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/abc123DEF01.mp4");
+    assert_eq!(
+        out["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/abc123DEF01.mp4",
+        "without a secret nothing is signed, so there is nothing to bind"
+    );
 }
 
-/// With a secret configured the play URL carries the tag /play and /crop will demand — and without
-/// one it is byte-for-byte the URL it has always been, because every install in the field is
-/// holding unsigned URLs with a week of `max-age` on them.
+/// The tag for `vid` as this release signs it, bound to `binding`.
+fn bound_tag(vid: &str, binding: crate::sign::Binding) -> String {
+    crate::sign::tag("s3cret", &crate::sign::message(vid, binding))
+}
+
+/// With a secret configured the play URL carries the tag /play and /crop will demand, bound to the
+/// install that asked — and without one it is byte-for-byte the URL it has always been, because
+/// every install in the field is holding unsigned URLs with a week of `max-age` on them.
 #[test]
 fn a_signed_install_hands_out_signed_play_urls() {
-    let signed = crate::addon::build_meta(
-        "movie",
-        "tt0111161",
-        "https://trailers.example.com",
-        &["abc123DEF01".to_string()],
-        Some("s3cret"),
+    use crate::sign::Binding;
+    let url = |binding| {
+        let meta = crate::addon::build_meta(
+            "movie",
+            "tt0111161",
+            "https://trailers.example.com",
+            &["abc123DEF01".to_string()],
+            Some("s3cret"),
+            binding,
+        );
+        meta["meta"]["links"][0]["trailers"].as_str().unwrap().to_string()
+    };
+    let base = "https://trailers.example.com/play/abc123DEF01.mp4";
+    let installed = Binding::Install { iid: Some(IID), ep: 2 };
+    assert_eq!(url(installed), format!("{base}?s={}&i={IID}&e=2", bound_tag("abc123DEF01", installed)));
+    let no_iid = Binding::Install { iid: None, ep: 0 };
+    assert_eq!(url(no_iid), format!("{base}?s={}&e=0", bound_tag("abc123DEF01", no_iid)));
+    assert_eq!(
+        url(Binding::Unbound),
+        format!("{base}?s={}", bound_tag("abc123DEF01", Binding::Unbound)),
+        "the config-less /meta has no install to name"
     );
-    let url = signed["meta"]["links"][0]["trailers"].as_str().unwrap();
-    let expected = format!(
-        "https://trailers.example.com/play/abc123DEF01.mp4?s={}",
-        crate::sign::tag("s3cret", "abc123DEF01")
-    );
-    assert_eq!(url, expected);
 }
 
 /// The only thing standing in front of /play and /crop was "is this eleven characters", and both
@@ -447,7 +465,7 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
         client.get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).send().await.unwrap();
     assert_eq!(r.status(), 403, "a wrong tag was accepted");
 
-    let tag = crate::sign::tag("s3cret", "cachedVid07");
+    let tag = bound_tag("cachedVid07", crate::sign::Binding::Unbound);
     let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
     assert_eq!(r.status(), 200, "the URL /meta hands out must actually play");
 
@@ -468,10 +486,11 @@ async fn a_signed_install_refuses_unsigned_play_and_crop() {
 }
 
 /// Turning signing on over an install whose clients hold a week of unsigned `/meta` answers: until
-/// the deadline a request with NO tag is still served, a WRONG tag never is, and after it the gate
-/// is exactly the one above.
+/// the deadline a request with NO tag is still served, and so is one signed over the id alone by a
+/// release before install binding; a WRONG tag never is, and after it the gate is exactly the one
+/// above.
 #[tokio::test]
-async fn a_signing_grace_serves_untagged_urls_until_its_deadline() {
+async fn a_signing_grace_serves_untagged_and_pre_binding_urls_until_its_deadline() {
     let dir = temp_dir();
     seed_cache(&dir, "cachedVid07", 100);
     let mut cfg = test_cfg(dir);
@@ -481,25 +500,175 @@ async fn a_signing_grace_serves_untagged_urls_until_its_deadline() {
     let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
     let base = spawn_server(state).await;
     let client = reqwest::Client::new();
-    let tag = crate::sign::tag("s3cret", "cachedVid07");
+    let installed = crate::sign::Binding::Install { iid: Some(IID), ep: 0 };
+    let bound = format!("s={}&i={IID}&e=0", bound_tag("cachedVid07", installed));
+    let pre_binding = crate::sign::tag("s3cret", "cachedVid07");
+    let status = |q: String| {
+        let client = client.clone();
+        let url = format!("{base}/play/cachedVid07.mp4{q}");
+        async move { client.get(url).send().await.unwrap().status() }
+    };
 
-    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
-    assert_eq!(r.status(), 200, "a URL cached before signing was turned on 403'd inside the grace");
-    let r =
-        client.get(format!("{base}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).send().await.unwrap();
-    assert_eq!(r.status(), 403, "the grace is for a missing tag, not a wrong one");
-    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
-    assert_eq!(r.status(), 200, "signed URLs must play during the grace too");
+    assert_eq!(
+        status(String::new()).await,
+        200,
+        "a URL cached before signing was turned on 403'd inside the grace"
+    );
+    assert_eq!(
+        status("?s=deadbeefdeadbeefdeadbeef".into()).await,
+        403,
+        "the grace is for a missing tag, not a wrong one"
+    );
+    assert_eq!(status(format!("?{bound}")).await, 200, "signed URLs must play during the grace too");
+    assert_eq!(
+        status(format!("?s={pre_binding}")).await,
+        200,
+        "a URL the previous release signed 403'd inside the grace"
+    );
+    assert_eq!(
+        status(format!("?s={pre_binding}&i={IID}&e=0")).await,
+        403,
+        "a pre-binding tag does not cover an install, so it must not arrive with one"
+    );
 
     clock.advance(60_000);
-    let r = client.get(format!("{base}/play/cachedVid07.mp4")).send().await.unwrap();
-    assert_eq!(r.status(), 403, "the grace outlived its deadline");
-    let body: Value =
-        client.get(format!("{base}/crop/cachedVid07.json")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(body["letterboxed"], false, "an untagged /crop after the deadline degrades as before");
-    assert!(body.get("content").is_none());
-    let r = client.get(format!("{base}/play/cachedVid07.mp4?s={tag}")).send().await.unwrap();
-    assert_eq!(r.status(), 200, "signed URLs outlive the grace");
+    assert_eq!(status(String::new()).await, 403, "the grace outlived its deadline");
+    assert_eq!(status(format!("?s={pre_binding}")).await, 403, "a pre-binding tag outlived the grace");
+    for q in [String::new(), format!("?s={pre_binding}")] {
+        let body: Value = client
+            .get(format!("{base}/crop/cachedVid07.json{q}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["letterboxed"], false, "a refused /crop after the deadline degrades as before");
+        assert!(body.get("content").is_none());
+    }
+    assert_eq!(status(format!("?{bound}")).await, 200, "signed URLs outlive the grace");
+}
+
+/// A second install id, using both url-safe characters.
+const OTHER_IID: &str = "_-_-_-_-_-_-_-_-_-_-_w";
+
+/// A signed install over `dir` (which holds `cachedVid07`), refusing the installs in `revoked`, links
+/// stamped below `epoch`, and — with `require_iid` — links without an install id.
+fn signed_state(dir: PathBuf, revoked: &str, epoch: &str, require_iid: bool) -> Arc<AppState> {
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.revocation =
+        crate::userconfig::Revocation::from_env(revoked, Some(epoch)).requiring_install_id(require_iid);
+    build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["cachedVid07"], None)),
+        always_playable(),
+        noop_prewarm(),
+    )
+}
+
+/// The play link `/meta` hands the install whose config is `json`, as a path and query.
+async fn minted_link(base: &str, json: &str) -> String {
+    let body: Value = reqwest::get(format!("{base}/{}/meta/movie/tt0111161.json", plain_segment(json)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let link = body["meta"]["links"][0]["trailers"].as_str().expect("a link").to_string();
+    link.strip_prefix(base).expect("a link on this host").to_string()
+}
+
+/// Revoking an install used to leave every trailer link it had been handed playing until
+/// PLAY_SECRET was rotated. The link is bound to the install now, so the revocation reaches it —
+/// with the same 403 a bad tag gets, and without touching any other install's links.
+#[tokio::test]
+async fn a_revoked_install_s_trailer_links_stop_playing() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mine = format!(r#"{{"tmdbKey":"k","iid":"{IID}","ep":0}}"#);
+    let theirs = format!(r#"{{"tmdbKey":"k","iid":"{OTHER_IID}","ep":0}}"#);
+
+    // Handed out while the install was admitted...
+    let before = spawn_server(signed_state(dir.clone(), "", "0", false)).await;
+    let link = minted_link(&before, &mine).await;
+    assert!(link.ends_with(&format!("&i={IID}&e=0")), "the link does not name its install: {link}");
+    assert_eq!(reqwest::get(format!("{before}{link}")).await.unwrap().status(), 200);
+    let other_link = minted_link(&before, &theirs).await;
+
+    // ...and replayed once it was revoked.
+    let after = spawn_server(signed_state(dir, IID, "0", false)).await;
+    let refused = reqwest::get(format!("{after}{link}")).await.unwrap();
+    assert_eq!(refused.status(), 403, "a revoked install's trailer link still played");
+    let bad_tag =
+        reqwest::get(format!("{after}/play/cachedVid07.mp4?s=deadbeefdeadbeefdeadbeef")).await.unwrap();
+    assert_eq!(
+        refused.json::<Value>().await.unwrap(),
+        bad_tag.json::<Value>().await.unwrap(),
+        "a revoked link must be answered exactly like a bad tag"
+    );
+    let crop = link.replace("/play/cachedVid07.mp4", "/crop/cachedVid07.json");
+    let body: Value = reqwest::get(format!("{after}{crop}")).await.unwrap().json().await.unwrap();
+    assert!(body.get("content").is_none(), "a revoked link's /crop must degrade like an unsigned one");
+    assert_eq!(
+        reqwest::get(format!("{after}{other_link}")).await.unwrap().status(),
+        200,
+        "revoking one install must leave another's links alone"
+    );
+}
+
+#[tokio::test]
+async fn a_trailer_link_stamped_below_config_epoch_is_refused() {
+    use crate::sign::Binding;
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let link = |iid: Option<&str>, ep: u64| {
+        let binding = Binding::Install { iid, ep };
+        format!("/play/cachedVid07.mp4?s={}{}", bound_tag("cachedVid07", binding), binding.query())
+    };
+    let base = spawn_server(signed_state(dir.clone(), "", "2", false)).await;
+    for (iid, ep, want) in [(Some(IID), 1, 403u16), (Some(IID), 2, 200), (Some(IID), 3, 200), (None, 2, 200)]
+    {
+        let r = reqwest::get(format!("{base}{}", link(iid, ep))).await.unwrap();
+        assert_eq!(r.status(), want, "iid={iid:?} ep={ep}");
+    }
+    // A link minted from a config without an install id is refused once ids are required, like the
+    // config itself.
+    let base = spawn_server(signed_state(dir, "", "0", true)).await;
+    assert_eq!(reqwest::get(format!("{base}{}", link(None, 0))).await.unwrap().status(), 403);
+    assert_eq!(reqwest::get(format!("{base}{}", link(Some(IID), 0))).await.unwrap().status(), 200);
+}
+
+/// The install a link names is signed, so it cannot be swapped for one that is still admitted, and
+/// stripping it does not fall back to the grace window's pre-binding acceptance.
+#[tokio::test]
+async fn a_tampered_install_id_or_epoch_is_refused() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid07", 100);
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    cfg.play_signing_grace = Some(crate::config::PlayGrace { until_ms: 60_000, until: "deadline".into() });
+    let state =
+        build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), TestClock::default().as_fn());
+    let base = spawn_server(state).await;
+    let s = bound_tag("cachedVid07", crate::sign::Binding::Install { iid: Some(IID), ep: 1 });
+
+    let status = |q: String| {
+        let url = format!("{base}/play/cachedVid07.mp4?{q}");
+        async move { reqwest::get(url).await.unwrap().status().as_u16() }
+    };
+    assert_eq!(status(format!("s={s}&i={IID}&e=1")).await, 200, "the untampered link");
+    for tampered in [
+        format!("s={s}&i={OTHER_IID}&e=1"),
+        format!("s={s}&i={IID}&e=5"),
+        format!("s={s}&i={IID}&e=0"),
+        format!("s={s}&i={IID}&e=x"),
+        format!("s={s}&e=1"),
+        format!("s={s}&i={IID}"),
+        format!("s={s}"),
+    ] {
+        assert_eq!(status(tampered.clone()).await, 403, "{tampered}");
+    }
 }
 
 /// `PLAY_SIGNING_GRACE_UNTIL` is RFC 3339 with an offset, read to the millisecond.
@@ -1085,6 +1254,30 @@ async fn get_manifest_returns_addon_manifest() {
     let body: Value = reqwest::get(format!("{base}/manifest.json")).await.unwrap().json().await.unwrap();
     assert_eq!(body["id"], "com.den.reel");
     assert_eq!(body["resources"][0], "meta");
+    assert!(body.get("denInstallId").is_none(), "the config-less manifest names no install");
+}
+
+/// A configured install's manifest names its install id — the value to put in REVOKED_INSTALLS —
+/// and is otherwise the same manifest.
+#[tokio::test]
+async fn a_configured_manifest_carries_its_install_id() {
+    let base = spawn_server(revoking_state("", "0")).await;
+    let get = |path: String| async move { reqwest::get(path).await.unwrap().json::<Value>().await.unwrap() };
+    let bare = get(format!("{base}/manifest.json")).await;
+
+    let with = get(format!(
+        "{base}/{}/manifest.json",
+        plain_segment(&format!(r#"{{"tmdbKey":"k","iid":"{IID}"}}"#))
+    ))
+    .await;
+    assert_eq!(with["denInstallId"], IID);
+    let mut rest = with.clone();
+    rest.as_object_mut().unwrap().remove("denInstallId");
+    assert_eq!(rest, bare, "the rest of the manifest changed");
+
+    let without = get(format!("{base}/{}/manifest.json", plain_segment(r#"{"tmdbKey":"k"}"#))).await;
+    assert!(without.get("denInstallId").is_none(), "a config without an install id names none: {without}");
+    assert_eq!(without, bare);
 }
 
 #[tokio::test]
@@ -1314,6 +1507,9 @@ async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
     assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
     assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
     assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
+    assert!(page.contains(r#"<code id="iid"></code>"#), "the page has nowhere to show the install id");
+    assert!(page.contains("iidEl.textContent = install.iid"), "the built link's install id is not shown");
+    assert!(page.contains("REVOKED_INSTALLS</code> to revoke just this link"), "the id is not explained");
 }
 
 #[tokio::test]
