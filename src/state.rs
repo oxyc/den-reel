@@ -70,6 +70,10 @@ pub struct AppState {
     /// another yt-dlp process, discovering the same thing. The TTL is reason-aware
     /// (`play::fail_ttl_ms`) — "removed" is a fact, "timed out" is a mood.
     pub play_fails: Mutex<HashMap<String, (PlayError, u64)>>,
+    /// vid -> (the direct googlevideo URLs, or why they could not be resolved; when to ask again).
+    /// Unlike every other cache here the TTL is not ours to choose: the URLs carry their own expiry,
+    /// so an entry stands until shortly before they stop working (`direct::ttl_ms`).
+    pub direct_cache: Mutex<HashMap<String, crate::direct::CachedDirect>>,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
@@ -139,6 +143,7 @@ impl AppState {
             crop_cache: Mutex::new(HashMap::new()),
             crop_unknown: Mutex::new(HashMap::new()),
             play_fails: Mutex::new(HashMap::new()),
+            direct_cache: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),

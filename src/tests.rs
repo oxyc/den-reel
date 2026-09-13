@@ -272,6 +272,7 @@ fn build_state_full(
         crop_cache: Mutex::new(HashMap::new()),
         crop_unknown: Mutex::new(HashMap::new()),
         play_fails: Mutex::new(HashMap::new()),
+        direct_cache: Mutex::new(HashMap::new()),
         upstream,
         prober,
         searcher,
@@ -3611,6 +3612,168 @@ async fn body_fault_why_redacts_even_a_send_path_error() {
     let logged = crate::upstream::body_fault_why(send_err);
     assert!(!logged.contains("SUPERSECRETKEY"), "the api_key reached a log line: {logged}");
     assert!(!logged.contains("api_key"), "the query string reached a log line: {logged}");
+}
+
+// --- /direct: the googlevideo URLs themselves --------------------------------
+
+/// Read a handler's JSON body. Named for this section so it cannot collide with a helper elsewhere.
+async fn direct_body(resp: hyper::Response<crate::httputil::Body>) -> Value {
+    use http_body_util::BodyExt;
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// A fake yt-dlp standing in for `--print "%(width)s %(height)s" --print urls`, counting its runs.
+fn fake_resolver(dir: &std::path::Path, name: &str, prints: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join(format!("{name}-runs"));
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\necho x >> {}\n{prints}\n", runs.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.to_string_lossy().into_owned(), runs)
+}
+
+fn direct_state(dir: &std::path::Path, ytdlp: String) -> Arc<AppState> {
+    let mut cfg = test_cfg(dir.to_path_buf());
+    cfg.ytdlp = ytdlp;
+    build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm())
+}
+
+/// The expiry is signed into the URL and is the only thing that says how long an answer is good for.
+/// It appears as a query parameter on `videoplayback` and as a path segment on the manifest host.
+#[test]
+fn an_expiry_is_read_from_either_url_shape() {
+    let q = "https://rr7.googlevideo.com/videoplayback?itag=140&expire=1789357731&ei=x";
+    let p =
+        "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1789357725/ei/x/file/index.m3u8";
+    assert_eq!(crate::direct::parse_expiry_ms(q), Some(1_789_357_731_000));
+    assert_eq!(crate::direct::parse_expiry_ms(p), Some(1_789_357_725_000));
+    // No expiry at all, and one that is not a number, both mean "we cannot tell" — never a wrong answer.
+    assert_eq!(crate::direct::parse_expiry_ms("https://rr7.googlevideo.com/videoplayback?itag=140"), None);
+    assert_eq!(crate::direct::parse_expiry_ms("https://rr7.googlevideo.com/v?expire=soon"), None);
+}
+
+/// An adaptive answer is two streams, and it stops being usable when the FIRST of them dies — a page
+/// playing video against a dead audio track is not playing the trailer.
+#[test]
+fn a_resolve_reads_both_streams_and_expires_with_the_soonest() {
+    let out = "1920 1080\n\
+               https://rr7.googlevideo.com/videoplayback?itag=137&expire=2000\n\
+               https://rr7.googlevideo.com/videoplayback?itag=140&expire=1500\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("two streams");
+    assert!(d.video.contains("itag=137"), "the video stream is the first one printed");
+    assert!(d.audio.as_deref().is_some_and(|a| a.contains("itag=140")));
+    assert_eq!((d.width, d.height), (Some(1920), Some(1080)));
+    assert_eq!(d.expires, 1_500_000, "the answer outlived its audio track");
+}
+
+/// yt-dlp writes `NA` for a field it does not know. That is not a failure: a URL with no dimensions
+/// still plays, and dropping the answer over it would lose a trailer for a cosmetic reason.
+#[test]
+fn a_muxed_resolve_names_no_audio_and_unknown_dimensions_are_not_a_failure() {
+    let out = "NA NA\nhttps://rr7.googlevideo.com/videoplayback?itag=18&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("one stream");
+    assert!(d.audio.is_none(), "a muxed format carries its own audio");
+    assert_eq!((d.width, d.height), (None, None));
+}
+
+/// One run carries both transports: the progressive pair, and the HLS master that is the only way a
+/// browser gets sound. yt-dlp prints the manifests as a Python-style list, mostly `None`.
+#[test]
+fn a_resolve_also_carries_the_hls_master() {
+    let out = "1920 1080\n\
+               [None, 'https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8', None]\n\
+               https://rr7.googlevideo.com/videoplayback?itag=137&expire=2000\n\
+               https://rr7.googlevideo.com/videoplayback?itag=140&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("two streams and a master");
+    assert_eq!(
+        d.hls.as_deref(),
+        Some("https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8")
+    );
+    assert!(d.video.contains("itag=137"), "the master must not be mistaken for the video stream");
+    // The master expires first here, and an answer is only good while everything in it still works.
+    assert_eq!(d.expires, 1_900_000);
+}
+
+/// A video YouTube publishes no HLS rendition for is still a usable answer for the muted path.
+#[test]
+fn a_resolve_without_a_master_is_still_an_answer() {
+    let out = "1920 1080\n[None, None]\nhttps://rr7.googlevideo.com/videoplayback?itag=18&expire=2000\n";
+    let d = crate::direct::parse_resolve(out, 0).expect("one stream");
+    assert!(d.hls.is_none());
+    assert_eq!(d.expires, 2_000_000);
+}
+
+/// Exit 0 with nothing we can use is still nothing we can use.
+#[test]
+fn a_resolve_with_no_url_is_not_an_answer() {
+    assert!(crate::direct::parse_resolve("1920 1080\n", 0).is_none());
+    assert!(crate::direct::parse_resolve("", 0).is_none());
+}
+
+#[tokio::test]
+async fn direct_answers_the_urls_and_resolves_each_id_once() {
+    let dir = temp_dir();
+    // Expiring in 2096, so the answer is good and the cache TTL is comfortably positive.
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-printing",
+        "printf '1920 1080\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), 200);
+    let body = direct_body(resp).await;
+    assert_eq!(body["video"], "https://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000");
+    assert_eq!(body["audio"], "https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000");
+    assert_eq!(body["height"], 1080);
+    assert_eq!(body["expires"], 4_000_000_000u64);
+    assert_eq!(spawn_count(&runs), 1);
+
+    // The URLs are good for hours. Re-resolving would spend a yt-dlp run to print the same thing.
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
+}
+
+/// The download path learned this lesson the expensive way: without a remembered verdict, every
+/// request for a video YouTube has removed spends another yt-dlp run rediscovering it.
+#[tokio::test]
+async fn a_removed_video_is_classified_and_not_re_resolved() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-gone", "echo 'ERROR: Video unavailable' >&2\nexit 1");
+    let state = direct_state(&dir, yt);
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), 404, "a removed video is a 404, as it is on /play");
+    assert_eq!(direct_body(resp).await["error"], "unavailable");
+
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    assert_eq!(resp.status(), 404);
+    assert_eq!(spawn_count(&runs), 1, "a known-dead id was re-resolved");
+}
+
+/// A resolve is a yt-dlp run, so the gate that protects the download has to cover this too —
+/// refusing, not degrading, because unlike a crop hint there is no useful constant to answer with.
+#[tokio::test]
+async fn direct_refuses_an_unsigned_link_when_play_is_signed() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-unused", "printf '1920 1080\\nhttps://x/v\\n'");
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt;
+    cfg.play_secret = Some("s3cret".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+
+    let req = hyper::Request::builder().uri("/direct/dQw4w9WgXcQ.json").body(()).unwrap();
+    let resp = crate::handle_request(state, req).await;
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(direct_body(resp).await["error"], "bad_signature");
+    assert_eq!(spawn_count(&runs), 0, "a refused caller still got a yt-dlp run");
 }
 
 /// ...and the check has to sit BEFORE the fetch. `record_unknown` only proves the file existed when

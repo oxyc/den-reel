@@ -6,15 +6,21 @@
 //!
 //!   2. PLAYBACK (yt-dlp + ffmpeg proxy):  ytId -> App-Store-safe, seekable MP4
 //!      GET /play/<id>.mp4  (or /play?v=<id>)  -> 200/206 video/mp4
+//!      GET /direct/<id>.json                  -> the googlevideo URLs themselves (see `direct.rs`)
 //!      GET /health                            -> 200 ok
 //!
 //! Extraction: yt-dlp rotates innertube clients that don't need a BotGuard poToken; ffmpeg muxes a
-//! faststart H.264/AAC MP4; we cache and PROXY it (the googlevideo URL is IP-bound to THIS server,
-//! so the Apple TV must hit us, not YouTube).
+//! faststart H.264/AAC MP4, which we cache and PROXY.
+//!
+//! The proxy is for AVPlayer's sake, not the URL's. A googlevideo URL carries `ip=<this box>` inside
+//! its signed `sparams`, which reads like a binding to this server — but Google does not enforce it,
+//! and `/direct` hands that same URL to a browser, which plays it. What the Apple TV cannot do is
+//! take a video stream plus a separate audio one, which is what YouTube now answers with.
 
 mod addon;
 mod config;
 mod crop;
+mod direct;
 mod httputil;
 mod play;
 mod seal;
@@ -425,8 +431,18 @@ fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
 /// or pasting the bare segment, which would otherwise put the key in the log through a 404.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
-    const ROUTES: [&str; 9] =
-        ["", "health", "metrics", "manifest.json", "configure", "config-key", "meta", "crop", "play"];
+    const ROUTES: [&str; 10] = [
+        "",
+        "health",
+        "metrics",
+        "manifest.json",
+        "configure",
+        "config-key",
+        "meta",
+        "crop",
+        "play",
+        "direct",
+    ];
     let rest = path.strip_prefix('/').unwrap_or(path);
     let (first, tail) = match rest.split_once('/') {
         Some((first, tail)) => (first, Some(tail)),
@@ -579,6 +595,19 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 return crop::unsigned_response(id);
             }
             return crop::handle_crop(state, id.to_string()).await;
+        }
+    }
+
+    // direct URLs: /direct/<id>.json → the googlevideo URLs themselves, for a client that can play
+    // them without this server in the middle (the web app; see `direct.rs`). Refuses like /play
+    // rather than degrading like /crop: an unsigned caller would otherwise get a free yt-dlp run,
+    // and unlike a crop hint there is no useful constant to answer with.
+    if let Some(id) = path.strip_prefix("/direct/").and_then(|r| r.strip_suffix(".json")) {
+        if is_valid_vid(id) {
+            if !signature_ok(&state, id, query) {
+                return bad_signature();
+            }
+            return direct::handle_direct(state, id.to_string()).await;
         }
     }
 

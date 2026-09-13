@@ -871,7 +871,7 @@ fn remaining_fail_ms(state: &AppState, vid: &str) -> Option<u64> {
 /// request is answered from the cache, and recomputing the whole TTL there tells a client asking at
 /// 5h59m of a 6h window to wait another six hours: up to twice the real cooldown, and unbounded if
 /// it keeps polling. The remainder is right there in the entry, so use it.
-fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response<Body> {
+pub(crate) fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response<Body> {
     let body = serde_json::json!({ "error": e.reason, "detail": e.message, "id": vid });
     // No entry means nothing is being cached for this id, so the full TTL is the honest estimate of
     // when asking again could help. Never zero: a client reading `Retry-After: 0` will come straight

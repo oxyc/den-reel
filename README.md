@@ -23,8 +23,11 @@ Every trailer source (TMDB, KinoCheck) points to a YouTube video, and YouTube's 
 server-side downloads (Cobalt, headless session generators) by withholding a `poToken`.
 **yt-dlp** sidesteps this — it rotates through the `android`/`ios`/`tv` innertube clients that
 don't need BotGuard, and the yt-dlp team keeps it current (that maintenance burden is theirs).
-We then **proxy** the result: the googlevideo URL is IP-bound to this server, so the Apple TV
-fetches from us, not from YouTube.
+We then **proxy** the result — because AVPlayer needs one file with sound in it, and YouTube now
+answers with a video stream and a separate audio one. *Not* because the URL is pinned here: it
+carries `ip=<this box>` inside its signed `sparams`, which reads like an IP binding, but Google
+does not enforce it. `/direct` (below) relies on exactly that to let the web app stream from
+Google without the bytes ever crossing this box.
 
 ## What playback guarantees
 
@@ -87,10 +90,12 @@ GET /manifest.json                       →  manifest with no config (uses the 
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
+GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
+                                             without this server in the middle (the web app)
      …/play requires ?s=<tag>&i=<iid>&e=<ep> when PLAY_SECRET is set (403 without,
        or for a revoked install, unless PLAY_SIGNING_GRACE_UNTIL is still ahead and
-       the tag is missing); the same query opens /crop, which without it answers
-       "play the full frame" instead of refusing
+       the tag is missing); the same query opens /crop and /direct — /crop without it
+       answers "play the full frame" instead of refusing, /direct refuses like /play
 GET /health                               →  200 {status} — ok, or degraded (see below)
 GET /metrics                              →  Prometheus text (bearer METRICS_TOKEN; 404 without it)
 OPTIONS <any path>                        →  204 CORS preflight
@@ -151,6 +156,42 @@ AVPlayer honors clean aperture, so a direct-to-`AVPlayer` client (Den's billboar
 the bars with **zero client changes** — no `/crop` call needed. Offsets are content-centre-relative,
 so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see the full frame. Set
 `CLAP=0` to disable baking.
+
+## `/direct` — the URLs themselves
+
+`/play` exists because AVPlayer needs one file with sound in it. A browser does not, so `/direct`
+resolves with yt-dlp (`--print`, **no download** — it takes a probe permit, not a download one) and
+answers with the googlevideo URLs:
+
+```
+{ "id":"…", "video":"https://rr7…/videoplayback?itag=137&…",
+  "audio":"https://rr7…/videoplayback?itag=140&…", "width":1920, "height":1080,
+  "expires":1789357731 }
+```
+
+The page then streams from Google directly: no wait for a download, no cache volume, and none of the
+trailer's bytes through this box. Same format ladder as `/play` (avc1 + mp4a under `MAX_HEIGHT`), so
+it cannot start handing out a VP9/AV1 stream only some browsers decode.
+
+**The URLs work away from this server.** They carry `ip=<this box>` inside the signed `sparams` set,
+which reads like the IP binding the section above describes — but Google does not enforce it; a URL
+resolved here plays from an unrelated address (verified against both `videoplayback` and
+`manifest.googlevideo.com`). They do expire in about six hours, so an answer is cached, and sent,
+only until shortly before its URLs stop working — `expires` and `max-age` both say when.
+
+**Usually two streams.** YouTube still lists the muxed itag 18 but no longer serves it, so `video` is
+video-only and `audio` is separate. A muted surface — Den Web's billboard, which is unpressable and
+forces `muted` — ignores `audio` entirely, and that is the case this exists for. Anything wanting
+sound needs a player that accepts two sources: browsers can, **AetherEngine cannot** (one
+`MediaSource` per session; `LoadOptions` has `externalSubtitles` and no audio equivalent), which is
+why the Apple TV keeps `/play`.
+
+**No crop.** The `clap` box is baked into the *cached MP4* by the download path, so a trailer with
+baked-in letterbox keeps its bars here; `/crop` cannot help, as it reads that same file.
+
+Failures are the `/play` shapes below, with the same reason-aware `Retry-After` cooldown, plus
+`502 no_direct_url` — yt-dlp exited 0 and printed nothing usable, which is not an extraction failure
+and deliberately does not feed `extractor_unavailable`.
 
 `/play` failures return a real status + JSON so the caller can say *why*:
 
