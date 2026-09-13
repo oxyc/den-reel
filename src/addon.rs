@@ -350,6 +350,21 @@ pub async fn resolve_youtube_ids(
     Resolved { ids, stale: substituted, degraded, timing }
 }
 
+/// What `/meta` should get ready, read from `?prewarm=`: the download, and the direct resolve.
+///
+/// `0` asks for neither. `direct` asks for the resolve alone, which is what a browser wants — it
+/// plays YouTube's own URL and will never read the downloaded file, so the download is a yt-dlp and
+/// an ffmpeg competing for the box with the very resolve it is waiting on. Anything else is both,
+/// which is what the Apple TV needs and what a browser with no native HLS needs too: without it
+/// `/play` is its only source of sound, and it would be cold exactly when it was wanted.
+pub(crate) fn prewarm_choice(asked: Option<&str>) -> (bool, bool) {
+    match asked {
+        Some("0") => (false, false),
+        Some("direct") => (false, true),
+        _ => (true, true),
+    }
+}
+
 pub async fn handle_meta(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -392,14 +407,19 @@ pub async fn handle_meta(
     // a primary that is STILL known dead means every candidate is — so there is nothing worth
     // speculatively fetching, and the permit is better left for a /play someone is waiting on.
     if let Some(primary) = yt_ids.first() {
-        if query_param(query, "prewarm").as_deref() != Some("0") && !demotion.head_dead {
-            (state.prewarm)(state.clone(), primary.clone());
-            // And resolve its direct URLs, which is what a browser asks for next. Prewarming only
-            // the download is what made the direct path feel SLOWER on a title that had been
-            // browsed: `/play` was already a warm file while `/direct` still had a cold yt-dlp run
-            // in front of it. A resolve is a metadata round-trip, so this spends a probe permit
-            // rather than a download slot or room on the cache volume.
-            (state.direct_warm)(state.clone(), primary.clone());
+        let (download, direct) = prewarm_choice(query_param(query, "prewarm").as_deref());
+        if !demotion.head_dead {
+            if download {
+                (state.prewarm)(state.clone(), primary.clone());
+            }
+            // The resolve as well, which is what a browser asks for next. Prewarming only the
+            // download is what made the direct path feel SLOWER on a title that had been browsed:
+            // `/play` was already a warm file while `/direct` still had a cold yt-dlp run in front
+            // of it. A resolve is a metadata round-trip, so it spends a probe permit rather than a
+            // download slot or room on the cache volume.
+            if direct {
+                (state.direct_warm)(state.clone(), primary.clone());
+            }
         }
     }
     let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);

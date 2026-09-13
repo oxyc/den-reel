@@ -26,6 +26,9 @@ pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
 pub type SharedDownload = Shared<BoxFuture<Result<crate::play::Fetched, PlayError>>>;
+/// The same, for a direct resolve: `/meta` warms one and the page asks for it a moment later, and
+/// without this they each spawn their own yt-dlp for the same video.
+pub type SharedResolve = Shared<BoxFuture<Result<crate::direct::Direct, PlayError>>>;
 
 /// Resolved (or negatively-cached) trailer ytIds — best-playable first, then unprobed alternates the
 /// client falls back to on a playback failure. Empty = "no trailer". `exp` is ms since epoch.
@@ -74,6 +77,9 @@ pub struct AppState {
     /// Unlike every other cache here the TTL is not ours to choose: the URLs carry their own expiry,
     /// so an entry stands until shortly before they stop working (`direct::ttl_ms`).
     pub direct_cache: Mutex<HashMap<String, crate::direct::CachedDirect>>,
+    /// vid -> the resolve already running for it. The probe budget is six, so a warm-up and the
+    /// request chasing it never queued behind one another — they simply both ran.
+    pub direct_inflight: Mutex<HashMap<String, SharedResolve>>,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
@@ -147,6 +153,7 @@ impl AppState {
             crop_unknown: Mutex::new(HashMap::new()),
             play_fails: Mutex::new(HashMap::new()),
             direct_cache: Mutex::new(HashMap::new()),
+            direct_inflight: Mutex::new(HashMap::new()),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),

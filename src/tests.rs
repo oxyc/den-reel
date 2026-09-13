@@ -273,6 +273,7 @@ fn build_state_full(
         crop_unknown: Mutex::new(HashMap::new()),
         play_fails: Mutex::new(HashMap::new()),
         direct_cache: Mutex::new(HashMap::new()),
+        direct_inflight: Mutex::new(HashMap::new()),
         upstream,
         prober,
         searcher,
@@ -3739,6 +3740,41 @@ async fn direct_answers_the_urls_and_resolves_each_id_once() {
     let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
+}
+
+/// A browser that plays YouTube's own URL never reads the downloaded file, so asking for it spends
+/// a yt-dlp and an ffmpeg against the resolve it is actually waiting on. One that falls back to
+/// `/play` — no native HLS, so nothing else carries sound — still needs both.
+#[test]
+fn prewarm_asks_for_what_the_client_will_actually_use() {
+    assert_eq!(crate::addon::prewarm_choice(None), (true, true), "the TV needs the file");
+    assert_eq!(crate::addon::prewarm_choice(Some("1")), (true, true));
+    assert_eq!(crate::addon::prewarm_choice(Some("direct")), (false, true));
+    assert_eq!(crate::addon::prewarm_choice(Some("0")), (false, false), "browse-time prefetch");
+}
+
+/// `/meta`'s warm-up and the `/direct` chasing it a moment later have to be ONE yt-dlp run between
+/// them. The probe budget cannot arrange that — six permits mean neither ever waits for the other,
+/// so both missed the cache and both resolved the same video, and the warm-up bought nothing.
+#[tokio::test]
+async fn concurrent_asks_for_one_id_share_a_single_resolve() {
+    let dir = temp_dir();
+    // Slow enough that the second ask certainly arrives while the first is still running.
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-slow-printing",
+        "sleep 1\nprintf '1920 1080\\nhttps://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+
+    let (first, second) = tokio::join!(
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()),
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()),
+    );
+
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200, "the waiter must get the answer, not an error of its own");
+    assert_eq!(spawn_count(&runs), 1, "one video, resolved twice at once");
 }
 
 /// The download path learned this lesson the expensive way: without a remembered verdict, every

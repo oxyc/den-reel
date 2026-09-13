@@ -39,9 +39,11 @@ use hyper::{Response, StatusCode};
 use serde_json::json;
 use tokio::process::Command;
 
+use futures_util::FutureExt;
+
 use crate::config::Config;
 use crate::httputil::{self, Body};
-use crate::state::AppState;
+use crate::state::{AppState, BoxFuture, SharedResolve};
 use crate::ytdlp::{classify, PlayError};
 
 /// yt-dlp `--print` is a metadata round-trip, not a download; well under the probe's own backstop.
@@ -256,24 +258,49 @@ pub(crate) async fn answer(
     if let Some(answer) = cached(state, vid, (state.clock)()) {
         return (answer, None);
     }
-    // A probe permit, not a download one: this is a metadata round-trip of the same weight as
-    // `ytdlp::probe`, and it must not be able to queue behind — or in front of — a real download.
     let started = std::time::Instant::now();
-    let _permit = state.probe_sem.acquire().await;
-    // Asked again under the permit. A burst for one id all miss the cache together and then queue;
-    // without this every one spends its own yt-dlp run on an answer the first has already written.
-    if let Some(answer) = cached(state, vid, (state.clock)()) {
-        return (answer, None);
-    }
-    let answer = resolve(&state.cfg, vid, (state.clock)()).await;
-    let now = (state.clock)();
-    if let Err(e) = &answer {
-        // Once per resolve that actually ran, at most once a minute per reason — the same shape the
-        // download path logs with, and for the same reason: in an outage every one fails alike.
-        crate::log_limited(&format!("direct {}", e.reason), || format!("[{vid}] {}", e.detail));
-    }
-    remember(state, vid, (answer.clone(), now + ttl_ms(&answer, now)), now);
-    (answer, Some(started.elapsed()))
+    // Join the resolve already running for this id, or start the one the others will join.
+    //
+    // A semaphore cannot do this. The probe budget is six, so `/meta`'s warm-up and the `/direct`
+    // that follows it a few milliseconds later each took a permit of their own, each missed the
+    // cache, and each spent a yt-dlp run — about two seconds of Python and YouTube — on the very
+    // same video. The warm-up bought nothing at all, which is the opposite of what it is for.
+    let shared: SharedResolve = {
+        let mut map = state.direct_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = map.get(vid) {
+            running.clone()
+        } else {
+            let st = state.clone();
+            let v = vid.to_string();
+            let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(async move {
+                // The permit is taken INSIDE the shared future, so waiters queue on the resolve
+                // rather than on the budget: one permit is spent per video, not per caller.
+                let _permit = st.probe_sem.acquire().await;
+                let answer = resolve(&st.cfg, &v, (st.clock)()).await;
+                let now = (st.clock)();
+                if let Err(e) = &answer {
+                    // Once per resolve that actually ran, at most once a minute per reason — the
+                    // shape the download path logs with, and for the same reason: in an outage
+                    // every one of them fails alike.
+                    crate::log_limited(&format!("direct {}", e.reason), || format!("[{v}] {}", e.detail));
+                }
+                remember(&st, &v, (answer.clone(), now + ttl_ms(&answer, now)), now);
+                st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&v);
+                answer
+            });
+            let shared = fut.shared();
+            map.insert(vid.to_string(), shared.clone());
+            // Driven by a task of its own, so a client that navigates away mid-resolve cannot leave
+            // the entry standing with a future nobody will poll — which would wedge the id until
+            // restart. Same reason the download path detaches its driver.
+            let driver = shared.clone();
+            tokio::spawn(async move {
+                let _ = driver.await;
+            });
+            shared
+        }
+    };
+    (shared.await, Some(started.elapsed()))
 }
 
 /// Resolve ahead of the request that will want it, so `/direct` costs a hash lookup instead of a
