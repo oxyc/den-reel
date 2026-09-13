@@ -79,6 +79,9 @@ pub struct AppState {
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
     pub searcher: SearchFn,
     pub prewarm: PrewarmFn,
+    /// Resolve the direct URLs ahead of the request, as `prewarm` does the download. Injectable for
+    /// the same reason it is: a test has to be able to keep yt-dlp out of the `/meta` path.
+    pub direct_warm: PrewarmFn,
     pub clock: ClockFn,
     /// Global caps on concurrent subprocess trees, so a burst of distinct ids can't fork-bomb the
     /// box: downloads (yt-dlp+ffmpeg) and probes (yt-dlp --simulate).
@@ -148,6 +151,7 @@ impl AppState {
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),
             prewarm: default_prewarm(),
+            direct_warm: default_direct_warm(),
             clock: Box::new(default_clock),
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
             prewarm_sem,
@@ -257,6 +261,11 @@ pub fn default_prewarm() -> PrewarmFn {
             let _ = crate::play::fetch_trailer(state, id).await;
         });
     })
+}
+
+/// Real direct warm-up: resolve into the cache so the `/direct` that follows is a hash lookup.
+pub fn default_direct_warm() -> PrewarmFn {
+    Box::new(|state: Arc<AppState>, id: String| crate::direct::warm(state, id))
 }
 
 /// Read the resolve cache left by the previous process, dropping whatever no longer holds.

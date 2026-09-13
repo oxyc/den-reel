@@ -245,32 +245,66 @@ fn ttl_ms(answer: &Result<Direct, PlayError>, now: u64) -> u64 {
     }
 }
 
-pub async fn handle_direct(state: Arc<AppState>, vid: String) -> Response<Body> {
-    let now = (state.clock)();
-    if let Some(answer) = cached(&state, &vid, now) {
-        return httputil::timed(respond(&state, &vid, &answer, now), "cache;desc=hit");
+/// This id's answer, from memory or from yt-dlp. `None` timing means it came from the cache.
+///
+/// Shared by the request path and by the warm-up `/meta` fires, so a speculative resolve and a real
+/// one cannot drift apart — and so the warm-up genuinely fills the cache the request then reads.
+pub(crate) async fn answer(
+    state: &Arc<AppState>,
+    vid: &str,
+) -> (Result<Direct, PlayError>, Option<std::time::Duration>) {
+    if let Some(answer) = cached(state, vid, (state.clock)()) {
+        return (answer, None);
     }
     // A probe permit, not a download one: this is a metadata round-trip of the same weight as
     // `ytdlp::probe`, and it must not be able to queue behind — or in front of — a real download.
     let started = std::time::Instant::now();
-    let answer = {
-        let _permit = state.probe_sem.acquire().await;
-        // Asked again under the permit. A burst for one id all miss the cache together and then
-        // queue; without this every one of them spends its own yt-dlp run on an answer the first
-        // has already written.
-        match cached(&state, &vid, (state.clock)()) {
-            Some(answer) => answer,
-            None => resolve(&state.cfg, &vid, (state.clock)()).await,
-        }
-    };
+    let _permit = state.probe_sem.acquire().await;
+    // Asked again under the permit. A burst for one id all miss the cache together and then queue;
+    // without this every one spends its own yt-dlp run on an answer the first has already written.
+    if let Some(answer) = cached(state, vid, (state.clock)()) {
+        return (answer, None);
+    }
+    let answer = resolve(&state.cfg, vid, (state.clock)()).await;
     let now = (state.clock)();
     if let Err(e) = &answer {
         // Once per resolve that actually ran, at most once a minute per reason — the same shape the
         // download path logs with, and for the same reason: in an outage every one fails alike.
         crate::log_limited(&format!("direct {}", e.reason), || format!("[{vid}] {}", e.detail));
     }
-    remember(&state, &vid, (answer.clone(), now + ttl_ms(&answer, now)), now);
-    httputil::timed(respond(&state, &vid, &answer, now), &httputil::timing("resolve", started.elapsed()))
+    remember(state, vid, (answer.clone(), now + ttl_ms(&answer, now)), now);
+    (answer, Some(started.elapsed()))
+}
+
+/// Resolve ahead of the request that will want it, so `/direct` costs a hash lookup instead of a
+/// yt-dlp run.
+///
+/// `/meta` already prewarms the DOWNLOAD, which is what made `/play` feel instant — and is exactly
+/// why the direct path felt slower for a title that had been browsed: it traded a warm file for a
+/// cold resolve. This puts the resolve on the same footing. Fire-and-forget, and it takes the same
+/// probe permit, so a browse cannot spend more of the budget than a probe would.
+pub fn warm(state: Arc<AppState>, vid: String) {
+    if !crate::is_valid_vid(&vid) {
+        return;
+    }
+    // Nothing to do if the answer is already standing — checked before spawning, so a browse over
+    // titles that are all cached costs no tasks at all.
+    if cached(&state, &vid, (state.clock)()).is_some() {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = answer(&state, &vid).await;
+    });
+}
+
+pub async fn handle_direct(state: Arc<AppState>, vid: String) -> Response<Body> {
+    let (answer, spent) = answer(&state, &vid).await;
+    let now = (state.clock)();
+    let timing = match spent {
+        Some(d) => httputil::timing("resolve", d),
+        None => "cache;desc=hit".to_string(),
+    };
+    httputil::timed(respond(&state, &vid, &answer, now), &timing)
 }
 
 /// The JSON body, cacheable for exactly as long as the URLs in it are good for.

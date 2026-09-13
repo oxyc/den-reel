@@ -394,6 +394,12 @@ pub async fn handle_meta(
     if let Some(primary) = yt_ids.first() {
         if query_param(query, "prewarm").as_deref() != Some("0") && !demotion.head_dead {
             (state.prewarm)(state.clone(), primary.clone());
+            // And resolve its direct URLs, which is what a browser asks for next. Prewarming only
+            // the download is what made the direct path feel SLOWER on a title that had been
+            // browsed: `/play` was already a warm file while `/direct` still had a cold yt-dlp run
+            // in front of it. A resolve is a metadata round-trip, so this spends a probe permit
+            // rather than a download slot or room on the cache volume.
+            (state.direct_warm)(state.clone(), primary.clone());
         }
     }
     let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);

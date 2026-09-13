@@ -277,6 +277,8 @@ fn build_state_full(
         prober,
         searcher,
         prewarm,
+        // Never the real one: /meta would spawn yt-dlp behind every test that browses a title.
+        direct_warm: noop_prewarm(),
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
