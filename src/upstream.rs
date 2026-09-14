@@ -283,13 +283,7 @@ fn redact(url: &str) -> &str {
 impl Upstream for HttpUpstream {
     /// `tmdb:<id>` goes straight to /videos; an imdb id resolves through /find first. Ordered YouTube
     /// trailer candidates, `[]` on miss.
-    async fn tmdb_candidates(
-        &self,
-        tmdb_key: &str,
-        id: &str,
-        ty: &str,
-        lang: &str,
-    ) -> Answered<Vec<String>> {
+    async fn tmdb_candidates(&self, tmdb_key: &str, id: &str, ty: &str, lang: &str) -> Answered<Vec<String>> {
         if tmdb_key.is_empty() {
             return Ok(Vec::new()); // not consulted, which is not a failure
         }
@@ -403,10 +397,8 @@ impl Upstream for HttpUpstream {
             Some(n) => format!("tmdb_id={n}"),
             None => format!("imdb_id={id}"),
         };
-        let url = format!(
-            "{}/{endpoint}?{param}&categories=Trailer&language={language}",
-            self.cfg.kinocheck_base
-        );
+        let url =
+            format!("{}/{endpoint}?{param}&categories=Trailer&language={language}", self.cfg.kinocheck_base);
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
         if let Some(k) = kinocheck_key {
             headers.push(("X-Api-Key", k));

@@ -249,9 +249,7 @@ pub async fn resolve_youtube_ids(
     let started = std::time::Instant::now();
     let ((tmdb, tmdb_dur), (kc, kc_dur)) = tokio::join!(
         async { (state.upstream.tmdb_candidates(tmdb_key, id, ty, lang).await, started.elapsed()) },
-        async {
-            (state.upstream.kinocheck_youtube_id(kinocheck_key, id, ty, lang).await, started.elapsed())
-        },
+        async { (state.upstream.kinocheck_youtube_id(kinocheck_key, id, ty, lang).await, started.elapsed()) },
     );
     // TMDB only when it was asked — without a key it is not consulted. KinoCheck always is.
     let mut timing =

@@ -3055,11 +3055,8 @@ async fn a_stated_id_pair_shares_one_resolve_entry() {
     let base = spawn_server(state).await;
     let client = reqwest::Client::new();
 
-    let stated = client
-        .get(format!("{base}/meta/movie/tmdb:157336.json?imdb=tt0816692"))
-        .send()
-        .await
-        .unwrap();
+    let stated =
+        client.get(format!("{base}/meta/movie/tmdb:157336.json?imdb=tt0816692")).send().await.unwrap();
     assert_eq!(stated.status(), 200);
     let by_imdb = client.get(format!("{base}/meta/movie/tt0816692.json")).send().await.unwrap();
     assert_eq!(by_imdb.status(), 200);
