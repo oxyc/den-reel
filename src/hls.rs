@@ -142,7 +142,7 @@ fn best_first(playlist: &str) -> String {
         tail.push_str(&text);
     }
     // Stable, so variants of equal bandwidth stay in the order YouTube chose for them.
-    variants.sort_by(|a, b| b.0.cmp(&a.0));
+    variants.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut out = head;
     for (_, text) in variants {
         out.push_str(&text);
