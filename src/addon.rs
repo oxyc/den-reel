@@ -34,6 +34,13 @@ pub fn manifest(install_id: Option<&str>) -> Value {
         // A BYOK TMDB key is entered (and sealed) at /configure — advertise it so a Stremio client shows
         // the Configure button. The Den app builds the sealed URL directly, so this is just for parity.
         "behaviorHints": { "configurable": true },
+        // The trailer source this addon adds to TMDB's own, for the client's credits (den-spec attribution-v1). TMDB
+        // is credited by the client itself.
+        "denAttribution": [{
+            "text": "Trailers found with KinoCheck.",
+            "link": "KinoCheck",
+            "url": "https://www.kinocheck.com",
+        }],
     });
     if let Some(iid) = install_id {
         manifest["denInstallId"] = json!(iid);

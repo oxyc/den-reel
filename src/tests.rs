@@ -1271,6 +1271,7 @@ async fn get_manifest_returns_addon_manifest() {
     assert_eq!(body["id"], "com.den.reel");
     assert_eq!(body["resources"][0], "meta");
     assert!(body.get("denInstallId").is_none(), "the config-less manifest names no install");
+    assert_eq!(body["denAttribution"][0]["link"], "KinoCheck");
 }
 
 /// A configured install's manifest names its install id — the value to put in REVOKED_INSTALLS —
