@@ -56,6 +56,15 @@ pub struct AppState {
     /// redeploy does not make the next browse re-ask TMDB for every title on screen. Empty ids =
     /// "no trailer".
     pub yt_cache: Mutex<HashMap<String, YtEntry>>,
+    /// The same title's imdb and tmdb ids, mapped both ways, as clients tell us them. A client browsing
+    /// from TMDB usually holds both already, and saying so here is worth more than it looks: KinoCheck
+    /// takes either id, TMDB wants its own, and a search or an Apple lookup wants neither — so knowing
+    /// the pair means whichever id arrives can reach every source without a lookup to convert it. It
+    /// also lets one title hold ONE resolve entry rather than one per id form.
+    ///
+    /// In memory only. A pair never changes, so it would park happily enough, but re-learning one costs
+    /// nothing when the client is carrying both anyway.
+    pub ids: Mutex<HashMap<String, String>>,
     /// vid -> (generation, shared download future), so concurrent /play (and prewarm) share one
     /// yt-dlp run. The generation lets the creator clear its own entry without clobbering a newer one.
     pub in_flight: Mutex<HashMap<String, (u64, SharedDownload)>>,
@@ -150,6 +159,7 @@ impl AppState {
             cfg: cfg.clone(),
             config_keyring,
             yt_cache: Mutex::new(HashMap::new()),
+            ids: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),

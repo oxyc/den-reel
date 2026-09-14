@@ -64,6 +64,24 @@ fn is_supported_id(id: &str) -> bool {
     is_imdb(id) || is_tmdb(id)
 }
 
+/// Remember that two ids name the same title, both ways round.
+///
+/// Cleared wholesale rather than grown without end: nothing stops a caller inventing pairs, and these are
+/// permanent facts a client re-sends on the next request anyway, so losing them costs one lookup.
+fn remember_pair(state: &Arc<AppState>, a: &str, b: &str) {
+    let mut ids = state.ids.lock().unwrap_or_else(|e| e.into_inner());
+    if ids.len() >= crate::YT_CACHE_MAX {
+        ids.clear();
+    }
+    ids.insert(a.to_owned(), b.to_owned());
+    ids.insert(b.to_owned(), a.to_owned());
+}
+
+/// The other id for this title, if anything has told us it.
+fn other_id(state: &Arc<AppState>, id: &str) -> Option<String> {
+    state.ids.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+}
+
 /// `^[a-z]{2}$` (case-insensitive), else the caller falls back to "en".
 fn valid_lang(l: &str) -> bool {
     l.len() == 2 && l.bytes().all(|b| b.is_ascii_alphabetic())
@@ -185,9 +203,14 @@ pub async fn resolve_youtube_ids(
         (true, true) => ":nokey",
         (true, false) => ":nokey:nokc",
     };
-    // Keyed by the id AS ASKED, so the same title under `tt…` and under `tmdb:…` holds two entries and
-    // resolves once each. Bounded and short-lived, and the pair is not known here to canonicalise with.
-    let cache_key = format!("{id}:{lang}{sources}");
+    // One title, one entry. A tmdb id is keyed under its imdb id wherever the pair is known, so the two
+    // forms share whatever either of them resolved. Keyed to the IMDB side deliberately: every entry
+    // parked by an earlier version is imdb-keyed, and they stay valid this way.
+    let canonical = match id.strip_prefix("tmdb:") {
+        Some(_) => other_id(state, id).unwrap_or_else(|| id.to_owned()),
+        None => id.to_owned(),
+    };
+    let cache_key = format!("{canonical}:{lang}{sources}");
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         let now = (state.clock)();
@@ -410,6 +433,16 @@ pub async fn handle_meta(
             &build_meta(ty, &id, &base, &[], state.cfg.play_secret.as_deref(), binding),
             &[("cache-control", "no-store")],
         );
+    }
+    // A client browsing from TMDB usually holds the imdb id too (and the other way about), so it can say
+    // so here: `?imdb=tt…` beside a tmdb id, `?tmdb=…` beside an imdb one. Then whichever id it asked
+    // with can reach every source without a lookup to convert it, and both forms share one resolve entry.
+    // Validated exactly as the path id is — a companion reaches the same upstream URLs.
+    let companion = query_param(query, "imdb")
+        .filter(|v| is_imdb(v))
+        .or_else(|| query_param(query, "tmdb").map(|n| format!("tmdb:{n}")).filter(|v| is_tmdb(v)));
+    if let Some(other) = companion.filter(|o| *o != id) {
+        remember_pair(state, &id, &other);
     }
     // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
     // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).

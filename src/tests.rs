@@ -270,6 +270,7 @@ fn build_state_full(
         cfg: Arc::new(cfg),
         config_keyring,
         yt_cache: Mutex::new(HashMap::new()),
+        ids: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
         dl_gen: std::sync::atomic::AtomicU64::new(0),
         crop_cache: Mutex::new(HashMap::new()),
@@ -3038,6 +3039,33 @@ async fn a_malformed_tmdb_id_is_refused() {
         !body["meta"]["links"].as_array().unwrap().is_empty(),
         "a well-formed tmdb id was refused along with the bad ones"
     );
+}
+
+/// A client that holds both ids can say so, and then the two forms are one title here rather than two:
+/// whichever it asks with next reads what the other already resolved.
+#[tokio::test]
+async fn a_stated_id_pair_shares_one_resolve_entry() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let cache = Arc::clone(&state);
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+
+    let stated = client
+        .get(format!("{base}/meta/movie/tmdb:157336.json?imdb=tt0816692"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stated.status(), 200);
+    let by_imdb = client.get(format!("{base}/meta/movie/tt0816692.json")).send().await.unwrap();
+    assert_eq!(by_imdb.status(), 200);
+
+    let entries = cache.yt_cache.lock().unwrap().len();
+    assert_eq!(entries, 1, "the same title resolved once per id form instead of once");
 }
 
 /// With no TMDB key, KinoCheck is the only source consulted — so its outage is a total failure to
