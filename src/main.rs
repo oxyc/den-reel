@@ -22,6 +22,7 @@ mod backoff;
 mod config;
 mod crop;
 mod direct;
+mod hls;
 mod httputil;
 mod play;
 mod seal;
@@ -454,7 +455,7 @@ fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
 /// or pasting the bare segment, which would otherwise put the key in the log through a 404.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
-    const ROUTES: [&str; 10] = [
+    const ROUTES: [&str; 12] = [
         "",
         "health",
         "metrics",
@@ -465,6 +466,8 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "crop",
         "play",
         "direct",
+        "hls",
+        "seg",
     ];
     let rest = path.strip_prefix('/').unwrap_or(path);
     let (first, tail) = match rest.split_once('/') {
@@ -631,6 +634,25 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 return bad_signature();
             }
             return direct::handle_direct(state, id.to_string()).await;
+        }
+    }
+
+    // One URL out of a playlist this server rewrote. Its signature covers that URL rather than a
+    // video id, so `signature_ok` is not the check here — `handle_segment` makes its own. It lives
+    // beside the master rather than at the root so the rewritten URIs can be relative to it.
+    if path == "/hls/seg" {
+        return hls::handle_segment(state, query, &parts.headers).await;
+    }
+
+    // HLS: /hls/<id>.m3u8 → YouTube's own master playlist, with every URI in it rewritten to come
+    // back through the route above. Signed like /direct, which is also the work it costs: one
+    // resolve, shared with whatever /meta already warmed.
+    if let Some(id) = path.strip_prefix("/hls/").and_then(|r| r.strip_suffix(".m3u8")) {
+        if is_valid_vid(id) {
+            if !signature_ok(&state, id, query) {
+                return bad_signature();
+            }
+            return hls::handle_master(state, id.to_string()).await;
         }
     }
 

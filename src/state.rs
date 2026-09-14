@@ -93,6 +93,10 @@ pub struct AppState {
     /// falls back to spawning the binary, so this is only ever an optimisation.
     pub worker: crate::worker::Worker,
     pub upstream: Box<dyn Upstream>,
+    /// The same HTTP client the upstream lookups use, for the HLS proxy's own fetches (`hls.rs`).
+    /// Shared rather than a second one: a client is a connection pool, and googlevideo and TMDB are
+    /// both plain https with the same TLS stack behind them.
+    pub http: reqwest::Client,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
     pub searcher: SearchFn,
@@ -148,7 +152,7 @@ impl AppState {
             .user_agent(concat!("den-reel/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client");
-        let upstream = Box::new(HttpUpstream::new(cfg.clone(), http));
+        let upstream = Box::new(HttpUpstream::new(cfg.clone(), http.clone()));
         let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
         let prewarm_sem = Arc::new(Semaphore::new(crate::PREWARM_MAX));
         // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.
@@ -173,6 +177,7 @@ impl AppState {
             direct_inflight: Mutex::new(HashMap::new()),
             worker: Default::default(),
             upstream,
+            http,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),
             prewarm: default_prewarm(),

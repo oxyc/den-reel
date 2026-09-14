@@ -280,6 +280,9 @@ fn build_state_full(
         direct_inflight: Mutex::new(HashMap::new()),
         worker: Default::default(),
         upstream,
+        // Never used by a test: nothing here reaches the HLS proxy, and a client builds no
+        // connection until something asks it for one.
+        http: reqwest::Client::new(),
         prober,
         searcher,
         prewarm,
