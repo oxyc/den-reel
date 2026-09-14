@@ -18,6 +18,7 @@
 //! take a video stream plus a separate audio one, which is what YouTube now answers with.
 
 mod addon;
+mod backoff;
 mod config;
 mod crop;
 mod direct;
@@ -85,6 +86,11 @@ pub const CROP_UNKNOWN_TTL_MS: u64 = 10 * 60 * 1000;
 pub const DOWNLOAD_CONCURRENCY: usize = 3; // global cap on concurrent yt-dlp downloads (bounds CPU/disk/fd)
 const _: () =
     assert!(PREWARM_MAX < DOWNLOAD_CONCURRENCY, "prewarm must leave a download permit for a real /play");
+// How long every new extraction waits after YouTube throttles this box (a 429, a bot check), doubling
+// per consecutive throttle up to the cap. Such a throttle is about the box's address, not the video, so
+// it pauses all of them: a per-id cooldown let every new id spawn another yt-dlp into it.
+pub const YOUTUBE_PAUSE_BASE_MS: u64 = 5 * 60 * 1000;
+pub const YOUTUBE_PAUSE_CAP_MS: u64 = 3 * 60 * 60 * 1000;
 pub const PROBE_CONCURRENCY: usize = 6; // global cap on concurrent yt-dlp --simulate probes
                                         // Cap on DISTINCT ids with a download outstanding. `download_sem` bounds how many run at once, but
                                         // the permit is taken inside `download_cached` — so every new id got a map entry and a spawned
@@ -168,10 +174,17 @@ fn health_body(
     recent_failures: u32,
     extract_fails: u32,
     local_fails: u32,
+    youtube_paused_ms: Option<u64>,
 ) -> serde_json::Value {
-    match health_verdict(tmdb_available, recent_failures, extract_fails, local_fails) {
+    let paused = youtube_paused_ms.is_some();
+    match health_verdict(tmdb_available, recent_failures, extract_fails, local_fails, paused) {
         Some((reason, detail)) => {
-            serde_json::json!({"status": "degraded", "reason": reason, "detail": detail})
+            let mut body = serde_json::json!({"status": "degraded", "reason": reason, "detail": detail});
+            // A throttle lifts on its own, so say when — the one verdict here with a known end.
+            if let (true, Some(ms)) = (reason == "youtube_throttled", youtube_paused_ms) {
+                body["retry_after_s"] = ms.div_ceil(1000).into();
+            }
+            body
         }
         None => serde_json::json!({"status": "ok"}),
     }
@@ -184,11 +197,19 @@ fn health_verdict(
     recent_failures: u32,
     extract_fails: u32,
     local_fails: u32,
+    youtube_paused: bool,
 ) -> Option<(&'static str, &'static str)> {
     if !tmdb_available {
         Some(("tmdb_key_missing", "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"))
     } else if recent_failures >= HEALTH_FAIL_THRESHOLD {
         Some(("upstream_unavailable", "TMDB has been failing"))
+    } else if youtube_paused {
+        // Ahead of `extractor_unavailable` because the advice differs: bumping yt-dlp does nothing
+        // for a throttle on this box's address. It lifts on its own, and a success ends it early.
+        Some((
+            "youtube_throttled",
+            "YouTube is throttling this server (429 / bot check) — extractions are paused until it lifts",
+        ))
     } else if extract_fails >= HEALTH_FAIL_THRESHOLD {
         // Trailers resolve upstream but yt-dlp can't extract any of them here — YouTube BotGuard or a
         // stale yt-dlp / broken nsig-JS runtime. Bumping YTDLP_VERSION is the fix that usually works,
@@ -374,9 +395,10 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+    // Retry-After as well, or a browser client cannot honour the cooldown a refusal carries.
     resp.headers_mut().insert(
         "access-control-expose-headers",
-        hyper::header::HeaderValue::from_static("Server-Timing, X-Den-Degraded"),
+        hyper::header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After"),
     );
     resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // Time to headers: a streamed /play body is still being written when this runs.
@@ -466,8 +488,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
         // no server TMDB key AND no sealed-config keyring, or TMDB failing. KinoCheck is a
         // fallback: its outage does not mean trailers are broken, so it does not move this.
-        let (tmdb_available, recent_failures, extract_fails, local_fails) = state.health_inputs();
-        let body = health_body(tmdb_available, recent_failures, extract_fails, local_fails);
+        let (tmdb_available, recent_failures, extract_fails, local_fails, paused) = state.health_inputs();
+        let body = health_body(tmdb_available, recent_failures, extract_fails, local_fails, paused);
         return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     // Operational detail /health has no room for. /health answers one question — can this instance

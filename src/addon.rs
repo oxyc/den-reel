@@ -284,7 +284,14 @@ pub async fn resolve_youtube_ids(
         // the empty result below is not an answer either.
         search_failed = title.is_err();
         if let Ok(Some(title)) = title {
-            match (state.searcher)(format!("{title} trailer")).await {
+            // A search is a yt-dlp run against YouTube too. While YouTube is throttling this box it
+            // cannot answer, so it is not run and counts as a failed search, not an empty one.
+            let found = if state.youtube.remaining_ms((state.clock)()).is_some() {
+                None
+            } else {
+                (state.searcher)(format!("{title} trailer")).await
+            };
+            match found {
                 Some(found) => {
                     for c in found {
                         if seen.insert(c.clone()) {

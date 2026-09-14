@@ -356,6 +356,9 @@ pub(crate) fn fail_ttl_ms(reason: &str) -> u64 {
         // Long enough to stop one stuck id monopolising a permit every request, short enough that a
         // network that comes back is served within the minute.
         "timeout" => 60 * 1000,
+        // Never cached per id — the pause in `AppState::youtube` covers every id at once. This is
+        // only what `Retry-After` falls back to if that pause has already lifted.
+        "throttled" => crate::YOUTUBE_PAUSE_BASE_MS,
         // A shape we do not recognise: assume the least and re-ask soon.
         _ => 60 * 1000,
     }
@@ -584,6 +587,10 @@ async fn fetch_trailer_inner(
         let mut map = state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, existing)) = map.get(&vid) {
             existing.clone()
+        } else if state.youtube.remaining_ms((state.clock)()).is_some() {
+            // YouTube is throttling this box, so a NEW extraction would fail like the last one and
+            // extend the throttle besides. Joining one already running (above) is still free.
+            return Err(PlayError::throttled());
         } else if map.len() >= crate::IN_FLIGHT_MAX {
             // Only a NEW id is refused. Joining a download already in flight costs nothing and is
             // exactly what the de-duplication is for, so a viewer waiting on a trailer someone else
@@ -614,6 +621,9 @@ async fn fetch_trailer_inner(
                     let out = download_cached(st.clone(), v.clone(), gen).await;
                     match &out {
                         Ok(_) => clear_failure(&st, &v),
+                        // A throttle is about this box, not this id, and the pause already answers
+                        // every id. Pinning it here would outlive the pause for this one video.
+                        Err(e) if e.reason == "throttled" => {}
                         Err(e) => {
                             // Logged HERE, once per download that actually happened, rather than at
                             // every request that observes the result. `record_failure` drops the
@@ -681,6 +691,11 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         if e.reason == "extraction_failed" {
             state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Also systemic, but not the extractor's fault: a throttle pauses every new extraction
+        // instead of moving the counter whose advice is to bump yt-dlp.
+        if e.reason == "throttled" {
+            state.youtube.trip((state.clock)(), None, "YouTube is throttling extractions");
+        }
         // A local failure is not the extractor's fault, but it is still a total outage from the
         // viewer's side, and it used to move nothing at all.
         if e.reason == "incomplete_download" {
@@ -690,6 +705,7 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
     }
     let download = started.elapsed();
     state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed); // extraction worked → clear the signal
+    state.youtube.clear(); // ...and YouTube is answering again
 
     // Detect the content rect (cached for /crop) and bake a `clap` box — on the TEMP file, BEFORE
     // publishing, so no request can serve it mid-write. Best-effort: a play must not break because
@@ -876,7 +892,13 @@ pub(crate) fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response
     // No entry means nothing is being cached for this id, so the full TTL is the honest estimate of
     // when asking again could help. Never zero: a client reading `Retry-After: 0` will come straight
     // back, which is the one answer that is never useful here.
-    let ms = remaining_fail_ms(state, vid).unwrap_or_else(|| fail_ttl_ms(&e.reason));
+    // A throttle is not cached per id; what is left of the box-wide pause is its window.
+    let standing = if e.reason == "throttled" {
+        state.youtube.remaining_ms((state.clock)())
+    } else {
+        remaining_fail_ms(state, vid)
+    };
+    let ms = standing.unwrap_or_else(|| fail_ttl_ms(&e.reason));
     // Round UP. `record_failure` and this read take separate millisecond clock readings, so dividing
     // down reports one second short whenever the millisecond ticks between them — and a client that
     // comes back a second early finds the window still closed. Rounding up can only ever be right.
@@ -888,13 +910,20 @@ pub(crate) fn play_error(state: &AppState, vid: &str, e: &PlayError) -> Response
     )
 }
 
+/// The refusal `/play` and `/crop` give while the cache volume is unusable. `cache_available` never
+/// remembers a failure, so the very next request re-probes; a minute is what a client should wait
+/// before being that request, rather than retrying at once or giving up.
+pub(crate) fn cache_unavailable() -> Response<Body> {
+    httputil::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &serde_json::json!({ "error": "cache_unavailable", "detail": "Trailer cache is unavailable." }),
+        &[("retry-after", "60")],
+    )
+}
+
 pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String) -> Response<Body> {
     if !cache_available(&state.cfg).await {
-        return httputil::error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cache_unavailable",
-            "Trailer cache is unavailable.",
-        );
+        return cache_unavailable();
     }
     let range = headers.get("range").and_then(|v| v.to_str().ok()).map(str::to_string);
 

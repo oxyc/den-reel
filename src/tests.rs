@@ -295,6 +295,7 @@ fn build_state_full(
         cache_measured_at: std::sync::atomic::AtomicU64::new(0),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
         local_fails: std::sync::atomic::AtomicU32::new(0),
+        youtube: crate::state::youtube_backoff(),
         health_logged: Mutex::new(None),
     })
 }
@@ -1126,26 +1127,32 @@ fn classify_defaults_to_502() {
 fn health_reports_degraded_and_ok_states() {
     // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
     assert_eq!(
-        crate::health_body(false, 0, 0, 0),
+        crate::health_body(false, 0, 0, 0, None),
         json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     );
     // A missing key wins even if upstreams / the extractor are also failing.
-    assert_eq!(crate::health_body(false, 99, 99, 0)["reason"], "tmdb_key_missing");
+    assert_eq!(crate::health_body(false, 99, 99, 0, None)["reason"], "tmdb_key_missing");
 
     // Key present but upstreams have been failing (>= threshold) → degraded (wins over the extractor).
     assert_eq!(
-        crate::health_body(true, 3, 99, 0),
+        crate::health_body(true, 3, 99, 0, None),
         json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB has been failing"})
     );
-    assert_eq!(crate::health_body(true, 4, 0, 0)["reason"], "upstream_unavailable");
+    assert_eq!(crate::health_body(true, 4, 0, 0, None)["reason"], "upstream_unavailable");
 
     // Upstreams fine but yt-dlp can't extract anything (>= threshold) → degraded (the silent-outage gap).
-    assert_eq!(crate::health_body(true, 0, 3, 0)["reason"], json!("extractor_unavailable"));
-    assert_eq!(crate::health_body(true, 0, 2, 0), json!({"status": "ok"})); // below threshold → ok
+    assert_eq!(crate::health_body(true, 0, 3, 0, None)["reason"], json!("extractor_unavailable"));
+    assert_eq!(crate::health_body(true, 0, 2, 0, None), json!({"status": "ok"})); // below threshold → ok
 
     // Key present, everything below the threshold → ok.
-    assert_eq!(crate::health_body(true, 0, 0, 0), json!({"status": "ok"}));
-    assert_eq!(crate::health_body(true, 2, 2, 0), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 0, 0, 0, None), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 2, 2, 0, None), json!({"status": "ok"}));
+
+    // A YouTube throttle outranks the extractor counter — "bump yt-dlp" is the wrong advice for it —
+    // and says when it lifts.
+    let throttled = crate::health_body(true, 0, 3, 0, Some(90_500));
+    assert_eq!(throttled["reason"], "youtube_throttled");
+    assert_eq!(throttled["retry_after_s"], 91);
 }
 
 // --- resolve logic ----------------------------------------------------------
@@ -4370,17 +4377,17 @@ async fn exit_zero_with_no_file_is_not_blamed_on_the_extractor() {
 #[test]
 fn downloads_failing_locally_degrade_health_under_their_own_reason() {
     let t = crate::HEALTH_FAIL_THRESHOLD;
-    let ok = crate::health_body(true, 0, 0, 0);
+    let ok = crate::health_body(true, 0, 0, 0, None);
     assert_eq!(ok["status"], "ok");
 
-    let local = crate::health_body(true, 0, 0, t);
+    let local = crate::health_body(true, 0, 0, t, None);
     assert_eq!(local["status"], "degraded", "every download failing still reported ok");
     assert_eq!(local["reason"], "downloads_failing");
     let detail = local["detail"].as_str().unwrap_or_default();
     assert!(!detail.contains("yt-dlp can't extract"), "local failures blamed the extractor: {detail}");
 
     // An extractor outage still wins: it is the more specific diagnosis.
-    let both = crate::health_body(true, 0, t, t);
+    let both = crate::health_body(true, 0, t, t, None);
     assert_eq!(both["reason"], "extractor_unavailable");
 }
 
@@ -4730,6 +4737,249 @@ async fn a_play_failure_says_when_to_come_back() {
         (ttl - 600_000) / 1000,
         "a cached failure quoted the full TTL again instead of what is left of it"
     );
+}
+
+/// A throttle is YouTube refusing the box, not the video, and has to be told apart from the per-video
+/// refusals — the age wall shares "sign in to confirm" with the bot check.
+#[test]
+fn classify_recognises_a_youtube_throttle() {
+    for stderr in [
+        "ERROR: [youtube] abcdefghijk: Unable to download API page: HTTP Error 429: Too Many Requests",
+        "ERROR: [youtube] abcdefghijk: Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser",
+        "ERROR: [youtube] abcdefghijk: Sign in to confirm you're not a bot",
+        "ERROR: [youtube] abcdefghijk: The current session has been rate-limited by YouTube for up to an hour",
+    ] {
+        let e = classify(Some(1), stderr);
+        assert_eq!((e.status, e.reason.as_str()), (503, "throttled"), "{stderr}");
+    }
+    assert_eq!(classify(Some(1), "ERROR: Sign in to confirm your age").reason, "restricted");
+}
+
+/// The pause doubles per episode, never passes its cap, and counts one episode once: requests that
+/// left before the pause report back inside it, and must not double it once each.
+#[test]
+fn a_backoff_doubles_caps_and_counts_one_episode_once() {
+    use crate::backoff::{window_ms, Backoff};
+    assert_eq!(window_ms(1000, 60_000, 1, 0), 1000);
+    assert_eq!(window_ms(1000, 60_000, 3, 0), 4000);
+    assert_eq!(window_ms(1000, 60_000, 3, 199), 4796);
+    assert_eq!(window_ms(1000, 60_000, 30, 199), 60_000);
+
+    let b = Backoff::new("test", 1000, 60_000);
+    assert_eq!(b.remaining_ms(0), None);
+    let first = b.trip(0, None, "refused");
+    assert!((1000..=1200).contains(&first), "{first}");
+    assert_eq!(b.trip(10, None, "refused"), first - 10, "a refusal inside the pause started a new episode");
+    assert_eq!(b.trip(10, Some(5000), "refused"), 5000, "a longer stated delay must extend the pause");
+    let second = b.trip(5010, None, "refused");
+    assert!((2000..=2400).contains(&second), "the next episode did not double: {second}");
+    b.clear();
+    assert_eq!(b.remaining_ms(5011), None, "an answer did not end the pause");
+    let after = b.trip(5011, None, "refused");
+    assert!((1000..=1200).contains(&after), "an answer did not forget the strikes: {after}");
+}
+
+/// Every new extraction waits out a YouTube throttle — a different id is refused without spawning
+/// yt-dlp, with what is left of the pause as `Retry-After` — and one that works ends it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_youtube_throttle_pauses_every_new_extraction_until_one_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir();
+    let spawns = dir.join("spawns");
+    let ok = dir.join("youtube-answers");
+    let yt = dir.join("yt-throttled");
+    std::fs::write(
+        &yt,
+        format!(
+            "#!/bin/sh\necho x >> \"{}\"\nif [ -f \"{}\" ]; then\nout=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\nhead -c 2048 /dev/zero > \"$out\"\nexit 0\nfi\necho 'ERROR: [youtube] x: HTTP Error 429: Too Many Requests' >&2\nexit 1\n",
+            spawns.display(),
+            ok.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&yt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = yt.to_string_lossy().into_owned();
+    cfg.bake_clap = false;
+    let clock = TestClock::default();
+    let now = || clock.0.load(Ordering::SeqCst);
+    let state = build_state_cfg_clock(cfg, Box::new(FakeUpstream::new(&[], None)), clock.as_fn());
+
+    let err = crate::play::fetch_trailer(state.clone(), "throttled01".into()).await.expect_err("throttled");
+    assert_eq!((err.status, err.reason.as_str()), (503, "throttled"));
+    assert_eq!(spawn_count(&spawns), 1);
+
+    let err = crate::play::fetch_trailer(state.clone(), "different01".into()).await.expect_err("paused");
+    assert_eq!(err.reason, "throttled");
+    assert_eq!(spawn_count(&spawns), 1, "a different id spawned yt-dlp into a throttle");
+    assert!(state.play_fails.lock().unwrap().is_empty(), "a throttle was pinned to an id");
+
+    let base = spawn_server(state.clone()).await;
+    let r = reqwest::get(format!("{base}/play/another0001.mp4")).await.unwrap();
+    assert_eq!(r.status(), 503);
+    let left = state.youtube.remaining_ms(now()).expect("paused");
+    assert_eq!(r.headers()["retry-after"].to_str().unwrap(), left.div_ceil(1000).to_string());
+    assert!(r.headers()["access-control-expose-headers"].to_str().unwrap().contains("Retry-After"));
+    assert_eq!(spawn_count(&spawns), 1);
+    let health: Value = reqwest::get(format!("{base}/health")).await.unwrap().json().await.unwrap();
+    assert_eq!(health["reason"], "youtube_throttled");
+
+    // Past the pause the next extraction is a probe. It works, and that ends the episode...
+    clock.advance(left + 1);
+    std::fs::write(&ok, "").unwrap();
+    crate::play::fetch_trailer(state.clone(), "different01".into()).await.expect("YouTube answers again");
+    assert_eq!(spawn_count(&spawns), 2);
+    assert_eq!(state.youtube.remaining_ms(now()), None);
+
+    // ...forgetting its strikes: the next throttle starts from the base window, not double it.
+    std::fs::remove_file(&ok).unwrap();
+    let _ = crate::play::fetch_trailer(state.clone(), "throttled02".into()).await;
+    let again = state.youtube.remaining_ms(now()).expect("paused again");
+    assert!(again <= crate::YOUTUBE_PAUSE_BASE_MS * 6 / 5, "a success did not reset the backoff: {again}ms");
+}
+
+#[test]
+fn retry_after_reads_seconds_and_http_dates() {
+    use crate::upstream::{http_date_ms, rate_limit_spent_ms, retry_after_ms, PAUSE_CAP_MS};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    let with = |pairs: &[(&'static str, &str)]| {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    };
+    let now = http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT").expect("an IMF-fixdate");
+    assert_eq!(now, 784_111_777_000);
+
+    let ra = |v: &str| retry_after_ms(&with(&[(RETRY_AFTER.as_str(), v)]), now);
+    assert_eq!(ra("120"), Some(120_000));
+    assert_eq!(ra("Sun, 06 Nov 1994 08:51:37 GMT"), Some(120_000));
+    assert_eq!(ra("86400"), Some(PAUSE_CAP_MS), "a day-long Retry-After switched discovery off for a day");
+    // Past, zero or unreadable: no hint, so the caller's own backoff applies rather than "retry now".
+    for v in ["0", "Sun, 06 Nov 1994 08:00:00 GMT", "soon", "-5", "Sunday, 06-Nov-94 08:49:37 GMT"] {
+        assert_eq!(ra(v), None, "{v}");
+    }
+    assert_eq!(retry_after_ms(&HeaderMap::new(), now), None);
+
+    // A present-day clock here: an epoch reset is told from a delay by being past a billion seconds,
+    // which 1994 is not.
+    let now = 1_789_639_200_000;
+    let spent = |pairs: &[(&'static str, &str)]| rate_limit_spent_ms(&with(pairs), now);
+    let epoch_reset = (now / 1000 + 45).to_string();
+    assert_eq!(spent(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "30")]), Some(30_000));
+    assert_eq!(spent(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", &epoch_reset)]), Some(45_000));
+    assert_eq!(spent(&[("x-ratelimit-remaining", "3"), ("x-ratelimit-reset", "30")]), None);
+    assert_eq!(spent(&[("ratelimit", "limit=100, remaining=0, reset=50")]), Some(50_000));
+    assert_eq!(spent(&[("ratelimit", "\"default\";r=0;t=20")]), Some(20_000));
+    assert_eq!(spent(&[("ratelimit", "\"default\";r=5;t=20")]), None);
+}
+
+/// Answer every connection with the same response and count them, so a test can prove a request
+/// was never made.
+async fn serve_counting(head: &'static str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!("{head}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A 429 is about the host, not the title: the next title is not sent to TMDB while its Retry-After
+/// stands, TMDB still reads as failing on /health, and KinoCheck — a different host — is still asked.
+#[tokio::test]
+async fn a_throttled_tmdb_is_not_asked_again_until_its_retry_after() {
+    const KC: &str = "{\"trailer\":{\"youtube_video_id\":\"dQw4w9WgXcQ\"}}";
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-type: application/json",
+        "{}",
+    )
+    .await;
+    let (kc, kc_hits) = serve_counting("HTTP/1.1 200 OK\r\ncontent-type: application/json", KC).await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    cfg.kinocheck_base = kc;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1, "a different title was sent to a throttled TMDB");
+    assert!(up.recent_failures() >= 2, "a paused TMDB read as healthy on /health");
+
+    assert_eq!(
+        up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await,
+        Ok(Some("dQw4w9WgXcQ".to_string())),
+        "a TMDB pause silenced KinoCheck"
+    );
+    assert_eq!(kc_hits.load(Ordering::SeqCst), 1);
+}
+
+/// KinoCheck gets the same pause, from its own exponential window when a 5xx says nothing about how
+/// long. And a good answer that spends the rate limit is used, while the call after it waits.
+#[tokio::test]
+async fn kinocheck_pauses_on_a_5xx_and_a_spent_rate_limit_pauses_after_the_answer() {
+    let (kc, kc_hits) =
+        serve_counting("HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json", "{}").await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.kinocheck_base = kc;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0816692", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(up.kinocheck_youtube_id(None, "tt0111161", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(kc_hits.load(Ordering::SeqCst), 1, "a failing KinoCheck was asked again at once");
+
+    const VIDEOS: &str = "{\"results\":[{\"site\":\"YouTube\",\"key\":\"dQw4w9WgXcQ\",\
+        \"type\":\"Trailer\",\"official\":true,\"iso_639_1\":\"en\"}]}";
+    let (tmdb, tmdb_hits) = serve_counting(
+        "HTTP/1.1 200 OK\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 30\r\ncontent-type: application/json",
+        VIDEOS,
+    )
+    .await;
+    let mut cfg = test_cfg(temp_dir());
+    cfg.tmdb_base = tmdb;
+    let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+    assert_eq!(
+        up.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await,
+        Ok(vec!["dQw4w9WgXcQ".to_string()]),
+        "the answer that spent the limit is still an answer"
+    );
+    assert_eq!(up.tmdb_candidates("test-key", "tmdb:603", "movie", "en").await, Err(NoAnswer));
+    assert_eq!(tmdb_hits.load(Ordering::SeqCst), 1, "TMDB was asked past a spent rate limit");
+}
+
+/// Our own refusal says when to come back too, on both endpoints that make it.
+#[tokio::test]
+async fn an_unusable_cache_says_when_to_come_back() {
+    let dir = temp_dir();
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let mut cfg = test_cfg(dir);
+    cfg.cache_dir = file.join("cache");
+    cfg.ytdlp_cache = cfg.cache_dir.join("yt-dlp");
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    for path in ["/play/dQw4w9WgXcQ.mp4", "/crop/dQw4w9WgXcQ.json"] {
+        let r = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(r.status(), 503, "{path}");
+        assert_eq!(r.headers()["retry-after"], "60", "{path}");
+        assert!(r.headers()["access-control-expose-headers"].to_str().unwrap().contains("Retry-After"));
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "cache_unavailable", "{path}");
+    }
 }
 
 /// The TTL has to follow the REASON. One uniform value is wrong in both directions: short enough

@@ -75,6 +75,17 @@ impl PlayError {
             detail: "in-flight download cap reached".into(),
         }
     }
+    /// YouTube is throttling this box, so no new extraction is started until the pause lifts. A 503
+    /// like `overloaded`, for the same reason: it says nothing about the video, and is never
+    /// remembered against the id.
+    pub(crate) fn throttled() -> PlayError {
+        PlayError {
+            status: 503,
+            reason: "throttled".into(),
+            message: THROTTLED_MESSAGE.into(),
+            detail: "extractions paused: YouTube is throttling this server".into(),
+        }
+    }
     fn timed_out() -> PlayError {
         PlayError {
             status: 504,
@@ -85,11 +96,32 @@ impl PlayError {
     }
 }
 
+const THROTTLED_MESSAGE: &str = "Trailers can't be fetched right now. Try again later.";
+
+/// Is this YouTube refusing the BOX rather than the video? A 429, the "confirm you're not a bot"
+/// wall (spelled with a straight or a typographic apostrophe, depending on the release), or its
+/// session rate-limit notice. All of them fail every video alike until they lift.
+fn is_throttle(lowered: &str) -> bool {
+    [
+        "http error 429",
+        "too many requests",
+        "confirm you're not a bot",
+        "confirm you\u{2019}re not a bot",
+        "rate-limit",
+        "rate limit",
+    ]
+    .iter()
+    .any(|p| lowered.contains(p))
+}
+
 /// Map a yt-dlp failure to an HTTP status + short reason (the cause is in stderr; match the common
 /// YouTube ones). Anything unrecognized is a blanket 502.
 pub fn classify(code: Option<i32>, stderr: &str) -> PlayError {
     let s = stderr.to_lowercase();
-    let (status, reason, message) = if s.contains("available in your country")
+    // First: a throttle's message can carry wording the per-video branches below would match.
+    let (status, reason, message) = if is_throttle(&s) {
+        (503, "throttled", THROTTLED_MESSAGE)
+    } else if s.contains("available in your country")
         || s.contains("available in your location")
         || s.contains("blocked it in your country")
         || s.contains("not available from your location")

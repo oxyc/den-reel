@@ -128,6 +128,10 @@ pub struct AppState {
     /// yt-dlp or the player clients will help. Without it these were invisible, and an instance
     /// failing every single download reported `ok`.
     pub local_fails: AtomicU32,
+    /// Paused while YouTube is throttling this box. Every path that would start an extraction —
+    /// download, direct resolve, search — asks it first; a throttled extraction trips it, and one
+    /// that works clears it. Surfaced as `degraded: youtube_throttled`.
+    pub youtube: crate::backoff::Backoff,
     /// The /health reason last logged (`None` = ok), so `note_health` writes a line only when the
     /// verdict changes.
     pub health_logged: Mutex<Option<&'static str>>,
@@ -183,6 +187,7 @@ impl AppState {
             cache_measured_at: AtomicU64::new(0),
             extract_fails: AtomicU32::new(0),
             local_fails: AtomicU32::new(0),
+            youtube: youtube_backoff(),
             health_logged: Mutex::new(None),
         })
     }
@@ -197,15 +202,16 @@ impl AppState {
         self.cache_measured_at.store((self.clock)(), Relaxed);
     }
 
-    /// What /health decides on: whether any install can supply a discovery key, and the three
-    /// consecutive-failure counters.
-    pub fn health_inputs(&self) -> (bool, u32, u32, u32) {
+    /// What /health decides on: whether any install can supply a discovery key, the three
+    /// consecutive-failure counters, and what is left of a YouTube throttle pause.
+    pub fn health_inputs(&self) -> (bool, u32, u32, u32, Option<u64>) {
         use std::sync::atomic::Ordering::Relaxed;
         (
             self.cfg.tmdb_key.is_some() || self.config_keyring.is_some(),
             self.upstream.recent_failures(),
             self.extract_fails.load(Relaxed),
             self.local_fails.load(Relaxed),
+            self.youtube.remaining_ms((self.clock)()),
         )
     }
 
@@ -214,8 +220,8 @@ impl AppState {
     /// it reads move (after a resolve's upstream calls, after a download) and once at boot; nothing
     /// polls. Returns the line it wrote, so a test can see it.
     pub fn note_health(&self) -> Option<String> {
-        let (key, upstream, extract, local) = self.health_inputs();
-        let verdict = crate::health_verdict(key, upstream, extract, local);
+        let (key, upstream, extract, local, paused) = self.health_inputs();
+        let verdict = crate::health_verdict(key, upstream, extract, local, paused.is_some());
         let reason = verdict.map(|(reason, _)| reason);
         {
             let mut last = self.health_logged.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,6 +237,11 @@ impl AppState {
         eprintln!("{line}");
         Some(line)
     }
+}
+
+/// The YouTube throttle pause, with its production window.
+pub fn youtube_backoff() -> crate::backoff::Backoff {
+    crate::backoff::Backoff::new("youtube", crate::YOUTUBE_PAUSE_BASE_MS, crate::YOUTUBE_PAUSE_CAP_MS)
 }
 
 /// Real prober: ask yt-dlp whether the id is extractable here and (for the resolver's landscape

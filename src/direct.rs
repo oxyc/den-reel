@@ -290,30 +290,47 @@ pub(crate) async fn answer(
             let st = state.clone();
             let v = vid.to_string();
             let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(async move {
-                // The permit is taken INSIDE the shared future, so waiters queue on the resolve
-                // rather than on the budget: one permit is spent per video, not per caller.
-                let _permit = st.probe_sem.acquire().await;
-                // The resident worker first, and the binary whenever it cannot answer — which is
-                // every way it can fail, including not being configured at all.
-                let answer = match st.worker.resolve(&st.cfg, &v).await {
-                    Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
-                        status: 502,
-                        reason: "no_direct_url".into(),
-                        message: "Could not fetch this trailer.".into(),
-                        detail: "the resident yt-dlp answered with no usable URL".into(),
-                    }),
-                    // Its own words about this video, classified exactly as the binary's stderr is.
-                    Some(Err(said)) => Err(classify(None, &said)),
-                    None => resolve(&st.cfg, &v, (st.clock)()).await,
+                // While YouTube is throttling this box nothing is asked — the same gate a download
+                // meets, since a resolve is an extraction too.
+                let answer = if st.youtube.remaining_ms((st.clock)()).is_some() {
+                    Err(PlayError::throttled())
+                } else {
+                    // The permit is taken INSIDE the shared future, so waiters queue on the resolve
+                    // rather than on the budget: one permit is spent per video, not per caller.
+                    let _permit = st.probe_sem.acquire().await;
+                    // The resident worker first, and the binary whenever it cannot answer — which is
+                    // every way it can fail, including not being configured at all.
+                    match st.worker.resolve(&st.cfg, &v).await {
+                        Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
+                            status: 502,
+                            reason: "no_direct_url".into(),
+                            message: "Could not fetch this trailer.".into(),
+                            detail: "the resident yt-dlp answered with no usable URL".into(),
+                        }),
+                        // Its own words about this video, classified exactly as the binary's stderr is.
+                        Some(Err(said)) => Err(classify(None, &said)),
+                        None => resolve(&st.cfg, &v, (st.clock)()).await,
+                    }
                 };
                 let now = (st.clock)();
-                if let Err(e) = &answer {
+                match &answer {
+                    Ok(_) => st.youtube.clear(),
+                    // A trip while already paused is a no-op, so the gated answer above costs nothing.
+                    Err(e) if e.reason == "throttled" => {
+                        st.youtube.trip(now, None, "YouTube is throttling extractions");
+                    }
                     // Once per resolve that actually ran, at most once a minute per reason — the
                     // shape the download path logs with, and for the same reason: in an outage
                     // every one of them fails alike.
-                    crate::log_limited(&format!("direct {}", e.reason), || format!("[{v}] {}", e.detail));
+                    Err(e) => {
+                        crate::log_limited(&format!("direct {}", e.reason), || format!("[{v}] {}", e.detail))
+                    }
                 }
-                remember(&st, &v, (answer.clone(), now + ttl_ms(&answer, now)), now);
+                // A throttle says nothing about this video; the pause answers for every id, and a
+                // cached copy would outlive it.
+                if !matches!(&answer, Err(e) if e.reason == "throttled") {
+                    remember(&st, &v, (answer.clone(), now + ttl_ms(&answer, now)), now);
+                }
                 st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&v);
                 answer
             });

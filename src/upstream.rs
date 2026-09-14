@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+use crate::backoff::Backoff;
 use crate::config::Config;
 
 /// Max upstream JSON body we'll buffer.
@@ -23,8 +24,15 @@ use crate::config::Config;
 /// anything TMDB actually returns.
 const MAX_UPSTREAM_BODY: usize = 256 * 1024;
 
-/// A source could not be asked: transport error, a wrong key's 401, a 429, a 5xx, or a 200 whose
-/// body never arrived. Distinct from a source that answered with nothing, which is a real result.
+/// How long a host is left alone after a 429 or 5xx that did not say how long itself, doubling per
+/// consecutive refusal. The cap also bounds what a `Retry-After` may ask for, so a misconfigured or
+/// hostile upstream cannot switch discovery off for a day.
+const PAUSE_BASE_MS: u64 = 30 * 1000;
+pub(crate) const PAUSE_CAP_MS: u64 = 60 * 60 * 1000;
+
+/// A source could not be asked: transport error, a wrong key's 401, a 429, a 5xx, a 200 whose body
+/// never arrived, or the host pause one of those started. Distinct from a source that answered with
+/// nothing, which is a real result.
 /// The distinction has to travel with the call — a shared counter compared across one cannot say
 /// which lookup faulted, so an unrelated title's outage was read as this one's answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,11 +132,30 @@ pub struct HttpUpstream {
     /// Consecutive hard upstream faults (transport / 401 / 403 / 429 / 5xx) — surfaced as `degraded`
     /// on /health (ADDON-02). A 404 "not found" is a miss, not a fault, so it doesn't count.
     fails: AtomicU32,
+    /// One pause per host. A 429 or 5xx is about the host, not the title, so the per-title failure
+    /// cooldown still sent every other title straight back to a host that had just refused.
+    tmdb_pause: Backoff,
+    kinocheck_pause: Backoff,
 }
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream { cfg, http, fails: AtomicU32::new(0) }
+        HttpUpstream {
+            cfg,
+            http,
+            fails: AtomicU32::new(0),
+            tmdb_pause: Backoff::new("tmdb", PAUSE_BASE_MS, PAUSE_CAP_MS),
+            kinocheck_pause: Backoff::new("kinocheck", PAUSE_BASE_MS, PAUSE_CAP_MS),
+        }
+    }
+
+    /// The pause for the host a URL belongs to.
+    fn pause(&self, url: &str) -> &Backoff {
+        if self.counts_toward_health(url) {
+            &self.tmdb_pause
+        } else {
+            &self.kinocheck_pause
+        }
     }
 
     /// Is this the source /health speaks for? KinoCheck is a fallback — its outage does not mean
@@ -150,6 +177,15 @@ impl HttpUpstream {
     /// `Ok(Some(v))` parsed; `Ok(None)` the upstream said "not there" (404); `Err(NoAnswer)` we did
     /// not get an answer at all.
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Answered<Option<Value>> {
+        if self.pause(url).remaining_ms(crate::state::default_clock()).is_some() {
+            // Not asked: the host told us to back off, and asking anyway is what keeps a throttle
+            // from lifting. Still no answer — and counted for /health like the 429 it stands in
+            // for, or a throttled TMDB would read as healthy just because we stopped asking.
+            if self.counts_toward_health(url) {
+                self.fails.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(NoAnswer);
+        }
         let mut req = self.http.get(url);
         for (k, v) in headers {
             req = req.header(*k, *v);
@@ -173,6 +209,18 @@ impl HttpUpstream {
             }
         };
         let status = res.status();
+        let now = crate::state::default_clock();
+        if status == 429 || status.is_server_error() {
+            let hint = retry_after_ms(res.headers(), now);
+            self.pause(url).trip(now, hint, &format!("answered {}", status.as_u16()));
+        } else {
+            // Any other status is the host answering, which ends a pause — a 404 or a bad key's 401
+            // included, since those are about the title or the install, not the host's capacity.
+            self.pause(url).clear();
+            if let Some(ms) = rate_limit_spent_ms(res.headers(), now) {
+                self.pause(url).trip(now, Some(ms), "rate limit spent");
+            }
+        }
         if !status.is_success() {
             // A 404 is a real "this title is not there": a miss, not a fault. KinoCheck answers it
             // for every title it has no trailer for, so it is neither counted nor logged.
@@ -277,6 +325,61 @@ pub(crate) fn transport_fault_line(url: &str, e: reqwest::Error) -> String {
 /// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
 fn redact(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+/// `Retry-After` as a delay in ms — delta-seconds or an HTTP-date — capped at `PAUSE_CAP_MS`. `None`
+/// when absent, unreadable or already past, and the caller falls back to its own exponential window:
+/// "retry now" on a 429 is not advice worth taking.
+pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let ms = match v.parse::<u64>() {
+        Ok(secs) => secs.saturating_mul(1000),
+        Err(_) => http_date_ms(v)?.checked_sub(now)?,
+    };
+    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
+}
+
+/// Epoch ms for an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`), the HTTP-date form servers send.
+/// Rewritten as RFC 3339 so the one date parser in the tree does the validating.
+pub(crate) fn http_date_ms(s: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let f: Vec<&str> = s.split_whitespace().collect();
+    let [_weekday, day, month, year, time, "GMT"] = f.as_slice() else { return None };
+    let month = MONTHS.iter().position(|m| m == month)? + 1;
+    if day.len() != 2 {
+        return None;
+    }
+    crate::config::parse_rfc3339_ms(&format!("{year}-{month:02}-{day}T{time}Z"))
+}
+
+/// How long until the rate-limit window resets, when a response says none of it is left:
+/// `X-RateLimit-Remaining: 0` with `X-RateLimit-Reset`, or the IETF draft `RateLimit` field
+/// (`remaining=0, reset=N` in early drafts, `r=0;t=N` in later ones). A reset above a billion is a
+/// unix timestamp and anything smaller a delay in seconds — both conventions are in use, and no
+/// window is thirty years long. Capped like `Retry-After`.
+pub(crate) fn rate_limit_spent_ms(headers: &reqwest::header::HeaderMap, now: u64) -> Option<u64> {
+    fn field<'a>(h: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+        h.get(name).and_then(|v| v.to_str().ok()).map(str::trim)
+    }
+    let mut remaining = field(headers, "x-ratelimit-remaining");
+    let mut reset = field(headers, "x-ratelimit-reset");
+    if let Some(draft) = field(headers, "ratelimit") {
+        for (k, v) in draft.split([',', ';']).filter_map(|p| p.split_once('=')) {
+            match k.trim() {
+                "remaining" | "r" => remaining = Some(v.trim()),
+                "reset" | "t" => reset = Some(v.trim()),
+                _ => {}
+            }
+        }
+    }
+    if remaining? != "0" {
+        return None;
+    }
+    let n: u64 = reset?.parse().ok()?;
+    let ms =
+        if n > 1_000_000_000 { n.saturating_mul(1000).checked_sub(now)? } else { n.saturating_mul(1000) };
+    (ms > 0).then_some(ms.min(PAUSE_CAP_MS))
 }
 
 #[async_trait]

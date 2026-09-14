@@ -288,8 +288,8 @@ figure with a timestamp.
 
 ## T10 — Small, cheap
 
-- **`Retry-After`** on the 502/504 play errors. `play_error` (`play.rs:428-435`) passes `&[]`;
-  `httputil::json` adds only `no-store` (`httputil.rs:66-69`).
+- ~~**`Retry-After`** on the 502/504 play errors.~~ DONE: `play_error` sends what is left of the
+  failure window (or of the YouTube throttle pause), and `cache_unavailable` sends 60s.
 - **Link labels** — `addon.rs:81` hardcodes `"name": "Trailer"`, discarding TMDB's per-video
   `name`/`type`, so fallback links are indistinguishable in the client. **This is not a one-liner**:
   `pick_trailer_candidates` (`upstream.rs:57-76`) reads `type`/`official` for the sort at line 65

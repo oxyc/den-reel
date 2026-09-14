@@ -507,11 +507,7 @@ pub fn unsigned_response(id: &str) -> Response<Body> {
 
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     if !crate::play::cache_available(&state.cfg).await {
-        return httputil::error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cache_unavailable",
-            "Trailer cache is unavailable.",
-        );
+        return crate::play::cache_unavailable();
     }
     if let Some(cached) = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() {
         return httputil::timed(json(&cached), "cache;desc=hit");

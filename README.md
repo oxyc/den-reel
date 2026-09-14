@@ -41,7 +41,9 @@ Google without the bytes ever crossing this box.
 
 `/health` always returns 200 (liveness) with a JSON `status`: `ok`, or `degraded` with a `reason` —
 `tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB failing — KinoCheck is a
-fallback and its outage is deliberately invisible here), or
+fallback and its outage is deliberately invisible here), `youtube_throttled` (YouTube answered a 429
+or a bot check, so every new extraction is paused — 5 min, doubling to 3 h, until it lifts or one
+works; `retry_after_s` says when; bumping yt-dlp does not help), or
 `extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
 YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` — pinning
 `YTDLP_PLAYER_CLIENTS` is a stopgap, not the fix),
@@ -51,8 +53,13 @@ would otherwise report `ok`, and "bump yt-dlp" is the wrong advice for a full di
 The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
 answering while every trailer silently comes back empty.
 
+A 429 or 5xx from TMDB or KinoCheck pauses that host: for its `Retry-After` (seconds or an HTTP-date,
+capped at an hour), else 30 s doubling, and until the reset when a response spends the rate limit
+(`X-RateLimit-Remaining: 0`, or the draft `RateLimit` field). Lookups inside the pause get no answer
+without a request; the host's next answer ends it.
+
 The log is state changes, not events: one line when `/health` turns degraded (with its reason) and
-one when it recovers; upstream, search and download failures at most once a minute per condition,
+one when it recovers; one when a host pause starts and one when an answer lifts it; upstream, search and download failures at most once a minute per condition,
 with a count of what was held back; the version and a secret-free summary at startup. It never
 carries a key, a config segment, a play signature or a query string. `LOG_REQUESTS` adds a
 per-request line.
@@ -200,6 +207,8 @@ and deliberately does not feed `extractor_unavailable`.
 403 {"error":"restricted", …}   # private / age-restricted
 404 {"error":"unavailable", …}  # removed
 503 {"error":"busy", …}           # IN_FLIGHT_MAX distinct ids already downloading
+503 {"error":"throttled", …}      # YouTube is throttling this server; Retry-After = what is left of the pause
+503 {"error":"cache_unavailable", …}  # the cache volume is unusable; Retry-After: 60
 502 {"error":"extraction_failed", …}
 502 {"error":"incomplete_download", …}  # yt-dlp was fine; no usable file came out of it
 504 {"error":"timeout", …}
