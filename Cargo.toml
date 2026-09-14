@@ -40,6 +40,9 @@ crypto_box = { version = "0.9", features = ["seal"] }
 # and subtle throughout — so these edges add a direct dependency, not a new crate to compile.
 blake2 = "0.10"
 subtle = "2"
+# HTTP dates for /play's Last-Modified, If-Modified-Since and If-Range. hyper already builds it for
+# the Date header, so this too is a direct edge rather than new code.
+httpdate = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }

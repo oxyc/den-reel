@@ -7,8 +7,9 @@
 //!
 //! With `PLAY_SECRET` set, `/meta` hands out `…/play/<vid>.mp4?s=<tag>&i=<iid>&e=<ep>` and both
 //! endpoints require a tag that verifies. Unset, nothing changes at all: this has to default off
-//! because `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
-//! turning signing on unconditionally would break every install for that week.
+//! because a `/meta` answer can stand in a client's cache for a week (`stale-while-revalidate`,
+//! `stale-if-error`), so clients hold unsigned play URLs for up to a week and turning signing on
+//! unconditionally would break every install for that week.
 //!
 //! The tag covers the id and the **install the link was minted for** ([`message`]): its install id
 //! and config epoch, carried in the URL as `i` and `e`. Signing them is what lets a revocation
@@ -18,8 +19,8 @@
 //!
 //! Not the path, so a client can carry the query it was given on the play URL straight over to
 //! `/crop` for the same id — the two endpoints authorise the same work. Not an expiry, because the
-//! play URL is immutable and cached hard by design (`max-age=31536000`), and an expiring URL inside an
-//! immutable response is a broken trailer waiting for a clock to tick over.
+//! play URL is immutable and cached hard by design (a week, as long as `/meta` hands it out), and an
+//! expiring URL inside an immutable response is a broken trailer waiting for a clock to tick over.
 //!
 //! Releases before install binding signed the id alone. A tag over the bare id is still accepted
 //! while `PLAY_SIGNING_GRACE_UNTIL` is ahead, and never after; the two formats cannot be confused,

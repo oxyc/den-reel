@@ -413,7 +413,7 @@ pub struct Demotion {
     ///
     /// Not merely "something is dead". A list that is already in the right order — a live candidate
     /// ahead of a dead one — produces a body byte-for-byte identical to the one the untouched path
-    /// would emit, and downgrading that to `max-age=3600` makes every client re-ask 168 times more
+    /// would emit, and downgrading that to `max-age=3600` makes every client re-ask 24 times more
     /// often for an answer that cannot have changed.
     pub reordered: bool,
     /// The candidate the client will play first is itself dead, which after the sort means they all
@@ -770,8 +770,24 @@ where
 struct Opened {
     file: std::fs::File,
     size: u64,
-    /// Already resolved against the real size, and already seeked to when satisfiable.
+    /// Already resolved against the real size and the request's `If-Range`, and already seeked to
+    /// when satisfiable.
     range: Option<RangeReq>,
+    etag: String,
+    last_modified: String,
+}
+
+/// The cached file's `ETag` and `Last-Modified`, taken from the file rather than the id.
+///
+/// Eviction and a fresh download put different bytes at the same path, often at the same size, so an
+/// id-and-size tag vouched for a file it had never seen — and a player resuming a Range across that
+/// spliced two encodes into one video. The mtime changes with every publish (the rename keeps the
+/// finished temp file's own write time) and nothing moves it after: serving touches atime only.
+fn validators(size: u64, modified: SystemTime) -> (String, String) {
+    // A clock before 1970 would make `fmt_http_date` panic; no real publish lands there.
+    let modified = modified.max(SystemTime::UNIX_EPOCH);
+    let nanos = modified.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    (format!("\"{size:x}-{nanos:x}\""), httpdate::fmt_http_date(modified))
 }
 
 /// Open a cached trailer for serving — open, fstat, reject anything that is not a real file, bump
@@ -786,7 +802,7 @@ struct Opened {
 /// `set_times` goes through the handle we already hold rather than opening the path again, and the
 /// `is_file` check that used to live in `fetch_trailer` comes along for free — `open` on a directory
 /// succeeds on Linux, so something has to reject it, and the fstat is right here.
-fn open_for_serve(fp: &Path, range: Option<&str>) -> std::io::Result<Opened> {
+fn open_for_serve(fp: &Path, range: Option<&str>, if_range: Option<&str>) -> std::io::Result<Opened> {
     use std::io::{Seek, SeekFrom};
 
     let mut file = std::fs::File::open(fp)?;
@@ -801,19 +817,25 @@ fn open_for_serve(fp: &Path, range: Option<&str>) -> std::io::Result<Opened> {
     let _ = file.set_times(std::fs::FileTimes::new().set_accessed(SystemTime::now()));
 
     let size = md.len();
+    let (etag, last_modified) = validators(size, md.modified()?);
+    // A range is only good against the file the client started reading. When `If-Range` names a
+    // different one, the whole of this file goes out instead of a part to splice onto the old.
+    let range = range.filter(|_| if_range.is_none_or(|v| httputil::if_range_holds(v, &etag, &last_modified)));
     let parsed = parse_range(range, size);
     if let Some(RangeReq::Satisfiable { start, .. }) = parsed {
         file.seek(SeekFrom::Start(start))?;
     }
-    Ok(Opened { file, size, range: parsed })
+    Ok(Opened { file, size, range: parsed, etag, last_modified })
 }
 
 /// Run [`open_for_serve`] off the runtime thread. `None` means "not servable" — usually simply not
 /// cached yet, which is the normal cold path and not worth a log line.
-async fn try_open(cfg: &Config, vid: &str, range: Option<&str>) -> Option<Opened> {
+async fn try_open(cfg: &Config, vid: &str, headers: &HeaderMap) -> Option<Opened> {
     let fp = cache_path(cfg, vid);
-    let range = range.map(str::to_string);
-    let opened = tokio::task::spawn_blocking(move || open_for_serve(&fp, range.as_deref())).await;
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (range, if_range) = (header("range"), header("if-range"));
+    let opened =
+        tokio::task::spawn_blocking(move || open_for_serve(&fp, range.as_deref(), if_range.as_deref())).await;
     match opened {
         Ok(Ok(o)) => Some(o),
         // A cold id is the common case and says nothing; anything else is worth seeing.
@@ -833,12 +855,14 @@ async fn try_open(cfg: &Config, vid: &str, range: Option<&str>) -> Option<Opened
 /// (+206 on Range) — which tvOS AVPlayer REQUIRES for a progressive MP4.
 ///
 /// Pure: no I/O, no awaits. Everything it needs was settled by `open_for_serve`.
-fn serve_opened(opened: Opened, vid: &str) -> Response<Body> {
-    let Opened { file, size, range } = opened;
+fn serve_opened(opened: Opened) -> Response<Body> {
+    let Opened { file, size, range, etag, last_modified } = opened;
     let file = tokio::fs::File::from_std(file);
-    // The cached MP4 for a given id is byte-stable + immutable (a new extraction would be a new id),
-    // so it can be cached hard. A strong ETag from id+size lets a caller/proxy revalidate cheaply.
-    let etag = httputil::etag_of(format!("{vid}:{size}").as_bytes());
+    // A published file never changes while it stays cached, so it is `immutable` for as long as a
+    // client may hold the link: seven days, which is how long a `/meta` answer can stand in a client's
+    // cache. Not a year — after eviction the same URL is a new download. `private`, because the link
+    // carries a tag bound to one install.
+    const CACHE_CONTROL: &str = "private, max-age=604800, immutable";
 
     match range {
         Some(RangeReq::Unsatisfiable) => Response::builder()
@@ -855,8 +879,9 @@ fn serve_opened(opened: Opened, vid: &str) -> Response<Body> {
                 .header("accept-ranges", "bytes")
                 .header("content-length", len)
                 .header("content-type", "video/mp4")
-                .header("cache-control", "public, max-age=31536000, immutable")
+                .header("cache-control", CACHE_CONTROL)
                 .header("etag", &etag)
+                .header("last-modified", &last_modified)
                 .body(stream_body(file.take(len)))
                 .unwrap()
         }
@@ -865,8 +890,9 @@ fn serve_opened(opened: Opened, vid: &str) -> Response<Body> {
             .header("content-length", size)
             .header("content-type", "video/mp4")
             .header("accept-ranges", "bytes")
-            .header("cache-control", "public, max-age=31536000, immutable")
+            .header("cache-control", CACHE_CONTROL)
             .header("etag", &etag)
+            .header("last-modified", &last_modified)
             .body(stream_body(file))
             .unwrap(),
     }
@@ -925,14 +951,12 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
     if !cache_available(&state.cfg).await {
         return cache_unavailable();
     }
-    let range = headers.get("range").and_then(|v| v.to_str().ok()).map(str::to_string);
-
     // Try to serve first, ask questions later. The overwhelmingly common request is for a trailer
     // that is already cached — prewarm exists to make it so — and this reaches it in ONE dispatch to
     // the blocking pool. Going through `fetch_trailer` first meant a stat and an atime touch before
     // the open and fstat that actually serve, all to establish what a single open would have told us.
-    if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
-        return httputil::timed(serve_opened(opened, &vid), "cache;desc=hit");
+    if let Some(opened) = try_open(&state.cfg, &vid, headers).await {
+        return httputil::timed(serve_opened(opened), "cache;desc=hit");
     }
 
     // Not servable: cold, or evicted out from under us. Two attempts, because the file can be
@@ -947,8 +971,8 @@ pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String)
             // arm is also reached by every request the failure cache answers from memory.
             Err(e) => return play_error(&state, &vid, &e),
         };
-        if let Some(opened) = try_open(&state.cfg, &vid, range.as_deref()).await {
-            return httputil::timed(serve_opened(opened, &vid), &fetched.timing());
+        if let Some(opened) = try_open(&state.cfg, &vid, headers).await {
+            return httputil::timed(serve_opened(opened), &fetched.timing());
         }
         // Retire the finished entry before retrying, or `fetch_trailer` joins it and hands back the
         // same success for the file that just vanished.

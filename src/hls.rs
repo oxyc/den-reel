@@ -31,7 +31,7 @@ use std::time::Duration;
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::{HeaderMap, RANGE};
+use hyper::header::{HeaderMap, IF_NONE_MATCH, IF_RANGE, RANGE};
 use hyper::{Response, StatusCode};
 
 use crate::httputil::{self, Body};
@@ -44,6 +44,14 @@ const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 /// Long enough for a segment on a slow line, short enough that a wedged fetch cannot pin a task.
 /// Per-request, because the shared client's 15s is sized for JSON lookups.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The longest a segment is kept. googlevideo's URLs live about six hours, so this only bounds one
+/// whose expiry reads further out than that.
+const SEGMENT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// The longest a playlist is kept: a reload during a session costs nothing, and a tab left open
+/// tomorrow resolves again.
+const PLAYLIST_MAX_AGE_SECS: u64 = 300;
 
 /// The shortest rung a native player is offered, in pixels.
 ///
@@ -316,8 +324,21 @@ fn refused() -> Response<Body> {
     httputil::error(StatusCode::FORBIDDEN, "bad_signature", "This URL is not one this server serves.")
 }
 
+/// The upstream request for one URL, carrying what a player sends to seek and to revalidate. A
+/// segment is the same bytes for as long as its URL lives, so Google's own validators answer both.
+fn upstream(http: &reqwest::Client, url: &str, headers: &HeaderMap) -> reqwest::RequestBuilder {
+    let mut req = http.get(url).timeout(FETCH_TIMEOUT);
+    for name in [RANGE, IF_RANGE, IF_NONE_MATCH] {
+        if let Some(v) = headers.get(&name).and_then(|v| v.to_str().ok()) {
+            req = req.header(name.as_str(), v);
+        }
+    }
+    req
+}
+
 /// Fetch one upstream URL and answer with it: rewritten when it is a playlist, streamed when it is
-/// not. `Range` travels in both directions, so a player can seek inside a segment.
+/// not. `Range` and the validators travel in both directions, so a player can seek inside a segment
+/// and revalidate one it holds.
 async fn through(
     state: &AppState,
     url: &str,
@@ -325,11 +346,7 @@ async fn through(
     expect_playlist: bool,
     uris: Uris,
 ) -> Response<Body> {
-    let mut req = state.http.get(url).timeout(FETCH_TIMEOUT);
-    if let Some(range) = headers.get(RANGE).and_then(|v| v.to_str().ok()) {
-        req = req.header("range", range);
-    }
-    let res = match req.send().await {
+    let res = match upstream(&state.http, url, headers).send().await {
         Ok(res) => res,
         Err(e) => {
             crate::log_limited("hls transport", || {
@@ -343,6 +360,10 @@ async fn through(
         }
     };
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    // The copy the player holds is still Google's: say so, with the validators it keeps.
+    if status == StatusCode::NOT_MODIFIED {
+        return media(res, url, (state.clock)());
+    }
     if !status.is_success() {
         // Google's own refusal, which for an expired URL is a 403. Said plainly, and never cached:
         // the client's answer is to ask `/hls` again for a freshly resolved master.
@@ -361,8 +382,37 @@ async fn through(
     if expect_playlist || content_type.contains("mpegurl") {
         return playlist(state, url, res, uris).await;
     }
-    let mut out = Response::builder().status(status).header("cache-control", "private, max-age=3600");
-    for name in ["content-type", "content-length", "content-range", "accept-ranges"] {
+    media(res, url, (state.clock)())
+}
+
+/// A segment's `Cache-Control`. The bytes behind a signed URL never change, so it is `immutable`, but
+/// held no longer than that URL lives. One whose expiry cannot be read gets a playlist's minutes.
+fn segment_cache_control(url: &str, now: u64) -> String {
+    match crate::direct::parse_expiry_ms(url) {
+        Some(expires) => {
+            let left = (expires.saturating_sub(now) / 1000).min(SEGMENT_MAX_AGE_SECS);
+            format!("private, max-age={left}, immutable")
+        }
+        None => format!("private, max-age={PLAYLIST_MAX_AGE_SECS}"),
+    }
+}
+
+/// A playlist's `max-age`: minutes at most, and gone before the soonest URL it names stops working,
+/// by the same margin `/direct` keeps. Minutes when no URL in it carries an expiry.
+fn playlist_max_age(earliest: Option<u64>, now: u64) -> u64 {
+    earliest.map_or(PLAYLIST_MAX_AGE_SECS, |expires| {
+        let left = expires.saturating_sub(now).saturating_sub(crate::direct::EXPIRY_MARGIN_MS) / 1000;
+        left.min(PLAYLIST_MAX_AGE_SECS)
+    })
+}
+
+/// Answer with one upstream media response as it arrives — a segment, or the 304 for one the player
+/// already holds — with Google's validators on it.
+fn media(res: reqwest::Response, url: &str, now: u64) -> Response<Body> {
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut out = Response::builder().status(status).header("cache-control", segment_cache_control(url, now));
+    for name in ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]
+    {
         if let Some(v) = res.headers().get(name) {
             out = out.header(name, v.clone());
         }
@@ -396,23 +446,41 @@ async fn playlist(state: &AppState, url: &str, res: reqwest::Response, uris: Uri
         buf.extend_from_slice(&chunk);
     }
     let text = String::from_utf8_lossy(&buf);
-    let secret = state.cfg.play_secret.as_deref();
+    respond_playlist(&text, url, state.cfg.play_secret.as_deref(), uris, (state.clock)())
+}
+
+/// The playlist response: every URI pointed where `uris` says, the rungs ordered and floored, and a
+/// lifetime that ends before the first URL in it does.
+fn respond_playlist(text: &str, url: &str, secret: Option<&str>, uris: Uris, now: u64) -> Response<Body> {
+    // The soonest expiry among the playlist's own URL and every URL it names.
+    let earliest = std::cell::Cell::new(crate::direct::parse_expiry_ms(url));
+    let note = |target: &str| {
+        if let Some(at) = crate::direct::parse_expiry_ms(target) {
+            earliest.set(Some(earliest.get().map_or(at, |e| e.min(at))));
+        }
+    };
     let body = match uris {
-        Uris::Proxy => rewrite(&text, url, &|target: &str| proxied(secret, target)),
+        Uris::Proxy => rewrite(text, url, &|target: &str| {
+            note(target);
+            proxied(secret, target)
+        }),
         // Resolved against the playlist's own URL but otherwise untouched: a relative URI would
         // resolve against THIS server now that the playlist is served from it.
-        Uris::Native => rewrite(&text, url, &|target: &str| target.to_string()),
+        Uris::Native => rewrite(text, url, &|target: &str| {
+            note(target);
+            target.to_string()
+        }),
     };
     // A native player is offered the taller rungs only, because it opens on one of its own choosing.
     // hls.js takes the whole ladder: it is told where to start, and can fall as far as the line needs.
     let body = best_first(&body, if uris == Uris::Native { NATIVE_FLOOR } else { 0 });
+    let max_age = playlist_max_age(earliest.get(), now);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/vnd.apple.mpegurl")
         .header("content-length", body.len())
-        // Playlists name URLs that expire; a stale one is a trailer that stops mid-play. Minutes, so
-        // a reload during a session costs nothing and a tab left open tomorrow resolves again.
-        .header("cache-control", "private, max-age=300")
+        // Playlists name URLs that expire; a stale one is a trailer that stops mid-play.
+        .header("cache-control", format!("private, max-age={max_age}"))
         .body(httputil::full(body))
         .unwrap()
 }
@@ -573,6 +641,76 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// A segment's bytes never change behind its signed URL, but nothing should hold them past it.
+    #[test]
+    fn a_segment_is_held_no_longer_than_its_url_lives() {
+        let url = "https://r1.googlevideo.com/videoplayback?expire=1900&itag=140";
+        assert_eq!(segment_cache_control(url, 1_000_000), "private, max-age=900, immutable");
+        assert_eq!(segment_cache_control(url, 2_000_000), "private, max-age=0, immutable", "expired");
+        let far = "https://r1.googlevideo.com/videoplayback/expire/99999999/itag/140";
+        assert_eq!(segment_cache_control(far, 0), "private, max-age=21600, immutable", "six hours at most");
+        let undated = "https://r1.googlevideo.com/videoplayback?itag=140";
+        assert_eq!(segment_cache_control(undated, 0), "private, max-age=300");
+    }
+
+    /// Google's validators travel with a segment, and its 304 comes back as one.
+    #[test]
+    fn a_segment_keeps_googles_validators() {
+        let url = "https://r1.googlevideo.com/videoplayback?expire=1900&itag=140";
+        for status in [206, 304] {
+            let upstream = hyper::http::Response::builder()
+                .status(status)
+                .header("etag", "\"abc\"")
+                .header("last-modified", "Tue, 15 Sep 2026 10:00:00 GMT")
+                .header("content-range", "bytes 0-2/3")
+                .body("abc")
+                .unwrap();
+            let out = media(reqwest::Response::from(upstream), url, 1_000_000);
+            assert_eq!(out.status().as_u16(), status);
+            assert_eq!(out.headers()["etag"], "\"abc\"");
+            assert_eq!(out.headers()["last-modified"], "Tue, 15 Sep 2026 10:00:00 GMT");
+            assert_eq!(out.headers()["cache-control"], "private, max-age=900, immutable");
+        }
+    }
+
+    /// A player's seek and its revalidation reach Google; nothing else it sends does.
+    #[test]
+    fn a_players_seek_and_revalidation_travel_upstream() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in
+            [("range", "bytes=0-99"), ("if-range", "\"abc\""), ("if-none-match", "\"abc\""), ("cookie", "x")]
+        {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let url = "https://r1.googlevideo.com/videoplayback";
+        let req = upstream(&reqwest::Client::new(), url, &headers).build().unwrap();
+        for name in ["range", "if-range", "if-none-match"] {
+            assert_eq!(req.headers()[name], headers[name], "{name}");
+        }
+        assert!(!req.headers().contains_key("cookie"));
+    }
+
+    /// A playlist naming a URL about to expire must not outlive it in the player's cache, whichever way
+    /// its URIs are written.
+    #[test]
+    fn a_playlist_goes_stale_before_the_first_url_in_it() {
+        let now = 1_000_000 * 1000;
+        let master =
+            "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900000/file/index.m3u8";
+        // Expires 60 seconds past the margin.
+        let playlist = "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1920x1080\n\
+             https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1000360/file/index.m3u8\n";
+        for uris in [Uris::Proxy, Uris::Native] {
+            let out = respond_playlist(playlist, master, Some("s3cret"), uris, now);
+            assert_eq!(out.headers()["cache-control"], "private, max-age=60");
+        }
+        let out = respond_playlist("#EXTM3U\n", master, None, Uris::Proxy, now);
+        assert_eq!(out.headers()["cache-control"], "private, max-age=300", "nothing soon: minutes");
+        assert_eq!(playlist_max_age(Some(now + 1000), now), 0, "inside the margin: not kept at all");
+        assert_eq!(playlist_max_age(None, now), 300);
     }
 
     /// A URL carries `&` and `=` of its own, which have to survive being carried inside a query.

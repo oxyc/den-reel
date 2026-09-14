@@ -1337,7 +1337,7 @@ async fn get_meta_caches_success_not_empty() {
     let client = reqwest::Client::new();
 
     let ok = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
-    assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("max-age=604800"));
+    assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("max-age=86400"));
 
     state.yt_cache.lock().unwrap().clear();
     fake.set_tmdb(&[]); // no trailer → empty links → no-store (client re-checks, doesn't cache a miss)
@@ -1408,18 +1408,20 @@ async fn sealed_config_url_resolves_manifest_and_meta() {
     // The pasted install URL.
     let manifest = client.get(format!("{base}/{SEALED_SEG}/manifest.json")).send().await.unwrap();
     assert_eq!(manifest.status(), 200);
+    // The path carries the sealed key: no shared cache may keep either answer.
+    let cc = |r: &reqwest::Response| r.headers()["cache-control"].to_str().unwrap().to_string();
+    assert!(cc(&manifest).starts_with("private,"), "{}", cc(&manifest));
 
     // Stremio then derives /<config>/meta/... — resolves the trailer using the sealed BYOK TMDB key.
-    let body: Value = client
+    let meta = client
         .get(format!("{base}/{SEALED_SEG}/meta/movie/tt0111161.json"))
         .header("x-forwarded-host", "trailers.example.com")
         .header("x-forwarded-proto", "https")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert!(cc(&meta).starts_with("private,"), "{}", cc(&meta));
+    let body: Value = meta.json().await.unwrap();
     assert_eq!(body["meta"]["links"][0]["trailers"], "https://trailers.example.com/play/vidKey12345.mp4");
 }
 
@@ -1606,6 +1608,77 @@ async fn play_revalidation_is_304_but_a_range_still_gets_its_bytes() {
         client.get(&url).header("if-none-match", etag).header("range", "bytes=0-99").send().await.unwrap();
     assert_eq!(ranged.status(), 206);
     assert_eq!(ranged.bytes().await.unwrap().len(), 100);
+}
+
+/// Eviction and a fresh download put different bytes at the same path, often at the same size. The
+/// validators must tell the two files apart, and a Range resumed against the old one must get the new
+/// file whole rather than a splice of both.
+#[tokio::test]
+async fn a_trailer_fetched_again_is_a_new_file_even_at_the_same_size() {
+    let dir = temp_dir();
+    seed_cache(&dir, "cachedVid04", 4096);
+    let state =
+        build_state(dir.clone(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/play/cachedVid04.mp4");
+
+    let first = client.get(&url).send().await.unwrap();
+    assert_eq!(first.headers()["cache-control"], "private, max-age=604800, immutable");
+    let (old_etag, old_date) = (first.headers()["etag"].clone(), first.headers()["last-modified"].clone());
+
+    // Against the file it was read from, a resume gets its range, by tag or by date.
+    for validator in [&old_etag, &old_date] {
+        let resumed = client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), 206, "{validator:?}");
+    }
+    // A weak tag never holds a range.
+    let weak = format!("W/{}", old_etag.to_str().unwrap());
+    let r = client.get(&url).header("range", "bytes=100-").header("if-range", weak).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Evicted and downloaded again: same path and size, other bytes, a later write.
+    let fp = dir.join("cachedVid04.mp4");
+    std::fs::write(&fp, vec![9u8; 4096]).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::open(&fp).unwrap().set_times(std::fs::FileTimes::new().set_modified(later)).unwrap();
+
+    let second = client.get(&url).send().await.unwrap();
+    assert_ne!(second.headers()["etag"], old_etag, "the new file kept the old file's tag");
+    assert_ne!(second.headers()["last-modified"], old_date, "the new file kept the old file's date");
+    for validator in [&old_etag, &old_date] {
+        let resumed = client
+            .get(&url)
+            .header("range", "bytes=100-")
+            .header("if-range", validator)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), 200, "a resume against the old file got a range of the new one");
+        assert_eq!(resumed.bytes().await.unwrap().len(), 4096);
+    }
+
+    // A revalidation by date alone collapses to a 304 that keeps both validators.
+    let date = second.headers()["last-modified"].clone();
+    let again = client.get(&url).header("if-modified-since", date.clone()).send().await.unwrap();
+    assert_eq!(again.status(), 304);
+    assert_eq!(again.headers()["last-modified"], date);
+    assert_eq!(again.headers()["etag"], second.headers()["etag"]);
+    // ...and a stale tag beside it still means the body: If-None-Match wins.
+    let stale = client
+        .get(&url)
+        .header("if-none-match", old_etag)
+        .header("if-modified-since", date)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 200);
 }
 
 // --- cropdetect parsing ---
@@ -2106,14 +2179,16 @@ async fn an_unknown_crop_is_not_cached_by_the_client() {
     let cc = cc_of(resp);
     assert!(!cc.contains("immutable"), "an unknown crop was cached as if it were a real rect: {cc}");
 
-    // A detected rect is immutable per video and must still cache hard.
+    // A detected rect still caches, for a week and with a validator — but not `immutable`: it
+    // describes the cached MP4, and after eviction the same id is a new download.
     let known = crate::crop::refine_report(crate::crop::report_from(
         "dQw4w9WgXcQ",
         Some((1920, 1080)),
         crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 },
     ));
-    let cc = cc_of(crate::crop::json(&known));
-    assert!(cc.contains("immutable"), "a detected rect stopped caching: {cc}");
+    let resp = crate::crop::json(&known);
+    assert!(resp.headers().contains_key("etag"), "a detected rect lost its validator");
+    assert_eq!(cc_of(resp), "public, max-age=604800", "a detected rect's caching changed");
 }
 
 /// The format ladder degrades in quality order, but the lower rungs were a fixed 720/480 — so a
@@ -2758,26 +2833,26 @@ async fn a_failed_download_leaves_none_of_its_scratch_behind() {
     assert!(dir.join("cccccccccc1.mp4").exists(), "a published trailer was removed");
 }
 
-/// /meta and the manifest embed play URLs built from the forwarded host and scheme, and go out
-/// `public, max-age=604800`. Without naming those inputs, a shared cache may hand one requester's
-/// body — pointing at an authority they chose — to everyone else.
-#[test]
-fn a_cacheable_body_names_the_headers_its_urls_came_from() {
-    let res = crate::httputil::json(
-        hyper::StatusCode::OK,
-        &serde_json::json!({"ok": true}),
-        &[("cache-control", "public, max-age=604800")],
-    );
-    let vary = res.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
+/// /meta embeds play URLs built from the forwarded host and scheme, or from `Host` when nothing is
+/// forwarded, and goes out `public`. Without naming those inputs, a shared cache may hand one
+/// requester's body — pointing at an authority they chose — to everyone else. A body that embeds no
+/// host names none of them, or it splits every cache for nothing.
+#[tokio::test]
+async fn only_a_body_built_from_the_host_varies_on_it() {
+    let fake = FakeUpstream::new(&["vidKey12345"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let base = spawn_server(state).await;
+
+    let meta = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
+    let vary = meta.headers().get("vary").map(|v| v.to_str().unwrap().to_ascii_lowercase());
     let vary = vary.unwrap_or_default();
-    assert!(
-        vary.contains("x-forwarded-host"),
-        "cacheable body did not vary on the host it embedded: {vary:?}"
-    );
-    assert!(
-        vary.contains("x-forwarded-proto"),
-        "cacheable body did not vary on the scheme it embedded: {vary:?}"
-    );
+    for name in ["x-forwarded-host", "x-forwarded-proto", "host"] {
+        assert!(vary.split(',').any(|v| v.trim() == name), "/meta did not vary on {name}: {vary:?}");
+    }
+
+    let manifest = reqwest::get(format!("{base}/manifest.json")).await.unwrap();
+    assert!(manifest.headers().get("etag").is_some(), "the manifest lost its validator");
+    assert!(manifest.headers().get("vary").is_none(), "the manifest names no host but varied on one");
 }
 
 /// A broken yt-dlp made the search fallback return the same empty list as "YouTube has nothing",
@@ -3686,8 +3761,8 @@ async fn the_resolve_cache_is_actually_bounded() {
     assert!(len < crate::YT_CACHE_MAX, "the map grew past its bound with all entries live: {len}");
 }
 
-/// ...and the response actually says so. The flag only matters if it reaches the header — /meta ships
-/// a trailer link with a 7-day max-age, which for a stand-in outlives the server's own 48h bound.
+/// ...and the response actually says so. The flag only matters if it reaches the header — /meta lets a
+/// client keep a trailer link for a week, which for a stand-in outlives the server's own 48h bound.
 #[tokio::test]
 async fn meta_shortens_max_age_for_a_stand_in_answer() {
     let fake = FakeUpstream::new(&["goodTrailer"], None);
@@ -3698,7 +3773,7 @@ async fn meta_shortens_max_age_for_a_stand_in_answer() {
     let cc = |r: &reqwest::Response| r.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
 
     let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
-    assert!(cc(&fresh).contains("604800"), "a fresh answer lost its long cache: {}", cc(&fresh));
+    assert!(cc(&fresh).contains("max-age=86400"), "a fresh answer lost its long cache: {}", cc(&fresh));
 
     // Age it out and make the next lookup fail, so the answer becomes a stand-in.
     clock.advance(crate::YT_TTL_MS + 1);
@@ -4422,7 +4497,7 @@ fn only_a_bake_that_actually_wrote_condemns_the_file() {
 }
 
 /// The gate itself: a bake that may have half-rewritten the file must not be renamed into the cache.
-/// Once published it is served `immutable` for a year and never re-fetched, because any cached file
+/// Once published it is served for as long as it stays cached and never re-fetched, because any cached file
 /// with len > 0 counts as a hit — so a single interrupted bake is permanent.
 #[tokio::test]
 async fn a_damaged_bake_is_not_renamed_into_the_cache() {
@@ -4825,7 +4900,10 @@ async fn a_youtube_throttle_pauses_every_new_extraction_until_one_works() {
     assert_eq!(r.status(), 503);
     let left = state.youtube.remaining_ms(now()).expect("paused");
     assert_eq!(r.headers()["retry-after"].to_str().unwrap(), left.div_ceil(1000).to_string());
-    assert!(r.headers()["access-control-expose-headers"].to_str().unwrap().contains("Retry-After"));
+    let exposed = r.headers()["access-control-expose-headers"].to_str().unwrap();
+    for name in ["Retry-After", "ETag", "Last-Modified"] {
+        assert!(exposed.contains(name), "{name} is not readable cross-origin: {exposed}");
+    }
     assert_eq!(spawn_count(&spawns), 1);
     let health: Value = reqwest::get(format!("{base}/health")).await.unwrap().json().await.unwrap();
     assert_eq!(health["reason"], "youtube_throttled");
@@ -5054,7 +5132,7 @@ async fn meta_demotes_and_stops_prewarming_a_candidate_play_found_dead() {
 
 /// ...but only when the demotion actually moved something. A list already in the right order — a
 /// live candidate ahead of a dead one — produces the same body the untouched path would, and
-/// shortening its life to an hour makes every client re-ask 168 times more often for an answer that
+/// shortening its life to an hour makes every client re-ask 24 times more often for an answer that
 /// cannot have changed.
 #[tokio::test]
 async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
@@ -5073,8 +5151,8 @@ async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
 
     assert_eq!(
         resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("public, max-age=604800, stale-while-revalidate=86400, stale-if-error=86400"),
-        "a response the demotion never touched lost six days of cacheability"
+        Some("public, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800"),
+        "a response the demotion never touched lost its day of freshness"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     let links = body["meta"]["links"].as_array().unwrap();

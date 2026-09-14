@@ -217,6 +217,7 @@ dependencies = [
  "crypto_box",
  "futures-util",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "libc",

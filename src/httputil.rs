@@ -4,7 +4,9 @@
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_NONE_MATCH, RANGE};
+use hyper::header::{
+    HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE,
+};
 use hyper::{Method, Response, StatusCode};
 
 /// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can
@@ -62,15 +64,16 @@ pub fn json(status: StatusCode, value: &serde_json::Value, extra: &[(&str, &str)
     // Attach a strong validator to cacheable 200s so a conditional GET can collapse to a 304.
     if cacheable(status, cc) {
         b = b.header(ETAG, etag_of(&s));
-        // The play URLs in a /meta or /manifest body are built from the forwarded host and scheme
-        // when PUBLIC_BASE_URL is unset, so those headers are part of what the body says — but the
-        // response is `public, max-age=604800`, which invites any shared cache to store one
-        // requester's answer and hand it to everyone. Naming them keeps a cache from serving a
-        // body built for a different authority.
-        b = b.header("vary", "x-forwarded-host, x-forwarded-proto");
     }
     b.body(full(s)).unwrap()
 }
+
+/// The `Vary` for a body built from [`crate::addon::self_base`]. Its play URLs come from the
+/// forwarded host and scheme, or from `Host` when nothing is forwarded, so all three are part of what
+/// the body says — and a cache that ignored them could hand one requester's answer, pointing at an
+/// authority they chose, to everyone else. Only those bodies carry it: on one that embeds no host it
+/// would split a cache for nothing.
+pub const VARY_SELF_BASE: (&str, &str) = ("vary", "X-Forwarded-Host, X-Forwarded-Proto, Host");
 
 /// HTML response (the embedded /configure page), plus any extra headers (e.g. Cache-Control).
 pub fn html(status: StatusCode, body: &'static str, extra: &[(&str, &str)]) -> Response<Body> {
@@ -116,8 +119,9 @@ pub fn error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": code, "detail": detail }), &[])
 }
 
-/// Honor a conditional GET/HEAD: if the request's `If-None-Match` matches the response's `ETag`,
-/// collapse to a `304 Not Modified` that keeps the `ETag` + `Cache-Control` headers and drops the
+/// Honor a conditional GET/HEAD: if the request's `If-None-Match` matches the response's `ETag` —
+/// or, when it sends none, its `If-Modified-Since` is no earlier than the response's `Last-Modified`
+/// — collapse to a `304 Not Modified` that keeps the validators + `Cache-Control` and drops the
 /// body. A no-op for unsafe methods, responses without an ETag (errors, `no-store`), or a
 /// non-matching request.
 pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Response<Body>) -> Response<Body> {
@@ -134,14 +138,20 @@ pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Respons
     let Some(etag) = resp.headers().get(ETAG) else {
         return head_stripped(method, resp);
     };
-    let matched = req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, etag));
+    // RFC 9110 §13.2.2: If-Modified-Since is only consulted when If-None-Match is absent.
+    let matched = match req_headers.get(IF_NONE_MATCH) {
+        Some(inm) => if_none_match_matches(inm, etag),
+        None => not_modified_since(req_headers.get(IF_MODIFIED_SINCE), resp.headers().get(LAST_MODIFIED)),
+    };
     if !matched {
         return head_stripped(method, resp);
     }
     let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
     let headers = b.headers_mut().expect("fresh builder has headers");
-    if let Some(v) = resp.headers().get(ETAG) {
-        headers.insert(ETAG, v.clone());
+    for name in [ETAG, LAST_MODIFIED] {
+        if let Some(v) = resp.headers().get(&name) {
+            headers.insert(name, v.clone());
+        }
     }
     if let Some(v) = resp.headers().get(CACHE_CONTROL) {
         headers.insert(CACHE_CONTROL, v.clone());
@@ -184,6 +194,28 @@ fn if_none_match_matches(inm: &HeaderValue, etag: &HeaderValue) -> bool {
         let candidate = candidate.trim();
         candidate == "*" || candidate.trim_start_matches("W/") == etag
     })
+}
+
+/// RFC 9110 `If-Modified-Since`: unchanged when the response's `Last-Modified` is no later than the
+/// date the client holds. Both are whole seconds, so comparing the parsed dates is exact. False when
+/// either is missing or unreadable, which serves the body.
+fn not_modified_since(since: Option<&HeaderValue>, last_modified: Option<&HeaderValue>) -> bool {
+    let date = |v: Option<&HeaderValue>| v?.to_str().ok().and_then(|s| httpdate::parse_http_date(s).ok());
+    matches!((date(since), date(last_modified)), (Some(since), Some(modified)) if modified <= since)
+}
+
+/// RFC 9110 §13.1.5 `If-Range`: whether a range still applies to the representation being served.
+/// An entity tag must match strongly — a weak one never does — and a date must equal `Last-Modified`.
+/// When it does not hold, the caller serves the whole representation instead of a part of it.
+pub fn if_range_holds(if_range: &str, etag: &str, last_modified: &str) -> bool {
+    let if_range = if_range.trim();
+    if if_range.starts_with('"') || if_range.starts_with("W/") {
+        return if_range == etag;
+    }
+    match (httpdate::parse_http_date(if_range), httpdate::parse_http_date(last_modified)) {
+        (Ok(asked), Ok(modified)) => asked == modified,
+        _ => false,
+    }
 }
 
 /// Look up a query-string parameter without pulling in a URL parser. Returns the decoded value of

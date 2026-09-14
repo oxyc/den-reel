@@ -344,8 +344,8 @@ pub fn clap_params(report: &CropReport) -> Option<(u32, u32, i64, i64)> {
 ///
 /// MP4Box rewrites in place — verified against GPAC 26.02, same inode before and after, the content
 /// change landing as a burst near the end of a 1.5s run on a 200 MB file. So a bake killed part-way
-/// leaves a half-rewritten trailer, which the caller must not rename into the cache: it is served
-/// immutable for a year and never re-fetched. A bake that refused, or never ran, leaves the file
+/// leaves a half-rewritten trailer, which the caller must not rename into the cache: it is served for
+/// as long as it stays cached and never re-fetched. A bake that refused, or never ran, leaves the file
 /// exactly as it was, and losing that trailer over a cosmetic step would be the worse bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bake {
@@ -571,13 +571,14 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
 
 pub(crate) fn json(report: &CropReport) -> Response<Body> {
     let value = to_value(report).unwrap_or_else(|_| serde_json::json!({ "letterboxed": false }));
-    // A real rect is immutable per video (the cached MP4 never changes), so it caches hard; the
-    // ETag lets a conditional GET still 304. An `unknown` is the opposite — it means ffmpeg failed
+    // A real rect describes the cached MP4, which does not change while it stays cached — but after
+    // eviction the same id is a new download, so it caches for a week rather than a year and is not
+    // `immutable`; the ETag lets a revalidation 304. An `unknown` is the opposite — it means ffmpeg failed
     // or the file was not there — and it was going out with the same year-long `immutable`, so one
     // hiccup cost that trailer its de-letterboxing until the client's own cache was cleared. Its
     // own doc says "not cached, so a later call retries"; that was true server-side only.
     if report.is_known() {
-        httputil::json(StatusCode::OK, &value, &[("cache-control", "public, max-age=31536000, immutable")])
+        httputil::json(StatusCode::OK, &value, &[("cache-control", "public, max-age=604800")])
     } else {
         // "Play the full frame" stands in for a rect nobody could (or, unsigned, would) measure,
         // and the app is told so rather than left to read it as a verdict about the video.

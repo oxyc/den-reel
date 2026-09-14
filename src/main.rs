@@ -66,8 +66,8 @@ pub const YT_FAIL_TTL_MS: u64 = 60 * 1000;
 // How long PAST its normal expiry a known-good answer may keep standing in for a failing lookup,
 // measured from when it was last CONFIRMED (re-serving rewrites the expiry, so that is the only
 // clock that still means anything). Serving the last answer beats serving none during an outage,
-// but a trailer that was REMOVED upstream has to stop being handed out eventually — and /meta ships
-// it with a 7-day max-age, so "eventually" cannot mean "while anything is still faulting".
+// but a trailer that was REMOVED upstream has to stop being handed out eventually — and /meta lets a
+// client keep it for up to a week, so "eventually" cannot mean "while anything is still faulting".
 pub const STALE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 const _: () =
     assert!(YT_FAIL_TTL_MS < YT_NEG_TTL_MS, "a failure must be re-asked sooner than a real 'no trailer'");
@@ -396,10 +396,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp.headers_mut().insert("access-control-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
-    // Retry-After as well, or a browser client cannot honour the cooldown a refusal carries.
+    // Retry-After as well, or a browser client cannot honour the cooldown a refusal carries, and the
+    // validators, or it cannot make the conditional and If-Range requests they exist for.
     resp.headers_mut().insert(
         "access-control-expose-headers",
-        hyper::header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After"),
+        hyper::header::HeaderValue::from_static(
+            "Server-Timing, X-Den-Degraded, Retry-After, ETag, Last-Modified",
+        ),
     );
     resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));
     // Time to headers: a streamed /play body is still being written when this runs.
@@ -595,10 +598,11 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 }
             };
             if rest == "manifest.json" {
+                // `private`: the path carries the install's sealed key, and the body its install id.
                 return httputil::json(
                     StatusCode::OK,
                     &addon::manifest(cfg.iid.as_deref()),
-                    &[("cache-control", "public, max-age=3600, stale-while-revalidate=600")],
+                    &[("cache-control", "private, max-age=3600, stale-while-revalidate=600")],
                 );
             }
             let meta_rest = &rest["meta/".len()..];

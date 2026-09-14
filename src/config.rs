@@ -54,13 +54,13 @@ pub struct Config {
     pub revocation: crate::userconfig::Revocation,
     /// `PLAY_SECRET` — when set, `/meta` signs the ids it hands out and `/play` + `/crop`
     /// require the signature (see `sign.rs`). `None` disables it, which is the default and has to
-    /// be: `/meta` ships `max-age=604800`, so clients hold unsigned play URLs for up to a week and
-    /// turning this on unconditionally would break every install for that week.
+    /// be: a `/meta` answer can stand in a client's cache for a week, so clients hold unsigned play
+    /// URLs for up to a week and turning this on unconditionally would break every install for that week.
     pub play_secret: Option<String>,
     /// `PLAY_SECRETS_PREV` — comma-separated prior secrets, accepted when VERIFYING and never
     /// used to sign. Same rotation shape as `config_keys_prev`, and needed for the same reason:
-    /// `/meta` ships `max-age=604800`, so a client can present a tag made with the previous secret
-    /// for up to a week after it is rotated. Without this, rotating means a week of 403s.
+    /// a `/meta` answer can stand in a client's cache for a week, so a client can present a tag made
+    /// with the previous secret for up to a week after it is rotated. Without this, rotating means a week of 403s.
     pub play_secrets_prev: Vec<String>,
     /// `PLAY_SIGNING_GRACE_UNTIL` — the way to turn `PLAY_SECRET` on over an install whose clients
     /// still hold a week of unsigned `/meta` answers. `/meta` signs from the start; until this moment

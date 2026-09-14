@@ -354,7 +354,7 @@ pub async fn resolve_youtube_ids(
         // Only when the lookup produced NOTHING. A fresh non-empty result is the better answer even
         // if some other resolve faulted inside our window — the fault counter is process-wide, so
         // that says nothing about this lookup. Substituting there served a stale id while holding
-        // the current one, and /meta ships it with a 7-day max-age.
+        // the current one, and /meta lets a client keep it for up to a week.
         //
         // And only while the answer is still worth trusting. Re-serving rewrites `exp` to the retry
         // cooldown, so without an independent clock a title whose trailer was REMOVED upstream is
@@ -495,10 +495,13 @@ pub async fn handle_meta(
         }
     }
     let payload = build_meta(ty, &id, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);
-    // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
+    // A SUCCESSFUL resolution (a real trailer) is cacheable; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
-    let extra: &[(&str, &str)] = if has_link && (resolved.stale || demotion.reordered) {
+    // A configured install's path carries its sealed key and its links name its install, so nothing
+    // but that client's own cache may keep one. The config-less answer is the same for everyone.
+    let scope = if cfg.is_some() { "private" } else { "public" };
+    let cache_control = if has_link && (resolved.stale || demotion.reordered) {
         // Two ways to get here, one reason. A last-known-good answer standing in for a lookup we
         // could not make: the server stops trusting it after a day, so pinning it in every client
         // for a week outlives that by six.
@@ -508,15 +511,24 @@ pub async fn handle_meta(
         // held by every client that fetched inside that window for seven days. The demotion is
         // deliberately applied per response rather than baked into the 24h resolve entry, on the
         // grounds that a block can lift; a week in the client's cache defeats exactly that.
-        &[("cache-control", "public, max-age=3600")]
+        format!("{scope}, max-age=3600")
     } else if has_link {
-        // stale-if-error: a restart or an outage here should not blank a trailer the client already
-        // holds. Only on this branch — the stale and demoted answers above must not outlive their hour.
-        &[("cache-control", "public, max-age=604800, stale-while-revalidate=86400, stale-if-error=86400")]
+        // Fresh for a day, because that is how long this server trusts a resolve (`YT_TTL_MS`).
+        // After that a client may keep showing the answer for the rest of the week while it asks
+        // again, and through an outage or restart here for the whole week: a trailer it already
+        // holds should not blank. Only on this branch — the stale and demoted answers above must not
+        // outlive their hour.
+        format!("{scope}, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800")
     } else {
-        &[("cache-control", "no-store")]
+        "no-store".to_string()
     };
-    let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, extra), &resolved.timing);
+    let mut extra = vec![("cache-control", cache_control.as_str())];
+    // The links are built from `self_base`, so the body depends on the host it was asked at. An empty
+    // answer names no URL at all.
+    if has_link {
+        extra.push(httputil::VARY_SELF_BASE);
+    }
+    let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, &extra), &resolved.timing);
     // Not for a demotion: that order is this server's best current knowledge, not a fallback.
     if let Some(reason) = resolved.degraded {
         resp.headers_mut().insert("x-den-degraded", hyper::header::HeaderValue::from_static(reason));

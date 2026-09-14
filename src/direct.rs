@@ -51,7 +51,7 @@ const RESOLVE_TIMEOUT_SECS: u64 = 30;
 
 /// Stop handing out a URL this long before it expires, so a page that starts playing on the last
 /// answer still has time to finish loading it.
-const EXPIRY_MARGIN_MS: u64 = 5 * 60 * 1000;
+pub(crate) const EXPIRY_MARGIN_MS: u64 = 5 * 60 * 1000;
 
 /// What to cache when the URL carries no expiry we can read. Short: an unreadable expiry means the
 /// shape changed, and serving a dead URL for an hour is worse than resolving again in five minutes.
