@@ -25,7 +25,11 @@ pub fn manifest(install_id: Option<&str>) -> Value {
         "description": "Direct-URL trailers (TMDB/KinoCheck → yt-dlp service) for inline playback.",
         "resources": ["meta"],
         "types": ["movie", "series"],
-        "idPrefixes": ["tt"],
+        // `tmdb:` is declared, not merely tolerated: it is how a client says which addons it may hand a
+        // tmdb id to. Stremio's own addons take imdb ids and nothing else, so one that does not say this
+        // never gets sent one — which is why the prefix list is the right place for it rather than a
+        // client-side guess about which install happens to be den-reel.
+        "idPrefixes": ["tt", "tmdb:"],
         "catalogs": [],
         // A BYOK TMDB key is entered (and sealed) at /configure — advertise it so a Stremio client shows
         // the Configure button. The Den app builds the sealed URL directly, so this is just for parity.
