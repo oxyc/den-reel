@@ -48,6 +48,22 @@ fn is_imdb(id: &str) -> bool {
         .is_some_and(|d| (1..=11).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// `tmdb:<digits>` — the id Den's own clients already hold. Stremio deals in IMDb ids and always will, but a
+/// client that starts from TMDB had to resolve an IMDb id it did not need, only for this server to resolve it
+/// straight back to ask TMDB for the videos. Accepting it directly spends one upstream call instead of two.
+///
+/// Digits only and bounded, for the reason `is_imdb` is: the id is interpolated into an upstream URL, so a
+/// crafted one must not survive this far.
+fn is_tmdb(id: &str) -> bool {
+    id.strip_prefix("tmdb:")
+        .is_some_and(|d| (1..=9).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Either id the meta route takes.
+fn is_supported_id(id: &str) -> bool {
+    is_imdb(id) || is_tmdb(id)
+}
+
 /// `^[a-z]{2}$` (case-insensitive), else the caller falls back to "en".
 fn valid_lang(l: &str) -> bool {
     l.len() == 2 && l.bytes().all(|b| b.is_ascii_alphabetic())
@@ -144,7 +160,7 @@ pub async fn resolve_youtube_ids(
     state: &Arc<AppState>,
     tmdb_key: &str,
     kinocheck_key: Option<&str>,
-    imdb: &str,
+    id: &str,
     ty: &str,
     lang: &str,
 ) -> Resolved {
@@ -169,7 +185,9 @@ pub async fn resolve_youtube_ids(
         (true, true) => ":nokey",
         (true, false) => ":nokey:nokc",
     };
-    let cache_key = format!("{imdb}:{lang}{sources}");
+    // Keyed by the id AS ASKED, so the same title under `tt…` and under `tmdb:…` holds two entries and
+    // resolves once each. Bounded and short-lived, and the pair is not known here to canonicalise with.
+    let cache_key = format!("{id}:{lang}{sources}");
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         let now = (state.clock)();
@@ -203,9 +221,9 @@ pub async fn resolve_youtube_ids(
     // own duration.
     let started = std::time::Instant::now();
     let ((tmdb, tmdb_dur), (kc, kc_dur)) = tokio::join!(
-        async { (state.upstream.tmdb_candidates(tmdb_key, imdb, ty, lang).await, started.elapsed()) },
+        async { (state.upstream.tmdb_candidates(tmdb_key, id, ty, lang).await, started.elapsed()) },
         async {
-            (state.upstream.kinocheck_youtube_id(kinocheck_key, imdb, ty, lang).await, started.elapsed())
+            (state.upstream.kinocheck_youtube_id(kinocheck_key, id, ty, lang).await, started.elapsed())
         },
     );
     // TMDB only when it was asked — without a key it is not consulted. KinoCheck always is.
@@ -236,7 +254,7 @@ pub async fn resolve_youtube_ids(
     // search YouTube for "<title year> trailer". Still no probe — the results are returned as candidates.
     if ids.is_empty() {
         let search_started = std::time::Instant::now();
-        let title = state.upstream.tmdb_title(tmdb_key, imdb, ty).await;
+        let title = state.upstream.tmdb_title(tmdb_key, id, ty).await;
         // The title lookup is the gate on the search: if IT could not be asked, no search ran, and
         // the empty result below is not an answer either.
         search_failed = title.is_err();
@@ -373,18 +391,23 @@ pub async fn handle_meta(
     raw_id: &str,
     query: &str,
 ) -> Response<Body> {
-    let imdb = raw_id.split(':').next().unwrap_or(""); // series may arrive as tt…:S:E — trailers are show-level
+    // Series may arrive as `tt…:S:E` — trailers are show-level, so only the title's own id is kept. A
+    // `tmdb:<id>` carries a colon of its own, so the episode suffix comes off the number and not the prefix.
+    let id = match raw_id.strip_prefix("tmdb:") {
+        Some(rest) => format!("tmdb:{}", rest.split(':').next().unwrap_or("")),
+        None => raw_id.split(':').next().unwrap_or("").to_string(),
+    };
     let base = self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
     let binding = match cfg {
         Some(c) => crate::sign::Binding::Install { iid: c.iid.as_deref(), ep: c.ep },
         None => crate::sign::Binding::Unbound,
     };
-    // Only imdb ids reach the upstreams (and our URLs) — reject anything else so a crafted id
-    // can't be interpolated into a TMDB/KinoCheck request.
-    if !is_imdb(imdb) {
+    // Only an imdb or a tmdb id reaches the upstreams (and our URLs) — reject anything else so a
+    // crafted id can't be interpolated into a TMDB/KinoCheck request.
+    if !is_supported_id(&id) {
         return httputil::json(
             StatusCode::OK,
-            &build_meta(ty, imdb, &base, &[], state.cfg.play_secret.as_deref(), binding),
+            &build_meta(ty, &id, &base, &[], state.cfg.play_secret.as_deref(), binding),
             &[("cache-control", "no-store")],
         );
     }
@@ -396,7 +419,7 @@ pub async fn handle_meta(
     // Lowercased, not just accepted: the cache key and KinoCheck's language pick are both
     // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.
     let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
-    let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
+    let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, &id, ty, &lang).await;
     let mut yt_ids = resolved.ids;
     // What /play learned, applied to what /meta hands out. Discovery does not probe, so without this
     // a candidate that is geo-blocked or removed keeps its upstream rank forever and every client
@@ -422,7 +445,7 @@ pub async fn handle_meta(
             }
         }
     }
-    let payload = build_meta(ty, imdb, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);
+    let payload = build_meta(ty, &id, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());

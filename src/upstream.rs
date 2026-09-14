@@ -61,14 +61,14 @@ pub trait Upstream: Send + Sync {
     }
 }
 
-/// Which language band a TMDB /videos entry falls in: the film's own language, English, or other.
+/// Which language band a TMDB /videos entry falls in: the language asked for, English, or other.
 ///
 /// An untagged video (`iso_639_1` absent or empty) lands in `other` rather than being guessed at. We
 /// ask for `null` in `include_video_language` so those are not lost, but an untagged video is not
 /// evidence of anything, so it sorts behind the two we can actually identify.
-fn lang_band(v: &Value, original: &str) -> u8 {
+fn lang_band(v: &Value, preferred: &str) -> u8 {
     match v["iso_639_1"].as_str() {
-        Some(l) if l.eq_ignore_ascii_case(original) => 0,
+        Some(l) if l.eq_ignore_ascii_case(preferred) => 0,
         Some(l) if l.eq_ignore_ascii_case("en") => 1,
         _ => 2,
     }
@@ -96,7 +96,7 @@ fn rank(v: &Value) -> u8 {
 /// the film as it was made — with subtitles if the client wants them, which is the client's business.
 /// English second because it is both the most common original language and the most likely to exist
 /// at all; when the film IS English the two bands coincide and this is simply kind order.
-pub fn pick_trailer_candidates(results: &[Value], original: &str) -> Vec<String> {
+pub fn pick_trailer_candidates(results: &[Value], preferred: &str) -> Vec<String> {
     let mut yt: Vec<&Value> = results
         .iter()
         // An id from upstream is untrusted: it ends up as a cache filename and a yt-dlp -o path,
@@ -105,7 +105,7 @@ pub fn pick_trailer_candidates(results: &[Value], original: &str) -> Vec<String>
         .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(crate::is_valid_vid))
         .collect();
     // stable → preserves TMDB order within a rank, like JS's sort
-    yt.sort_by_key(|v| (lang_band(v, original), rank(v)));
+    yt.sort_by_key(|v| (lang_band(v, preferred), rank(v)));
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for v in yt {
@@ -281,53 +281,57 @@ fn redact(url: &str) -> &str {
 
 #[async_trait]
 impl Upstream for HttpUpstream {
-    /// imdb → TMDB id (via /find) → /videos → ordered YouTube trailer candidates ([] on miss).
-    // `_lang` is the VIEWER's language, and TMDB video selection deliberately does not use it — see
-    // the `include_video_language` reasoning below. KinoCheck still does.
+    /// `tmdb:<id>` goes straight to /videos; an imdb id resolves through /find first. Ordered YouTube
+    /// trailer candidates, `[]` on miss.
     async fn tmdb_candidates(
         &self,
         tmdb_key: &str,
-        imdb: &str,
+        id: &str,
         ty: &str,
-        _lang: &str,
+        lang: &str,
     ) -> Answered<Vec<String>> {
         if tmdb_key.is_empty() {
             return Ok(Vec::new()); // not consulted, which is not a failure
         }
         let key = tmdb_key;
         let tmdb_type = if ty == "series" { "tv" } else { "movie" };
-        let find_url = format!("{}/find/{imdb}?external_source=imdb_id&api_key={key}", self.cfg.tmdb_base);
-        let Some(found) = self.get_json(&find_url, &[]).await? else {
-            return Ok(Vec::new());
+        // A tmdb id is the one TMDB wants, so it reaches the videos below with no lookup at all. An imdb
+        // id costs a /find first — exactly the round trip a client already holding a tmdb id need not pay.
+        let hit_id = match id.strip_prefix("tmdb:") {
+            Some(n) => n.to_string(),
+            None => {
+                let find_url =
+                    format!("{}/find/{id}?external_source=imdb_id&api_key={key}", self.cfg.tmdb_base);
+                let Some(found) = self.get_json(&find_url, &[]).await? else {
+                    return Ok(Vec::new());
+                };
+                let results =
+                    if tmdb_type == "movie" { &found["movie_results"] } else { &found["tv_results"] };
+                let Some(hit) = results.get(0).and_then(|h| h["id"].as_i64()) else {
+                    return Ok(Vec::new());
+                };
+                hit.to_string()
+            }
         };
-        let results = if tmdb_type == "movie" { &found["movie_results"] } else { &found["tv_results"] };
-        let Some(hit_id) = results.get(0).and_then(|h| h["id"].as_i64()) else {
-            return Ok(Vec::new());
-        };
-        // The film's own language, which is what decides which trailer we want — NOT the viewer's.
-        // Already in the /find hit, so it costs nothing to read.
-        let original = results
-            .get(0)
-            .and_then(|h| h["original_language"].as_str())
-            .filter(|l| l.len() == 2 && l.bytes().all(|b| b.is_ascii_lowercase()))
-            .unwrap_or("en");
-        // `include_video_language` is what makes this work at all, and it is doing two jobs.
+        // `include_video_language` is what makes this work at all.
         //
         // Without it, `/videos` returns only videos TAGGED with `language=` — and with no `language=`
         // at all TMDB defaults to en-US, which is the same thing. Measured against the live API:
-        // Amélie returns 14 videos, all English, and NOT its two French trailers. So the original
-        // trailer for a foreign-language film was simply unreachable.
+        // Amélie returns 14 videos, all English, and NOT its two French trailers.
         //
-        // And it takes a list that `language=` need not contain, so the film's language can be asked
-        // for regardless of the viewer's: `language=en&include_video_language=fr,en,null` returns the
-        // French ones. Amélie 14 → 16 (fr=2), Spirited Away 6 → 7 (ja=1).
+        // `null` is what keeps an UNTAGGED video, which is how a great many original trailers arrive.
         //
-        // The viewer's language is deliberately NOT in this list. A video tagged with it is a dub or
-        // a local-market cut, not the film as made — asking for `fi` got Oppenheimer a Finnish
-        // trailer ranked above the English original. Leaving it out drops that (52 → 51) as well as
-        // adding what we wanted. Subtitles are the client's business, not ours.
+        // The language asked for is the caller's preference, English unless it says otherwise, and it
+        // is deliberately a preference rather than the film's own language: reading `original_language`
+        // meant a /find on every lookup, which is the round trip a tmdb id exists to avoid. A film's own
+        // trailer is usually untagged and still arrives through `null`; what is lost is one tagged
+        // French video for Amélie, against a lookup saved on every title.
+        //
+        // A caller that DOES ask (`?lang=es`) gets Spanish first, then English, then the untagged —
+        // worth knowing that a video tagged `es` is often a dub rather than the film as made, which is
+        // why nothing asks for it by default.
         let videos_url = format!(
-            "{}/{tmdb_type}/{hit_id}/videos?api_key={key}&language=en&include_video_language={original},en,null",
+            "{}/{tmdb_type}/{hit_id}/videos?api_key={key}&language=en&include_video_language={lang},en,null",
             self.cfg.tmdb_base
         );
         let Some(data) = self.get_json(&videos_url, &[]).await? else {
@@ -335,22 +339,34 @@ impl Upstream for HttpUpstream {
         };
         let empty = Vec::new();
         let results = data["results"].as_array().unwrap_or(&empty);
-        Ok(pick_trailer_candidates(results, original))
+        Ok(pick_trailer_candidates(results, lang))
     }
 
-    /// imdb → "Title Year" via TMDB /find, for the YouTube-search fallback query. None on miss.
-    async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Answered<Option<String>> {
+    /// An imdb or tmdb id → "Title Year", for the YouTube-search fallback query. None on miss.
+    async fn tmdb_title(&self, tmdb_key: &str, id: &str, ty: &str) -> Answered<Option<String>> {
         if tmdb_key.is_empty() {
             return Ok(None); // not consulted, which is not a failure
         }
         let tmdb_type = if ty == "series" { "tv" } else { "movie" };
-        let find_url =
-            format!("{}/find/{imdb}?external_source=imdb_id&api_key={tmdb_key}", self.cfg.tmdb_base);
-        let Some(found) = self.get_json(&find_url, &[]).await? else {
+        // A tmdb id names the title's own record, which carries the name and date outright; an imdb id
+        // has to be looked up before anything can be read off it.
+        let (url, named_outright) = match id.strip_prefix("tmdb:") {
+            Some(n) => (format!("{}/{tmdb_type}/{n}?api_key={tmdb_key}", self.cfg.tmdb_base), true),
+            None => (
+                format!("{}/find/{id}?external_source=imdb_id&api_key={tmdb_key}", self.cfg.tmdb_base),
+                false,
+            ),
+        };
+        let Some(found) = self.get_json(&url, &[]).await? else {
             return Ok(None);
         };
-        let hit =
-            if tmdb_type == "movie" { found["movie_results"].get(0) } else { found["tv_results"].get(0) };
+        let hit = if named_outright {
+            Some(&found)
+        } else if tmdb_type == "movie" {
+            found["movie_results"].get(0)
+        } else {
+            found["tv_results"].get(0)
+        };
         let Some(hit) = hit else { return Ok(None) };
         // Movies carry `title` + `release_date`; TV carries `name` + `first_air_date`.
         let Some(title) = hit["title"].as_str().or_else(|| hit["name"].as_str()) else {
@@ -371,18 +387,24 @@ impl Upstream for HttpUpstream {
         }))
     }
 
-    /// KinoCheck discovery fallback: imdb → official trailer's YouTube id (or None).
+    /// KinoCheck discovery fallback: an imdb OR tmdb id → the official trailer's YouTube id (or None).
+    /// It takes either, so a tmdb id needs no resolving here — and it answers without a key, which is
+    /// what a caller with no TMDB key of its own is left with.
     async fn kinocheck_youtube_id(
         &self,
         kinocheck_key: Option<&str>,
-        imdb: &str,
+        id: &str,
         ty: &str,
         lang: &str,
     ) -> Answered<Option<String>> {
         let endpoint = if ty == "series" { "shows" } else { "movies" };
         let language = if lang.starts_with("de") { "de" } else { "en" };
+        let param = match id.strip_prefix("tmdb:") {
+            Some(n) => format!("tmdb_id={n}"),
+            None => format!("imdb_id={id}"),
+        };
         let url = format!(
-            "{}/{endpoint}?imdb_id={imdb}&categories=Trailer&language={language}",
+            "{}/{endpoint}?{param}&categories=Trailer&language={language}",
             self.cfg.kinocheck_base
         );
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];

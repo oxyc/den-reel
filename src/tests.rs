@@ -2830,6 +2830,31 @@ async fn serve_once_stalling(content_length: usize) -> String {
     format!("http://{addr}")
 }
 
+/// Serve one fixed response and hand back the request line, so a test can assert WHICH url was asked
+/// for — the only way to pin that an id reached an upstream under the parameter it belongs in.
+async fn serve_once_capturing(body: &'static str) -> (String, tokio::sync::oneshot::Receiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            let _ = tx.send(line);
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
 async fn serve_once_bytes(status_line: &str, content_length: usize, body: Vec<u8>) -> String {
     use tokio::io::AsyncWriteExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2938,6 +2963,80 @@ async fn an_oversize_body_is_not_an_answer() {
         up.tmdb_candidates("test-key", "tt0111161", "movie", "en").await,
         Err(NoAnswer),
         "an oversize body was buffered and accepted as an answer"
+    );
+}
+
+/// A tmdb id spends ONE upstream call where an imdb id spends two, which is the whole point of taking
+/// it. `serve_once` answers exactly one request, so the single body proves which call was made: given a
+/// /videos-shaped answer, the tmdb id reads a trailer out of it, while the imdb id spends that one
+/// answer on /find — where a videos body carries no `movie_results` — and comes back with nothing.
+#[tokio::test]
+async fn a_tmdb_id_reaches_the_videos_without_a_find() {
+    const VIDEOS: &str = "{\"results\":[{\"site\":\"YouTube\",\"key\":\"dQw4w9WgXcQ\",\
+        \"type\":\"Trailer\",\"official\":true,\"iso_639_1\":\"en\"}]}";
+    let upstream = || async {
+        let base = serve_once("HTTP/1.1 200 OK", VIDEOS.len(), VIDEOS).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.tmdb_base = base;
+        crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new())
+    };
+
+    assert_eq!(
+        upstream().await.tmdb_candidates("test-key", "tmdb:157336", "movie", "en").await,
+        Ok(vec!["dQw4w9WgXcQ".to_string()]),
+        "a tmdb id should have asked for the videos outright"
+    );
+    assert_eq!(
+        upstream().await.tmdb_candidates("test-key", "tt0816692", "movie", "en").await,
+        Ok(Vec::new()),
+        "an imdb id still spends its first call resolving the id"
+    );
+}
+
+/// KinoCheck takes either id, which is what keeps it reachable for a caller holding only a tmdb id —
+/// and it is the one source that answers with no key at all, so that path has to stay open.
+#[tokio::test]
+async fn kinocheck_is_asked_by_whichever_id_it_was_given() {
+    const KC: &str = "{\"trailer\":{\"youtube_video_id\":\"dQw4w9WgXcQ\"}}";
+    for (id, expected) in [("tmdb:157336", "tmdb_id=157336"), ("tt0816692", "imdb_id=tt0816692")] {
+        let (base, asked) = serve_once_capturing(KC).await;
+        let mut cfg = test_cfg(temp_dir());
+        cfg.kinocheck_base = base;
+        let up = crate::upstream::HttpUpstream::new(Arc::new(cfg), reqwest::Client::new());
+
+        assert_eq!(
+            up.kinocheck_youtube_id(None, id, "movie", "en").await,
+            Ok(Some("dQw4w9WgXcQ".to_string())),
+            "{id}"
+        );
+        let line = asked.await.expect("the upstream was never asked");
+        assert!(line.contains(expected), "{id} was asked for as {line}, not {expected}");
+    }
+}
+
+/// An id that is neither form never reaches an upstream url. The route still answers 200 with no links,
+/// as it does for any title it has no trailer for — a crafted id is not an error to report back.
+#[tokio::test]
+async fn a_malformed_tmdb_id_is_refused() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let base = spawn_server(state).await;
+    let client = reqwest::Client::new();
+    for id in ["tmdb:abc", "tmdb:", "tmdb:1234567890", "nonsense"] {
+        let r = client.get(format!("{base}/meta/movie/{id}.json")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{id}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["meta"]["links"].as_array().map(Vec::len), Some(0), "{id} was not refused");
+    }
+    let ok = client.get(format!("{base}/meta/movie/tmdb:157336.json")).send().await.unwrap();
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert!(
+        !body["meta"]["links"].as_array().unwrap().is_empty(),
+        "a well-formed tmdb id was refused along with the bad ones"
     );
 }
 
