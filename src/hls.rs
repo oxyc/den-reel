@@ -45,6 +45,14 @@ const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 /// Per-request, because the shared client's 15s is sized for JSON lookups.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The shortest rung a native player is offered, in pixels.
+///
+/// Safari opens on a rung of its own choosing whatever order the playlist is in, so the only way to
+/// keep a trailer off 240p for the first seconds — which is most of a trailer — is not to list 240p.
+/// 540 leaves the 720p and 1080p rungs, which is room to fall without ever looking like a thumbnail.
+/// The proxied path passes 0 and keeps the whole ladder: hls.js is told where to start instead.
+const NATIVE_FLOOR: u32 = 540;
+
 /// What a proxied URL's tag covers. Prefixed, so a tag minted for a video id cannot open a URL and a
 /// URL's tag cannot stand in for one on `/play`.
 fn message(url: &str) -> String {
@@ -103,23 +111,30 @@ pub enum Uris {
     Native,
 }
 
-/// Put the highest-bandwidth variant first.
+/// Put the highest-bandwidth variant first, and offer no rung shorter than `floor` pixels.
 ///
 /// A player choosing its opening variant has nothing to go on but the playlist's order, and Apple's
-/// native one takes the first entry. YouTube's order is not a ladder: 240p is listed first, the 144p
-/// rungs sit below 1080p, and the whole set is grouped by codec rather than by size. So iOS opened
-/// every trailer at 426x240 and spent the next ninety seconds climbing — on a phone that had the
-/// bandwidth for 1080p from the first segment.
+/// native one is documented to take the first entry. YouTube's order is not a ladder: 240p is listed
+/// first, the 144p rungs sit below 1080p, and the whole set is grouped by codec rather than by size.
+/// So iOS opened every trailer at 426x240 and spent the next ninety seconds climbing.
 ///
-/// Nothing is dropped: a line that genuinely cannot hold the top rung still has every lower one to
-/// fall to, which is the difference between this and capping the ladder.
-fn best_first(playlist: &str) -> String {
+/// Sorting turned out not to be enough. Safari picks its own opening rung whatever the order says —
+/// measured on the box, with 1080p standing first in the playlist and a phone still starting soft —
+/// and there is no setting for the native player the way hls.js takes one. The playlist is the only
+/// lever left, so a rung a phone should not open on is not offered at all. `floor` is a height in
+/// pixels, and 0 offers everything: that is what the proxied path wants, where hls.js is told where to
+/// start instead and can still fall as far as the line requires.
+///
+/// Never everything, though. A playlist whose every rung is below the floor is served whole, because a
+/// small picture beats no picture — and a rung that names no size is kept either way, since unknown is
+/// not the same as small and might be the only one a phone can play.
+fn best_first(playlist: &str, floor: u32) -> String {
     let (mut head, mut tail) = (String::new(), String::new());
-    let mut variants: Vec<(u64, String)> = Vec::new();
-    let mut open: Option<(u64, String)> = None;
+    let mut variants: Vec<(u64, u32, String)> = Vec::new();
+    let mut open: Option<(u64, u32, String)> = None;
     for line in playlist.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
-        if let Some((_, text)) = open.as_mut() {
+        if let Some((_, _, text)) = open.as_mut() {
             text.push_str(line);
             // The variant's own URI closes it. A blank line or a comment inside it does not.
             if !body.is_empty() && !body.starts_with('#') {
@@ -130,7 +145,7 @@ fn best_first(playlist: &str) -> String {
             continue;
         }
         if body.starts_with("#EXT-X-STREAM-INF:") {
-            open = Some((bandwidth(body), line.to_string()));
+            open = Some((bandwidth(body), height(body), line.to_string()));
         } else if variants.is_empty() {
             head.push_str(line);
         } else {
@@ -138,17 +153,29 @@ fn best_first(playlist: &str) -> String {
         }
     }
     // A tag whose URI never arrived is a malformed playlist. Keep it rather than drop it.
-    if let Some((_, text)) = open {
+    if let Some((_, _, text)) = open {
         tail.push_str(&text);
     }
+    let tall_enough: Vec<&(u64, u32, String)> =
+        variants.iter().filter(|(_, height, _)| *height == 0 || *height >= floor).collect();
+    let mut offered: Vec<&(u64, u32, String)> =
+        if tall_enough.is_empty() { variants.iter().collect() } else { tall_enough };
     // Stable, so variants of equal bandwidth stay in the order YouTube chose for them.
-    variants.sort_by_key(|a| std::cmp::Reverse(a.0));
+    offered.sort_by_key(|variant| std::cmp::Reverse(variant.0));
     let mut out = head;
-    for (_, text) in variants {
-        out.push_str(&text);
+    for (_, _, text) in offered {
+        out.push_str(text);
     }
     out.push_str(&tail);
     out
+}
+
+/// The height of a `#EXT-X-STREAM-INF` line's `RESOLUTION`, or 0 where it names none.
+fn height(tag: &str) -> u32 {
+    let Some(at) = tag.find("RESOLUTION=") else { return 0 };
+    let rest = &tag[at + "RESOLUTION=".len()..];
+    let size = rest.split(|c: char| !(c.is_ascii_digit() || c == 'x')).next().unwrap_or("");
+    size.split_once('x').map_or(0, |(_, height)| height.parse().unwrap_or(0))
 }
 
 /// The `BANDWIDTH` of a `#EXT-X-STREAM-INF` line — the one attribute every variant must carry.
@@ -376,7 +403,9 @@ async fn playlist(state: &AppState, url: &str, res: reqwest::Response, uris: Uri
         // resolve against THIS server now that the playlist is served from it.
         Uris::Native => rewrite(&text, url, &|target: &str| target.to_string()),
     };
-    let body = best_first(&body);
+    // A native player is offered the taller rungs only, because it opens on one of its own choosing.
+    // hls.js takes the whole ladder: it is told where to start, and can fall as far as the line needs.
+    let body = best_first(&body, if uris == Uris::Native { NATIVE_FLOOR } else { 0 });
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/vnd.apple.mpegurl")
@@ -470,15 +499,52 @@ mod tests {
              high.m3u8\n\
              #EXT-X-STREAM-INF:RESOLUTION=256x144\n\
              unsized.m3u8\n";
-        let out = best_first(playlist);
+        // Floor 0: the whole ladder, which is what the proxied path is served.
+        let out = best_first(playlist, 0);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "#EXTM3U", "the header stays at the top");
         assert!(lines[1].starts_with("#EXT-X-MEDIA"), "and so do the renditions: {out}");
         assert!(lines[2].contains("BANDWIDTH=4272159"), "the best rung opens the ladder: {out}");
         assert_eq!(lines[3], "high.m3u8", "each variant keeps its own URI: {out}");
         assert_eq!(lines[5], "low.m3u8", "{out}");
-        // Nothing is dropped: a line that cannot hold the top rung still has every lower one.
         assert_eq!(lines[7], "unsized.m3u8", "a variant with no bandwidth sorts last: {out}");
+    }
+
+    /// What a phone is offered. Sorting alone did not settle it: Safari opens on a rung of its own
+    /// choosing whatever the order says, so the short ones are not listed to it at all.
+    #[test]
+    fn a_floor_offers_a_phone_only_the_taller_rungs() {
+        let playlist = "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=238435,RESOLUTION=426x240\n\
+             low.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=4272159,RESOLUTION=1920x1080\n\
+             high.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1154419,RESOLUTION=1280x720\n\
+             middle.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=99\n\
+             sizeless.m3u8\n";
+        let out = best_first(playlist, NATIVE_FLOOR);
+        assert!(!out.contains("low.m3u8"), "240p is not offered: {out}");
+        assert!(out.contains("high.m3u8") && out.contains("middle.m3u8"), "{out}");
+        // Unknown is not the same as small, and it might be the only rung a phone can play.
+        assert!(out.contains("sizeless.m3u8"), "a rung naming no size is kept: {out}");
+
+        // And a ladder with nothing above the floor is served whole: a small picture beats none.
+        let short = "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=238435,RESOLUTION=426x240\n\
+             low.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=154256,RESOLUTION=256x144\n\
+             lower.m3u8\n";
+        let out = best_first(short, NATIVE_FLOOR);
+        assert!(out.contains("low.m3u8") && out.contains("lower.m3u8"), "{out}");
+    }
+
+    #[test]
+    fn a_variant_is_measured_by_the_height_it_names() {
+        assert_eq!(height("#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1920x1080"), 1080);
+        assert_eq!(height("#EXT-X-STREAM-INF:RESOLUTION=426x240,FRAME-RATE=24"), 240);
+        assert_eq!(height("#EXT-X-STREAM-INF:BANDWIDTH=1"), 0, "no size named");
+        assert_eq!(height("#EXT-X-STREAM-INF:RESOLUTION=broken"), 0);
     }
 
     /// `AVERAGE-BANDWIDTH` ends in the same word and is not the number to sort on.
