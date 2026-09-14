@@ -53,14 +53,18 @@ jobs:
           fi
           curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${tag}/SHA2-256SUMS" -o sums.txt
           amd64=$(awk '$2=="yt-dlp_linux"{print $1}' sums.txt)
+          # The zipapp as well: the image pins both artifacts, and a bump that refreshed only one
+          # would leave the other's sum stale and fail the build's own checksum check.
+          zipapp=$(awk '$2=="yt-dlp"{print $1}' sums.txt)
           rm -f sums.txt
-          if [ -z "$amd64" ]; then
-            echo "::error::could not read the SHA256 sum for $tag"; exit 1
+          if [ -z "$amd64" ] || [ -z "$zipapp" ]; then
+            echo "::error::could not read both SHA256 sums for $tag"; exit 1
           fi
           {
             echo "proceed=true"
             echo "tag=$tag"
             echo "amd64=$amd64"
+            echo "zipapp=$zipapp"
           } >> "$GITHUB_OUTPUT"
 
       - name: Patch Dockerfile
@@ -68,10 +72,12 @@ jobs:
         env:
           TAG: ${{ steps.rel.outputs.tag }}
           AMD64: ${{ steps.rel.outputs.amd64 }}
+          ZIPAPP: ${{ steps.rel.outputs.zipapp }}
         run: |
           set -euo pipefail
           sed -i -E "s|^ARG YTDLP_VERSION=.*|ARG YTDLP_VERSION=${TAG}|" Dockerfile
           sed -i -E "s|^ARG YTDLP_SHA256_AMD64=.*|ARG YTDLP_SHA256_AMD64=${AMD64}|" Dockerfile
+          sed -i -E "s|^ARG YTDLP_SHA256_ZIPAPP=.*|ARG YTDLP_SHA256_ZIPAPP=${ZIPAPP}|" Dockerfile
           git diff -- Dockerfile
 
       - name: Open auto-merging PR

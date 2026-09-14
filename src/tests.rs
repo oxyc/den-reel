@@ -215,6 +215,9 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
+        // Never the resident one in a test: it would want an interpreter and the pinned zipapp.
+        ytdlp_worker: None,
+        python: "python3".into(),
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
         cache_ok_until: std::sync::atomic::AtomicU64::new(0),
@@ -274,6 +277,7 @@ fn build_state_full(
         play_fails: Mutex::new(HashMap::new()),
         direct_cache: Mutex::new(HashMap::new()),
         direct_inflight: Mutex::new(HashMap::new()),
+        worker: Default::default(),
         upstream,
         prober,
         searcher,
@@ -3740,6 +3744,25 @@ async fn direct_answers_the_urls_and_resolves_each_id_once() {
     let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
+}
+
+/// The resident worker's protocol, held still. A success carries the streams flattened alongside
+/// `ok`; a failure carries yt-dlp's own words, which are classified exactly as its stderr would be;
+/// and a line that is not a reply at all says the far end has stopped being a worker.
+#[test]
+fn the_resident_workers_replies_are_read_as_answers_or_reasons() {
+    let good =
+        r#"{"ok":true,"width":1920,"height":1080,"urls":["https://a","https://b"],"hls":"https://m.m3u8"}"#;
+    let answer = crate::worker::read_reply(good).expect("a readable line").expect("an answer");
+    assert_eq!((answer.width, answer.height), (Some(1920), Some(1080)));
+    assert_eq!(answer.urls, vec!["https://a", "https://b"]);
+    assert_eq!(answer.hls.as_deref(), Some("https://m.m3u8"));
+
+    let bad = r#"{"ok":false,"error":"ERROR: [youtube] Video unavailable"}"#;
+    let said = crate::worker::read_reply(bad).expect("a readable line").expect_err("a reason");
+    assert_eq!(crate::ytdlp::classify(None, &said).reason, "unavailable");
+
+    assert!(crate::worker::read_reply("Traceback (most recent call last):").is_err());
 }
 
 /// A browser that plays YouTube's own URL never reads the downloaded file, so asking for it spends

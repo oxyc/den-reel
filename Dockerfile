@@ -3,7 +3,9 @@
 # Three stages: build the Rust binary, fetch the extractor tools (deno + yt-dlp) with curl/unzip in
 # a throwaway stage, then assemble a runtime image that carries neither the Rust toolchain nor
 # curl/unzip — just ffmpeg, ca-certs, the two extractor binaries, and our ~2 MB binary. No Node, no
-# npm, no python3 (yt-dlp's standalone build bundles its own interpreter). Builds amd64, the box's arch.
+# npm. python3 is here for exactly one thing: the resident resolver (worker/resolve.py), because
+# spawning the standalone binary spends ~840ms starting an interpreter before it looks at anything,
+# and that is paid again for every trailer. Builds amd64, the box's arch.
 
 # ---- build ----------------------------------------------------------------
 FROM rust:1-trixie AS build
@@ -71,6 +73,17 @@ RUN set -eux; \
     echo "${sha}  /usr/local/bin/yt-dlp" | sha256sum -c -; \
     chmod +x /usr/local/bin/yt-dlp
 
+# The same release as a ZIPAPP, pinned the same way. It is a zip of the package, so `sys.path` can
+# import it — which is what lets the resident resolver reuse this verified artifact instead of a pip
+# install. Pinning is the whole supply-chain guard here and a resident process is not worth losing it
+# for. Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml, which refreshes
+# both sums: a bump that renewed only one would fail this build on the other.
+ARG YTDLP_SHA256_ZIPAPP=1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6
+RUN set -eux; \
+    curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp" \
+      -o /usr/local/lib/yt-dlp.zip; \
+    echo "${YTDLP_SHA256_ZIPAPP}  /usr/local/lib/yt-dlp.zip" | sha256sum -c -
+
 # ---- runtime --------------------------------------------------------------
 FROM debian:trixie-slim
 
@@ -79,11 +92,15 @@ FROM debian:trixie-slim
 # refreshed only every few weeks, and ffmpeg parses untrusted media, so every build (the weekly patch
 # rebuild included) takes the current Debian security fixes rather than the base's.
 RUN apt-get update && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tools /usr/local/bin/deno /usr/local/bin/deno
 COPY --from=tools /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
+# The importable copy, and the process that imports it. The binary above stays: it is what a resolve
+# falls back to when the resident one cannot be started or has died.
+COPY --from=tools /usr/local/lib/yt-dlp.zip /usr/local/lib/yt-dlp.zip
+COPY worker/resolve.py /app/resolve.py
 # MP4Box + its shared lib (clap writer). ldconfig regenerates the libgpac.so.12 SONAME link.
 COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
 COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
@@ -100,6 +117,7 @@ WORKDIR /app
 ENV PORT=8092 \
     CACHE_DIR=/cache \
     YTDLP_PATH=/usr/local/bin/yt-dlp \
+    YTDLP_WORKER=/app/resolve.py \
     MAX_HEIGHT=1080
 VOLUME ["/cache"]
 EXPOSE 8092

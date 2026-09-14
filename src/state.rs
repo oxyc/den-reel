@@ -80,6 +80,9 @@ pub struct AppState {
     /// vid -> the resolve already running for it. The probe budget is six, so a warm-up and the
     /// request chasing it never queued behind one another — they simply both ran.
     pub direct_inflight: Mutex<HashMap<String, SharedResolve>>,
+    /// The resident yt-dlp, when one is configured and running (`worker.rs`). Every failure of it
+    /// falls back to spawning the binary, so this is only ever an optimisation.
+    pub worker: crate::worker::Worker,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
@@ -154,6 +157,7 @@ impl AppState {
             play_fails: Mutex::new(HashMap::new()),
             direct_cache: Mutex::new(HashMap::new()),
             direct_inflight: Mutex::new(HashMap::new()),
+            worker: Default::default(),
             upstream,
             prober: default_prober(cfg.clone(), probe_sem.clone()),
             searcher: default_searcher(cfg, probe_sem.clone()),

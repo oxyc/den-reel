@@ -28,6 +28,7 @@ mod sign;
 mod state;
 mod upstream;
 mod userconfig;
+mod worker;
 mod ytdlp;
 
 #[cfg(test)]
@@ -830,6 +831,20 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
+    // Let an idle resident yt-dlp go. Trailers are bursty — a browse, then nothing for hours — and
+    // an interpreter sitting on ~40 MB of a 1 GiB container for the quiet stretch is a poor trade
+    // against paying its startup once more on the next browse.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(crate::worker::IDLE_TIMEOUT / 4);
+            loop {
+                tick.tick().await;
+                state.worker.reap_idle().await;
+            }
+        });
+    }
+
     // Built ONCE, before serving — and before the startup line, since until the handlers are
     // registered SIGTERM keeps its default disposition and a stop in that window killed the process
     // outright. Constructing it per accept dropped the Signal each time accept() won the select, and
@@ -872,6 +887,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     if killed > 0 {
         eprintln!("shutdown: killed {killed} in-flight download(s)");
     }
+    state.worker.shutdown().await;
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     state::save_resolve_cache(&state);
     if drained {

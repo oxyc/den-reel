@@ -151,6 +151,23 @@ fn first_url_in(line: &str) -> Option<&str> {
     Some(&rest[..rest.find(['\'', '"', ',', ']', ' ']).unwrap_or(rest.len())])
 }
 
+/// The resident worker's answer as a `Direct` — by the same rules the printed one goes through, so
+/// one place decides what counts as an answer and when it stops being good.
+fn from_worker(answer: crate::worker::Answer, now: u64) -> Option<Direct> {
+    let urls: Vec<&str> = answer.urls.iter().map(String::as_str).collect();
+    let (video, audio) = match urls.as_slice() {
+        [only] => (only.to_string(), None),
+        [video, audio, ..] => (video.to_string(), Some(audio.to_string())),
+        [] => return None,
+    };
+    let mut dated = urls;
+    if let Some(master) = answer.hls.as_deref() {
+        dated.push(master);
+    }
+    let expires = earliest_expiry(&dated, now);
+    Some(Direct { expires, video, audio, hls: answer.hls, width: answer.width, height: answer.height })
+}
+
 /// Ask yt-dlp for the URLs, without downloading anything.
 ///
 /// The format string is `cfg.ytdlp_format` — the very same ladder `/play` extracts with. That is
@@ -276,7 +293,19 @@ pub(crate) async fn answer(
                 // The permit is taken INSIDE the shared future, so waiters queue on the resolve
                 // rather than on the budget: one permit is spent per video, not per caller.
                 let _permit = st.probe_sem.acquire().await;
-                let answer = resolve(&st.cfg, &v, (st.clock)()).await;
+                // The resident worker first, and the binary whenever it cannot answer — which is
+                // every way it can fail, including not being configured at all.
+                let answer = match st.worker.resolve(&st.cfg, &v).await {
+                    Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
+                        status: 502,
+                        reason: "no_direct_url".into(),
+                        message: "Could not fetch this trailer.".into(),
+                        detail: "the resident yt-dlp answered with no usable URL".into(),
+                    }),
+                    // Its own words about this video, classified exactly as the binary's stderr is.
+                    Some(Err(said)) => Err(classify(None, &said)),
+                    None => resolve(&st.cfg, &v, (st.clock)()).await,
+                };
                 let now = (st.clock)();
                 if let Err(e) = &answer {
                     // Once per resolve that actually ran, at most once a minute per reason — the

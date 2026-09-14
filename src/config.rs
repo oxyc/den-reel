@@ -101,6 +101,16 @@ pub struct Config {
     /// `YTDLP_PLAYER_CLIENTS` still pins it, comma-separated, for riding out a specific outage. Be
     /// aware that a name yt-dlp has retired fails quietly, in exactly the way described above.
     pub ytdlp_extractor_args: Option<String>,
+    /// `YTDLP_WORKER` — a resident yt-dlp answering over a pipe (`worker/resolve.py`), so a resolve
+    /// costs the extraction and not another interpreter start: about 840ms of every one, measured on
+    /// the box, spent before yt-dlp has looked at anything.
+    ///
+    /// Unset disables it and every resolve spawns the binary, which is also exactly what happens
+    /// when the worker cannot be started or has died — the fallback is the path that was always
+    /// there. The image sets this; a local `cargo run` leaves it unset unless asked.
+    pub ytdlp_worker: Option<String>,
+    /// `PYTHON_PATH` — the interpreter that runs the worker. Only consulted when one is configured.
+    pub python: String,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
@@ -323,6 +333,8 @@ impl Config {
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,
+            ytdlp_worker: env_opt("YTDLP_WORKER"),
+            python: env_opt("PYTHON_PATH").unwrap_or_else(|| "python3".to_string()),
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
             cache_ok_until: std::sync::atomic::AtomicU64::new(0),
