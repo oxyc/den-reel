@@ -18,6 +18,12 @@
 //! a different message, so neither tag opens the other — and must be a googlevideo host over https.
 //! With no secret configured (the default, as play signing is) the host check stands on its own, and
 //! what is left is a proxy for URLs Google itself signed and expires.
+//!
+//! **`?native=1` serves the playlist and nothing else.** A bare `<video>` is not subject to CORS —
+//! that is the whole reason `/direct` works — so WebKit can fetch Google's segments itself and only
+//! the master needs to come from here. It is served for the one thing this server can do that
+//! Google's own copy cannot: put the best variant first. A player picking its FIRST variant has
+//! nothing but the playlist's order to go on, and YouTube's order is not a ladder.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,6 +91,84 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// Where a playlist's URIs are made to point.
+///
+/// `Proxy` is what MSE needs: hls.js fetches its segments with XHR, and googlevideo answers those
+/// with no CORS header at all. `Native` is for a bare `<video>`, whose media loads are not
+/// CORS-checked — it fetches Google's segments itself, so the playlist comes from here and not one
+/// byte of video does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Uris {
+    Proxy,
+    Native,
+}
+
+/// Put the highest-bandwidth variant first.
+///
+/// A player choosing its opening variant has nothing to go on but the playlist's order, and Apple's
+/// native one takes the first entry. YouTube's order is not a ladder: 240p is listed first, the 144p
+/// rungs sit below 1080p, and the whole set is grouped by codec rather than by size. So iOS opened
+/// every trailer at 426x240 and spent the next ninety seconds climbing — on a phone that had the
+/// bandwidth for 1080p from the first segment.
+///
+/// Nothing is dropped: a line that genuinely cannot hold the top rung still has every lower one to
+/// fall to, which is the difference between this and capping the ladder.
+fn best_first(playlist: &str) -> String {
+    let (mut head, mut tail) = (String::new(), String::new());
+    let mut variants: Vec<(u64, String)> = Vec::new();
+    let mut open: Option<(u64, String)> = None;
+    for line in playlist.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        if let Some((_, text)) = open.as_mut() {
+            text.push_str(line);
+            // The variant's own URI closes it. A blank line or a comment inside it does not.
+            if !body.is_empty() && !body.starts_with('#') {
+                if let Some(done) = open.take() {
+                    variants.push(done);
+                }
+            }
+            continue;
+        }
+        if body.starts_with("#EXT-X-STREAM-INF:") {
+            open = Some((bandwidth(body), line.to_string()));
+        } else if variants.is_empty() {
+            head.push_str(line);
+        } else {
+            tail.push_str(line);
+        }
+    }
+    // A tag whose URI never arrived is a malformed playlist. Keep it rather than drop it.
+    if let Some((_, text)) = open {
+        tail.push_str(&text);
+    }
+    // Stable, so variants of equal bandwidth stay in the order YouTube chose for them.
+    variants.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = head;
+    for (_, text) in variants {
+        out.push_str(&text);
+    }
+    out.push_str(&tail);
+    out
+}
+
+/// The `BANDWIDTH` of a `#EXT-X-STREAM-INF` line — the one attribute every variant must carry.
+///
+/// Zero when it is missing or unreadable, which sorts that variant last rather than first: a rung we
+/// cannot size is not one to open a trailer on.
+fn bandwidth(tag: &str) -> u64 {
+    // `AVERAGE-BANDWIDTH` ends in the same word, so the name only counts where an attribute may
+    // start: straight after the tag's colon or a separator.
+    let mut rest = tag;
+    while let Some(at) = rest.find("BANDWIDTH=") {
+        let starts = matches!(rest[..at].chars().next_back(), Some(':') | Some(','));
+        rest = &rest[at + "BANDWIDTH=".len()..];
+        if starts {
+            return rest.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
 /// Rewrite every URI in a playlist to go through `/seg`.
 ///
 /// A line is either a tag or a URI. A tag can carry one too — renditions, the initialisation segment
@@ -147,11 +231,12 @@ fn join(base: &str, reference: &str) -> String {
     format!("{origin}{dir}/{reference}")
 }
 
-/// `/hls/<vid>.m3u8`: the trailer's master playlist, rewritten.
+/// `/hls/<vid>.m3u8`: the trailer's master playlist, best variant first, and — unless `uris` says
+/// otherwise — with every URI in it rewritten to come back through `/seg`.
 ///
 /// Resolving goes through `/direct`'s own path, so a warm title costs a hash lookup and a title
 /// already resolving joins that resolve instead of starting a second one.
-pub async fn handle_master(state: Arc<AppState>, vid: String) -> Response<Body> {
+pub async fn handle_master(state: Arc<AppState>, vid: String, uris: Uris) -> Response<Body> {
     let (answer, spent) = crate::direct::answer(&state, &vid).await;
     let direct = match answer {
         Ok(d) => d,
@@ -169,7 +254,7 @@ pub async fn handle_master(state: Arc<AppState>, vid: String) -> Response<Body> 
         Some(d) => httputil::timing("resolve", d),
         None => "cache;desc=hit".to_string(),
     };
-    httputil::timed(through(&state, &master, &HeaderMap::new(), true).await, &timing)
+    httputil::timed(through(&state, &master, &HeaderMap::new(), true, uris).await, &timing)
 }
 
 /// `/hls/seg?u=…&s=…`: one upstream URL, checked and fetched. A playlist comes back rewritten like the
@@ -194,7 +279,8 @@ pub async fn handle_segment(state: Arc<AppState>, query: &str, headers: &HeaderM
             return refused();
         }
     }
-    through(&state, &url, headers, false).await
+    // Always proxied: only a player that cannot fetch Google itself is ever asking through here.
+    through(&state, &url, headers, false, Uris::Proxy).await
 }
 
 /// A URL nothing here will fetch. The same answer for a host we do not proxy and for a tag that does
@@ -205,7 +291,13 @@ fn refused() -> Response<Body> {
 
 /// Fetch one upstream URL and answer with it: rewritten when it is a playlist, streamed when it is
 /// not. `Range` travels in both directions, so a player can seek inside a segment.
-async fn through(state: &AppState, url: &str, headers: &HeaderMap, expect_playlist: bool) -> Response<Body> {
+async fn through(
+    state: &AppState,
+    url: &str,
+    headers: &HeaderMap,
+    expect_playlist: bool,
+    uris: Uris,
+) -> Response<Body> {
     let mut req = state.http.get(url).timeout(FETCH_TIMEOUT);
     if let Some(range) = headers.get(RANGE).and_then(|v| v.to_str().ok()) {
         req = req.header("range", range);
@@ -240,7 +332,7 @@ async fn through(state: &AppState, url: &str, headers: &HeaderMap, expect_playli
         .unwrap_or("")
         .to_ascii_lowercase();
     if expect_playlist || content_type.contains("mpegurl") {
-        return playlist(state, url, res).await;
+        return playlist(state, url, res, uris).await;
     }
     let mut out = Response::builder().status(status).header("cache-control", "private, max-age=3600");
     for name in ["content-type", "content-length", "content-range", "accept-ranges"] {
@@ -256,7 +348,7 @@ async fn through(state: &AppState, url: &str, headers: &HeaderMap, expect_playli
 }
 
 /// Read a playlist (bounded) and answer with every URI in it pointing back here.
-async fn playlist(state: &AppState, url: &str, res: reqwest::Response) -> Response<Body> {
+async fn playlist(state: &AppState, url: &str, res: reqwest::Response, uris: Uris) -> Response<Body> {
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -278,7 +370,13 @@ async fn playlist(state: &AppState, url: &str, res: reqwest::Response) -> Respon
     }
     let text = String::from_utf8_lossy(&buf);
     let secret = state.cfg.play_secret.as_deref();
-    let body = rewrite(&text, url, &|target: &str| proxied(secret, target));
+    let body = match uris {
+        Uris::Proxy => rewrite(&text, url, &|target: &str| proxied(secret, target)),
+        // Resolved against the playlist's own URL but otherwise untouched: a relative URI would
+        // resolve against THIS server now that the playlist is served from it.
+        Uris::Native => rewrite(&text, url, &|target: &str| target.to_string()),
+    };
+    let body = best_first(&body);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/vnd.apple.mpegurl")
@@ -359,6 +457,56 @@ mod tests {
         ] {
             assert!(!googlevideo(refused), "{refused}");
         }
+    }
+
+    /// The order a native player opens on: YouTube's own puts 240p first and 144p below 1080p.
+    #[test]
+    fn the_best_variant_is_listed_first() {
+        let playlist = "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=238435,RESOLUTION=426x240\n\
+             low.m3u8\n\
+             #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9,BANDWIDTH=4272159,RESOLUTION=1920x1080\n\
+             high.m3u8\n\
+             #EXT-X-STREAM-INF:RESOLUTION=256x144\n\
+             unsized.m3u8\n";
+        let out = best_first(playlist);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "#EXTM3U", "the header stays at the top");
+        assert!(lines[1].starts_with("#EXT-X-MEDIA"), "and so do the renditions: {out}");
+        assert!(lines[2].contains("BANDWIDTH=4272159"), "the best rung opens the ladder: {out}");
+        assert_eq!(lines[3], "high.m3u8", "each variant keeps its own URI: {out}");
+        assert_eq!(lines[5], "low.m3u8", "{out}");
+        // Nothing is dropped: a line that cannot hold the top rung still has every lower one.
+        assert_eq!(lines[7], "unsized.m3u8", "a variant with no bandwidth sorts last: {out}");
+    }
+
+    /// `AVERAGE-BANDWIDTH` ends in the same word and is not the number to sort on.
+    #[test]
+    fn a_variant_is_sized_by_the_attribute_of_that_name() {
+        assert_eq!(bandwidth("#EXT-X-STREAM-INF:BANDWIDTH=1234,RESOLUTION=1x1"), 1234);
+        assert_eq!(bandwidth("#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=7,BANDWIDTH=1234"), 1234);
+        assert_eq!(bandwidth("#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=7"), 0);
+        assert_eq!(bandwidth("#EXT-X-STREAM-INF:RESOLUTION=1x1"), 0);
+    }
+
+    /// Native: every URI is resolved rather than proxied, so the element fetches Google itself.
+    #[test]
+    fn a_native_playlist_keeps_googles_own_urls() {
+        let playlist = "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1\n\
+             /rooted.m3u8\n";
+        let out = rewrite(playlist, MASTER, &|url: &str| url.to_string());
+        assert!(!out.contains("seg?u="), "nothing comes back through this server: {out}");
+        assert!(out.contains("https://manifest.googlevideo.com/rooted.m3u8"), "{out}");
+        // Relative, and the master is served from HERE now: unresolved, it would point at this box.
+        assert!(
+            out.contains(
+                "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/audio.m3u8"
+            ),
+            "{out}"
+        );
     }
 
     /// A URL carries `&` and `=` of its own, which have to survive being carried inside a query.

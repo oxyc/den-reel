@@ -644,15 +644,22 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         return hls::handle_segment(state, query, &parts.headers).await;
     }
 
-    // HLS: /hls/<id>.m3u8 → YouTube's own master playlist, with every URI in it rewritten to come
-    // back through the route above. Signed like /direct, which is also the work it costs: one
-    // resolve, shared with whatever /meta already warmed.
+    // HLS: /hls/<id>.m3u8 → YouTube's own master playlist, best variant first, with every URI in it
+    // rewritten to come back through the route above. Signed like /direct, which is also the work it
+    // costs: one resolve, shared with whatever /meta already warmed.
+    //
+    // `?native=1` leaves the URIs on googlevideo, for a player that can fetch them itself: a bare
+    // `<video>` is not CORS-checked, so only the playlist crosses this box and none of the video.
     if let Some(id) = path.strip_prefix("/hls/").and_then(|r| r.strip_suffix(".m3u8")) {
         if is_valid_vid(id) {
             if !signature_ok(&state, id, query) {
                 return bad_signature();
             }
-            return hls::handle_master(state, id.to_string()).await;
+            let uris = match query_param(query, "native").as_deref() {
+                Some("1") => hls::Uris::Native,
+                _ => hls::Uris::Proxy,
+            };
+            return hls::handle_master(state, id.to_string(), uris).await;
         }
     }
 
