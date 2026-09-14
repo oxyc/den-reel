@@ -294,7 +294,8 @@ async fn playlist(state: &AppState, url: &str, res: reqwest::Response) -> Respon
 mod tests {
     use super::*;
 
-    const MASTER: &str = "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8";
+    const MASTER: &str =
+        "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1900/file/index.m3u8";
 
     fn proxy(url: &str) -> String {
         proxied(Some("s3cret"), url)
@@ -350,10 +351,10 @@ mod tests {
         assert!(googlevideo(url));
         assert!(googlevideo("https://manifest.googlevideo.com/api/manifest/hls_variant/x"));
         for refused in [
-            "http://r1.googlevideo.com/x",                  // plaintext
-            "https://evil.example/x",                       // not YouTube at all
-            "https://googlevideo.com.evil.example/x",       // a suffix, not the host
-            "https://r1.googlevideo.com@evil.example/x",    // the host is what follows the @
+            "http://r1.googlevideo.com/x",               // plaintext
+            "https://evil.example/x",                    // not YouTube at all
+            "https://googlevideo.com.evil.example/x",    // a suffix, not the host
+            "https://r1.googlevideo.com@evil.example/x", // the host is what follows the @
             "file:///etc/passwd",
         ] {
             assert!(!googlevideo(refused), "{refused}");
