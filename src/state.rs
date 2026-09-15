@@ -23,8 +23,9 @@ pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send +
 /// YouTube-search fallback: query → candidate video ids. Injectable so tests stay hermetic.
 pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Option<Vec<String>>> + Send + Sync>;
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
-/// A direct warm-up: the id, and the height cap the request that follows will ask for.
-pub type DirectWarmFn = Box<dyn Fn(Arc<AppState>, String, Option<u32>) + Send + Sync>;
+/// A direct warm-up: the id, the height cap the request that follows will ask for, and whether to build
+/// `/progressive`'s index too (`Some`, with its sound when `true`).
+pub type DirectWarmFn = Box<dyn Fn(Arc<AppState>, String, Option<u32>, Option<bool>) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
 pub type SharedDownload = Shared<BoxFuture<Result<crate::play::Fetched, PlayError>>>;
@@ -308,7 +309,9 @@ pub fn default_prewarm() -> PrewarmFn {
 
 /// Real direct warm-up: resolve into the cache so the `/direct` that follows is a hash lookup.
 pub fn default_direct_warm() -> DirectWarmFn {
-    Box::new(|state: Arc<AppState>, id: String, cap: Option<u32>| crate::direct::warm(state, id, cap))
+    Box::new(|state: Arc<AppState>, id: String, cap: Option<u32>, index: Option<bool>| {
+        crate::direct::warm(state, id, cap, index)
+    })
 }
 
 /// Read the resolve cache left by the previous process, dropping whatever no longer holds.

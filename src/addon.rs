@@ -407,18 +407,22 @@ pub async fn resolve_youtube_ids(
     Resolved { ids, stale: substituted, degraded, timing }
 }
 
-/// What `/meta` should get ready, read from `?prewarm=`: the download, and the direct resolve.
+/// What `/meta` should get ready, read from `?prewarm=`: the download, the direct resolve, and
+/// `/progressive`'s index.
 ///
-/// `0` asks for neither. `direct` asks for the resolve alone, which is what a browser wants — it
+/// `0` asks for none. `direct` asks for the resolve alone, which is what a browser wants — it
 /// plays YouTube's own URL and will never read the downloaded file, so the download is a yt-dlp and
-/// an ffmpeg competing for the box with the very resolve it is waiting on. Anything else is both,
-/// which is what the Apple TV needs and what a browser with no native HLS needs too: without it
-/// `/play` is its only source of sound, and it would be cold exactly when it was wanted.
-pub(crate) fn prewarm_choice(asked: Option<&str>) -> (bool, bool) {
+/// an ffmpeg competing for the box with the very resolve it is waiting on. `progressive` asks for the
+/// resolve and then the index a `/progressive` request would otherwise build while its player waits.
+/// Anything else is the download and the resolve, which is what the Apple TV needs and what a browser
+/// with no native HLS needs too: without it `/play` is its only source of sound, and it would be cold
+/// exactly when it was wanted.
+pub(crate) fn prewarm_choice(asked: Option<&str>) -> (bool, bool, bool) {
     match asked {
-        Some("0") => (false, false),
-        Some("direct") => (false, true),
-        _ => (true, true),
+        Some("0") => (false, false, false),
+        Some("direct") => (false, true, false),
+        Some("progressive") => (false, true, true),
+        _ => (true, true, false),
     }
 }
 
@@ -479,7 +483,7 @@ pub async fn handle_meta(
     // a primary that is STILL known dead means every candidate is — so there is nothing worth
     // speculatively fetching, and the permit is better left for a /play someone is waiting on.
     if let Some(primary) = yt_ids.first() {
-        let (download, direct) = prewarm_choice(query_param(query, "prewarm").as_deref());
+        let (download, direct, progressive) = prewarm_choice(query_param(query, "prewarm").as_deref());
         if !demotion.head_dead {
             if download {
                 (state.prewarm)(state.clone(), primary.clone());
@@ -492,7 +496,9 @@ pub async fn handle_meta(
             // At the `?height=` the `/direct` that follows will ask for, or that is a second resolve.
             if direct {
                 let cap = crate::direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
-                (state.direct_warm)(state.clone(), primary.clone(), cap);
+                // And `?audio=` as the `/progressive` request will carry it, or the index is for the other file.
+                let index = progressive.then(|| query_param(query, "audio").as_deref() == Some("1"));
+                (state.direct_warm)(state.clone(), primary.clone(), cap, index);
             }
         }
     }

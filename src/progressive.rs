@@ -15,12 +15,13 @@
 //! asked for. No media is decoded, re-muxed or stored: what is kept is the index, for as long as
 //! Google's URL lives.
 //!
-//! **Video only.** It serves the stream `/direct` names as `video`, which is the muted surfaces' whole
-//! need; anything with sound takes HLS.
+//! **Sound when asked.** It serves the stream `/direct` names as `video`, which is a muted surface's
+//! whole need, and with `?audio=1` the `audio` stream too: YouTube's audio is fragmented the same way,
+//! so its index is built the same way and the file carries both tracks, their chunks interleaved by time.
 //!
 //! **Anything it cannot index is sent to Google.** A file that is not fragmented, a box it cannot read,
 //! or a fetch that fails answers `302` to the raw URL — which is exactly what the page played before —
-//! and says why in the log.
+//! and says why in the log. With sound asked for it answers an error instead: the raw URL has none.
 
 use std::io;
 use std::ops::Range;
@@ -32,7 +33,7 @@ use futures_util::future::Shared;
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::{HeaderMap, IF_RANGE, RANGE};
+use hyper::header::{HeaderMap, HeaderValue, IF_RANGE, RANGE};
 use hyper::{Response, StatusCode};
 use tokio::sync::mpsc;
 
@@ -76,7 +77,10 @@ fn unreadable(why: impl Into<String>) -> Unbuilt {
 /// A build shared by every request for the same stream, finished or not.
 pub type SharedLayout = Shared<BoxFuture<Result<Arc<Layout>, Unbuilt>>>;
 
-/// One kept build: the URL it indexes, when to stop using it (epoch ms), and the build.
+/// One file `layout` reads: its `moov` box, and its `moof`s with their offsets in that file.
+pub(crate) type Source<'a> = (&'a [u8], &'a [(u64, Bytes)]);
+
+/// One kept build: the URLs it indexes (one per line), when to stop using it (epoch ms), and the build.
 pub type Entry = (String, u64, SharedLayout);
 
 /// The file this serves: `head` (ftyp, the built moov, the mdat header), then each piece of Google's
@@ -89,10 +93,12 @@ pub struct Layout {
     pub etag: String,
 }
 
-/// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's.
+/// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's file `source`
+/// (the video, or its audio).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Piece {
     pub at: u64,
+    pub source: usize,
     pub from: u64,
     pub len: u64,
 }
@@ -421,13 +427,52 @@ fn after_times(b: &[u8], a: Atom) -> Result<u32, Unbuilt> {
     be32(b, a.body + if v1 { 20 } else { 12 })
 }
 
-/// The whole served header — ftyp, a moov with real sample tables, the mdat header — for a fragmented
-/// file whose `moov` box is `moov` and whose `moof`s (each with its offset in Google's file) are `moofs`.
-pub(crate) fn layout(moov: &[u8], moofs: &[(u64, Bytes)]) -> Result<Layout, Unbuilt> {
+/// The big-endian `u32` at `at` in the copy of a `kind` box set to `value`.
+fn put_u32(b: &mut [u8], at: usize, value: u32, kind: &[u8; 4]) -> Result<(), Unbuilt> {
+    let slot = b.get_mut(at..at + 4).ok_or_else(|| unreadable(format!("a {} box ends early", name(kind))))?;
+    slot.copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+/// One source's track as read: its `moov`, where the boxes this rewrites sit in it, and every sample its
+/// fragments carry.
+struct Read<'a> {
+    moov: &'a [u8],
+    root: Atom,
+    trak: Atom,
+    stsd: Atom,
+    movie_scale: u64,
+    media_scale: u64,
+    samples: Samples,
+}
+
+impl Read<'_> {
+    fn media_duration(&self) -> u64 {
+        self.samples.durations.iter().map(|d| *d as u64).sum()
+    }
+
+    /// Where each chunk starts, in this track's own ticks.
+    fn chunk_starts(&self) -> Vec<u64> {
+        let mut starts = Vec::with_capacity(self.samples.chunks.len());
+        let (mut sample, mut ticks) = (0usize, 0u64);
+        for &(_, _, count) in &self.samples.chunks {
+            starts.push(ticks);
+            let next = sample + count as usize;
+            ticks += self.samples.durations[sample..next].iter().map(|d| *d as u64).sum::<u64>();
+            sample = next;
+        }
+        starts
+    }
+}
+
+/// Read the one track of a fragmented file whose `moov` box is `moov` and whose `moof`s (each with its
+/// offset in that file) are `moofs`.
+fn read_track<'a>(moov: &'a [u8], moofs: &[(u64, Bytes)]) -> Result<Read<'a>, Unbuilt> {
     let root = find(&atoms(moov, 0, moov.len(), false)?, b"moov")?;
     let kids = atoms(moov, root.body, root.end, false)?;
     let mvhd = find(&kids, b"mvhd")?;
-    let trex = find(&atoms(moov, find(&kids, b"mvex")?.body, find(&kids, b"mvex")?.end, false)?, b"trex")?;
+    let mvex = find(&kids, b"mvex")?;
+    let trex = find(&atoms(moov, mvex.body, mvex.end, false)?, b"trex")?;
     let traks: Vec<Atom> = kids.iter().copied().filter(|a| &a.kind == b"trak").collect();
     let [trak] = traks[..] else {
         return Err(unreadable(format!("{} tracks, where one was expected", traks.len())));
@@ -447,41 +492,95 @@ pub(crate) fn layout(moov: &[u8], moofs: &[(u64, Bytes)]) -> Result<Layout, Unbu
         size: be32(moov, trex.body + 16)?,
         flags: be32(moov, trex.body + 20)?,
     };
-    let mut s = Samples::default();
+    let mut samples = Samples::default();
     for (at, bytes) in moofs {
-        read_fragment(bytes, *at, &track, &mut s)?;
+        read_fragment(bytes, *at, &track, &mut samples)?;
     }
-    if s.sizes.is_empty() {
+    if samples.sizes.is_empty() {
         return Err(unreadable("fragments with no samples"));
     }
+    Ok(Read {
+        moov,
+        root,
+        trak,
+        stsd,
+        movie_scale: after_times(moov, mvhd)? as u64,
+        media_scale: after_times(moov, mdhd)? as u64,
+        samples,
+    })
+}
 
-    let media_duration: u64 = s.durations.iter().map(|d| *d as u64).sum();
-    let (movie_scale, media_scale) = (after_times(moov, mvhd)? as u64, after_times(moov, mdhd)? as u64);
-    let movie_duration = (media_duration * movie_scale).checked_div(media_scale).unwrap_or(0);
-    let payload: u64 = s.chunks.iter().map(|c| c.1).sum();
+/// `r`'s `trak` as track `id`, with real sample tables whose chunks sit at `offsets`. An `edts` counts in
+/// its own movie's timescale, so it is dropped where that is not the one the served file keeps.
+fn trak_out(r: &Read, id: u32, movie_scale: u64, offsets: &[u32]) -> Result<Vec<u8>, Unbuilt> {
+    let media_duration = r.media_duration();
+    let movie_duration = (media_duration * movie_scale).checked_div(r.media_scale).unwrap_or(0);
+    let stbl = sample_table(&r.moov[r.stsd.start..r.stsd.end], &r.samples, offsets);
+    let moov = r.moov;
+    rebuilt(moov, r.trak, &|a| {
+        Ok(match &a.kind {
+            b"tkhd" => {
+                let mut tkhd = with_duration(moov, a, movie_duration)?;
+                let v1 = tkhd.get(a.body - a.start) == Some(&1);
+                put_u32(&mut tkhd, a.body - a.start + if v1 { 20 } else { 12 }, id, b"tkhd")?;
+                Some(tkhd)
+            }
+            b"edts" if r.movie_scale != movie_scale => Some(Vec::new()),
+            b"mdia" => Some(rebuilt(moov, a, &|a| {
+                Ok(match &a.kind {
+                    b"mdhd" => Some(with_duration(moov, a, media_duration)?),
+                    b"minf" => Some(rebuilt(moov, a, &|a| Ok((&a.kind == b"stbl").then(|| stbl.clone())))?),
+                    _ => None,
+                })
+            })?),
+            _ => None,
+        })
+    })
+}
 
-    // mvex is what marks a file as fragmented; without it the tables below are the whole index.
-    let moov_with = |offsets: &[u32]| -> Result<Vec<u8>, Unbuilt> {
-        let stbl = sample_table(&moov[stsd.start..stsd.end], &s, offsets);
-        rebuilt(moov, root, &|a| {
+/// The whole served header — ftyp, a moov with real sample tables, the mdat header — and where each
+/// chunk of media sits, for fragmented files holding one track each: `sources`, each its `moov` box and
+/// its `moof`s with their offsets in that file. The first source's movie header is kept, the tracks are
+/// numbered in order, and their chunks are interleaved by time, so a player reading along the file never
+/// has to jump between far-apart parts of it for picture and sound.
+pub(crate) fn layout(sources: &[Source]) -> Result<Layout, Unbuilt> {
+    let reads = sources.iter().map(|(moov, moofs)| read_track(moov, moofs)).collect::<Result<Vec<_>, _>>()?;
+    let first = reads.first().ok_or_else(|| unreadable("no stream to index"))?;
+    let movie_scale = first.movie_scale;
+    let movie_duration = reads
+        .iter()
+        .map(|r| (r.media_duration() * movie_scale).checked_div(r.media_scale).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+
+    // Every chunk in time order across the tracks. The sort is stable, so a tie keeps the tracks' order
+    // and each track's own chunks stay in theirs.
+    let starts: Vec<Vec<u64>> = reads.iter().map(Read::chunk_starts).collect();
+    let mut order: Vec<(usize, usize)> =
+        starts.iter().enumerate().flat_map(|(t, s)| (0..s.len()).map(move |c| (t, c))).collect();
+    order.sort_by(|&(ta, ca), &(tb, cb)| {
+        let a = starts[ta][ca] as u128 * reads[tb].media_scale as u128;
+        let b = starts[tb][cb] as u128 * reads[ta].media_scale as u128;
+        a.cmp(&b)
+    });
+
+    let moov_with = |offsets: &[Vec<u32>]| -> Result<Vec<u8>, Unbuilt> {
+        let mut traks = Vec::new();
+        for (i, r) in reads.iter().enumerate() {
+            traks.extend(trak_out(r, i as u32 + 1, movie_scale, &offsets[i])?);
+        }
+        rebuilt(first.moov, first.root, &|a| {
             Ok(match &a.kind {
+                // mvex is what marks a file as fragmented; without it the tables are the whole index.
                 b"mvex" => Some(Vec::new()),
-                b"mvhd" => Some(with_duration(moov, a, movie_duration)?),
-                b"trak" => Some(rebuilt(moov, a, &|a| {
-                    Ok(match &a.kind {
-                        b"tkhd" => Some(with_duration(moov, a, movie_duration)?),
-                        b"mdia" => Some(rebuilt(moov, a, &|a| {
-                            Ok(match &a.kind {
-                                b"mdhd" => Some(with_duration(moov, a, media_duration)?),
-                                b"minf" => Some(rebuilt(moov, a, &|a| {
-                                    Ok((&a.kind == b"stbl").then(|| stbl.clone()))
-                                })?),
-                                _ => None,
-                            })
-                        })?),
-                        _ => None,
-                    })
-                })?),
+                b"mvhd" => {
+                    let mut mvhd = with_duration(first.moov, a, movie_duration)?;
+                    let v1 = mvhd.get(a.body - a.start) == Some(&1);
+                    let next = a.body - a.start + if v1 { 108 } else { 96 };
+                    put_u32(&mut mvhd, next, reads.len() as u32 + 1, b"mvhd")?;
+                    Some(mvhd)
+                }
+                b"trak" => Some(traks.clone()),
                 _ => None,
             })
         })
@@ -489,18 +588,20 @@ pub(crate) fn layout(moov: &[u8], moofs: &[(u64, Bytes)]) -> Result<Layout, Unbu
 
     let ftyp = boxed(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41");
     // The chunk offsets depend on the moov's length, which does not depend on their values.
-    let draft = moov_with(&vec![0; s.chunks.len()])?;
+    let mut offsets: Vec<Vec<u32>> = reads.iter().map(|r| vec![0; r.samples.chunks.len()]).collect();
+    let draft = moov_with(&offsets)?;
+    let payload: u64 = reads.iter().flat_map(|r| r.samples.chunks.iter().map(|c| c.1)).sum();
     let mdat_start = (ftyp.len() + draft.len() + 8) as u64;
     if mdat_start + payload > u32::MAX as u64 {
         return Err(unreadable("too large for 32-bit chunk offsets"));
     }
-    let mut pieces = Vec::with_capacity(s.chunks.len());
-    let mut offsets = Vec::with_capacity(s.chunks.len());
+    let mut pieces = Vec::with_capacity(order.len());
     let mut at = mdat_start;
-    for &(from, len, _) in &s.chunks {
-        offsets.push(at as u32);
+    for (t, c) in order {
+        let (from, len, _) = reads[t].samples.chunks[c];
+        offsets[t][c] = at as u32;
         if len > 0 {
-            pieces.push(Piece { at, from, len });
+            pieces.push(Piece { at, source: t, from, len });
         }
         at += len;
     }
@@ -512,11 +613,11 @@ pub(crate) fn layout(moov: &[u8], moofs: &[(u64, Bytes)]) -> Result<Layout, Unbu
     Ok(Layout { total: mdat_start + payload, head: head.into(), pieces, etag })
 }
 
-/// What serving `start..=end` of a layout takes: some of the header, then ranges of Google's file.
+/// What serving `start..=end` of a layout takes: some of the header, then ranges of Google's files.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Part {
     Inline(Bytes),
-    Remote { from: u64, to: u64 },
+    Remote { source: usize, from: u64, to: u64 },
 }
 
 pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
@@ -531,7 +632,7 @@ pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
             break;
         }
         let (s, e) = (start.max(p.at), end.min(p.at + p.len - 1));
-        out.push(Part::Remote { from: p.from + (s - p.at), to: p.from + (e - p.at) });
+        out.push(Part::Remote { source: p.source, from: p.from + (s - p.at), to: p.from + (e - p.at) });
     }
     out
 }
@@ -565,39 +666,54 @@ async fn moof(http: &reqwest::Client, url: &str, at: u64, size: u64) -> Result<(
     Ok((at, fetch(http, url, at, at + len - 1).await?))
 }
 
-async fn build(http: &reqwest::Client, url: &str) -> Result<Layout, Unbuilt> {
-    let head = fetch(http, url, 0, HEAD_BYTES - 1).await?;
+/// One file's first bytes, where its `moov` sits in them, and its `moof`s with their offsets.
+async fn read_source(
+    http: &reqwest::Client,
+    url: String,
+) -> Result<(Bytes, Range<usize>, Vec<(u64, Bytes)>), Unbuilt> {
+    let head = fetch(http, &url, 0, HEAD_BYTES - 1).await?;
     let index = index(&head)?;
     // Owned pairs: a closure over borrowed ones is not general enough for a future that must be Send.
     let moofs: Vec<(u64, Bytes)> =
-        futures_util::stream::iter(index.fragments.into_iter().map(|(at, size)| moof(http, url, at, size)))
+        futures_util::stream::iter(index.fragments.into_iter().map(|(at, size)| moof(http, &url, at, size)))
             .buffered(MOOF_FETCHES)
             .try_collect()
             .await?;
-    layout(&head[index.moov], &moofs)
+    Ok((head, index.moov, moofs))
 }
 
-/// The index for `source`, kept under `key` until `until`, built once however many ask. The timing is
+/// The layout for `urls`: the video stream, and its audio where that was asked for. Both files are read
+/// at once.
+async fn build(http: &reqwest::Client, urls: &[String]) -> Result<Layout, Unbuilt> {
+    let read =
+        futures_util::future::try_join_all(urls.iter().cloned().map(|url| read_source(http, url))).await?;
+    let sources: Vec<Source> =
+        read.iter().map(|(head, moov, moofs)| (&head[moov.clone()], moofs.as_slice())).collect();
+    layout(&sources)
+}
+
+/// The index for `urls`, kept under `key` until `until`, built once however many ask. The timing is
 /// `None` when it was already built.
 async fn layout_for(
     state: &Arc<AppState>,
     key: &str,
-    source: &str,
+    urls: &[String],
     until: u64,
 ) -> (Result<Arc<Layout>, Unbuilt>, Option<Duration>) {
     let now = (state.clock)();
+    let source = urls.join("\n");
     let shared = {
         let mut map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(key) {
-            Some((url, kept_until, shared)) if url == source && *kept_until > now => shared.clone(),
+            Some((kept, kept_until, shared)) if *kept == source && *kept_until > now => shared.clone(),
             _ => {
-                let (st, url, k) = (state.clone(), source.to_string(), key.to_string());
+                let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {
-                    let built = build(&st.http, &url).await.map(Arc::new);
+                    let built = build(&st.http, &urls).await.map(Arc::new);
                     // A fetch that failed may work next time; a file that cannot be indexed will not.
                     if matches!(&built, Err(e) if e.retry) {
                         let mut map = st.progressive.lock().unwrap_or_else(|e| e.into_inner());
-                        if map.get(&k).is_some_and(|(u, _, _)| *u == url) {
+                        if map.get(&k).is_some_and(|(kept, _, _)| *kept == s) {
                             map.remove(&k);
                         }
                     }
@@ -610,7 +726,7 @@ async fn layout_for(
                         map.clear();
                     }
                 }
-                map.insert(key.to_string(), (source.to_string(), until, shared.clone()));
+                map.insert(key.to_string(), (source, until, shared.clone()));
                 // Driven by a task of its own, so a player that gives up mid-build leaves a finished
                 // index rather than a future nobody polls.
                 let driver = shared.clone();
@@ -669,13 +785,13 @@ async fn relay(
 }
 
 /// The response body for `parts`, fetched in order by a task that stops when the player hangs up.
-fn body(http: reqwest::Client, url: String, parts: Vec<Part>) -> Body {
+fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
     let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(4);
     tokio::spawn(async move {
         for part in parts {
             let going = match part {
                 Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
-                Part::Remote { from, to } => relay(&http, &url, from, to, &tx).await,
+                Part::Remote { source, from, to } => relay(&http, &urls[source], from, to, &tx).await,
             };
             if !going {
                 return;
@@ -686,7 +802,13 @@ fn body(http: reqwest::Client, url: String, parts: Vec<Part>) -> Body {
     BodyExt::boxed(StreamBody::new(stream))
 }
 
-fn serve(state: &AppState, layout: &Layout, url: &str, headers: &HeaderMap, max_age: u64) -> Response<Body> {
+fn serve(
+    state: &AppState,
+    layout: &Layout,
+    urls: &[String],
+    headers: &HeaderMap,
+    max_age: u64,
+) -> Response<Body> {
     let total = layout.total;
     // A range against a different file than the player holds gets the whole file instead.
     let current = match headers.get(IF_RANGE).and_then(|v| v.to_str().ok()) {
@@ -716,15 +838,49 @@ fn serve(state: &AppState, layout: &Layout, url: &str, headers: &HeaderMap, max_
     if status == StatusCode::PARTIAL_CONTENT {
         out = out.header("content-range", format!("bytes {start}-{end}/{total}"));
     }
-    out.body(body(state.http.clone(), url.to_string(), parts(layout, start, end))).unwrap()
+    out.body(body(state.http.clone(), urls.to_vec(), parts(layout, start, end))).unwrap()
 }
 
-/// `/progressive/<vid>.mp4`: the stream `/direct` would name, with its index first.
+/// Where `vid`'s served file comes from — its video stream, and its audio when `audio` asks and YouTube
+/// answered with one apart — and the key its index is kept under.
+fn streams(
+    vid: &str,
+    cap: Option<u32>,
+    direct: &crate::direct::Direct,
+    audio: bool,
+) -> (String, Vec<String>) {
+    let key = crate::direct::key(vid, cap);
+    match (&direct.audio, audio) {
+        (Some(sound), true) => (format!("{key}+audio"), vec![direct.video.clone(), sound.clone()]),
+        _ => (key, vec![direct.video.clone()]),
+    }
+}
+
+/// Build a stream's index ahead of the request that will play it, as `/meta?prewarm=progressive` asks, so
+/// that request costs a lookup rather than a round of range requests. `direct` is the resolve the warm-up
+/// has just finished.
+pub(crate) async fn warm(
+    state: &Arc<AppState>,
+    vid: &str,
+    cap: Option<u32>,
+    direct: &crate::direct::Direct,
+    audio: bool,
+) {
+    let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
+    let (key, urls) = streams(vid, cap, direct, audio);
+    if let (Err(e), _) = layout_for(state, &key, &urls, until).await {
+        crate::log_limited("progressive warm", || format!("[{vid}] no index built ahead ({})", e.why));
+    }
+}
+
+/// `/progressive/<vid>.mp4`: the stream `/direct` would name, with its index first, and its sound with it
+/// when `audio` asks.
 pub async fn handle_progressive(
     state: Arc<AppState>,
     headers: &HeaderMap,
     vid: String,
     cap: Option<u32>,
+    audio: bool,
 ) -> Response<Body> {
     let (answer, spent) = crate::direct::answer(&state, &vid, cap).await;
     let mut timing = match spent {
@@ -737,13 +893,25 @@ pub async fn handle_progressive(
     };
     let now = (state.clock)();
     let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
-    let (built, spent) = layout_for(&state, &crate::direct::key(&vid, cap), &direct.video, until).await;
+    let (key, urls) = streams(&vid, cap, &direct, audio);
+    let (built, spent) = layout_for(&state, &key, &urls, until).await;
     if let Some(d) = spent {
         timing.push_str(", ");
         timing.push_str(&httputil::timing("index", d));
     }
     let resp = match built {
-        Ok(layout) => serve(&state, &layout, &direct.video, headers, until.saturating_sub(now) / 1000),
+        Ok(layout) => serve(&state, &layout, &urls, headers, until.saturating_sub(now) / 1000),
+        // Google's raw video URL has no sound, so where sound was asked for that is not an answer.
+        Err(e) if urls.len() > 1 => {
+            crate::log_limited("progressive audio", || format!("[{vid}] no index with sound ({})", e.why));
+            let mut resp = httputil::error(
+                StatusCode::BAD_GATEWAY,
+                "progressive_unavailable",
+                "Could not index this trailer with its sound.",
+            );
+            resp.headers_mut().insert("x-den-degraded", HeaderValue::from_static("progressive_unavailable"));
+            resp
+        }
         Err(e) => {
             let reason = if e.retry { "progressive fetch" } else { "progressive layout" };
             crate::log_limited(reason, || format!("[{vid}] no index ({}); sending the raw stream", e.why));
@@ -777,15 +945,16 @@ mod tests {
         boxed(kind, &parts.concat())
     }
 
-    /// The byte every sample `i` of fragment `f` is filled with, so a misplaced byte shows.
-    fn fill(f: usize, i: usize) -> u8 {
-        (f * 16 + i + 1) as u8
+    /// The byte every sample `i` of fragment `f` of file `mark` is filled with, so a misplaced byte shows.
+    fn fill(mark: usize, f: usize, i: usize) -> u8 {
+        (mark * 64 + f * 16 + i + 1) as u8
     }
 
-    /// A file shaped like YouTube's adaptive video: a moov with empty sample tables and an mvex, a sidx,
-    /// then one moof+mdat per entry of `fragments` (each a list of sample sizes). Only the first sample
-    /// of a fragment is a sync sample, as trex's default flags say.
-    fn fragmented(fragments: &[&[u32]]) -> Vec<u8> {
+    /// A file shaped like YouTube's adaptive streams: a moov with empty sample tables and an mvex, a sidx,
+    /// then one moof+mdat per entry of `fragments` (each a list of sample sizes, each sample 1001 of 24000
+    /// long), its samples filled by `mark`. Only the first sample of a fragment is a sync sample, as trex's
+    /// default flags say.
+    fn fragmented(fragments: &[&[u32]], mark: usize) -> Vec<u8> {
         let stbl = make(
             b"stbl",
             &[
@@ -836,7 +1005,7 @@ mod tests {
             let data: Vec<u8> = sizes
                 .iter()
                 .enumerate()
-                .flat_map(|(i, &z)| std::iter::repeat_n(fill(f, i), z as usize))
+                .flat_map(|(i, &z)| std::iter::repeat_n(fill(mark, f, i), z as usize))
                 .collect();
             pairs.push([moof, make(b"mdat", &[&data])].concat());
         }
@@ -848,24 +1017,31 @@ mod tests {
         [make(b"ftyp", &[b"dash\0\0\0\0iso6mp41"]), moov, make(b"sidx", &[&sidx]), pairs.concat()].concat()
     }
 
-    /// The layout for a whole file held in memory, fetching its moofs as `build` would.
-    fn layout_of(file: &[u8]) -> Result<Layout, Unbuilt> {
-        let index = index(file)?;
-        let moofs: Vec<(u64, Bytes)> = index
-            .fragments
-            .iter()
-            .map(|&(at, size)| (at, Bytes::copy_from_slice(&file[at as usize..(at + size) as usize])))
-            .collect();
-        layout(&file[index.moov], &moofs)
+    /// The layout for whole files held in memory, their moofs read as `build` would fetch them.
+    fn layout_of(files: &[&[u8]]) -> Result<Layout, Unbuilt> {
+        let mut read = Vec::new();
+        for file in files {
+            let index = index(file)?;
+            let moofs: Vec<(u64, Bytes)> = index
+                .fragments
+                .iter()
+                .map(|&(at, size)| (at, Bytes::copy_from_slice(&file[at as usize..(at + size) as usize])))
+                .collect();
+            read.push((&file[index.moov], moofs));
+        }
+        let sources: Vec<Source> = read.iter().map(|(moov, moofs)| (*moov, &moofs[..])).collect();
+        layout(&sources)
     }
 
-    /// What a player receives for `start..=end`, with the remote parts read from `file`.
-    fn served(file: &[u8], l: &Layout, start: u64, end: u64) -> Vec<u8> {
+    /// What a player receives for `start..=end`, with the remote parts read from `files`.
+    fn served(files: &[&[u8]], l: &Layout, start: u64, end: u64) -> Vec<u8> {
         let mut out = Vec::new();
         for part in parts(l, start, end) {
             match part {
                 Part::Inline(bytes) => out.extend_from_slice(&bytes),
-                Part::Remote { from, to } => out.extend_from_slice(&file[from as usize..=to as usize]),
+                Part::Remote { source, from, to } => {
+                    out.extend_from_slice(&files[source][from as usize..=to as usize])
+                }
             }
         }
         out
@@ -889,9 +1065,9 @@ mod tests {
     /// sample bytes Google's fragments carried.
     #[test]
     fn a_fragmented_file_is_served_with_its_index_first() {
-        let file = fragmented(&[&[5, 3, 4], &[6, 2]]);
-        let l = layout_of(&file).expect("a layout");
-        let out = served(&file, &l, 0, l.total - 1);
+        let file = fragmented(&[&[5, 3, 4], &[6, 2]], 0);
+        let l = layout_of(&[&file]).expect("a layout");
+        let out = served(&[&file], &l, 0, l.total - 1);
         assert_eq!(out.len() as u64, l.total);
 
         let top: Vec<[u8; 4]> = atoms(&out, 0, out.len(), false).unwrap().iter().map(|a| a.kind).collect();
@@ -907,9 +1083,9 @@ mod tests {
         assert_eq!(table(&out, &at(b"stsc"), 0), [2, 1, 3, 1, 2, 2, 1]);
         let chunks = table(&out, &at(b"stco"), 0);
         assert_eq!(chunks[0], 2);
-        assert_eq!(out[chunks[1] as usize], fill(0, 0));
-        assert_eq!(out[chunks[2] as usize], fill(1, 0));
-        assert_eq!(out[chunks[2] as usize + 6], fill(1, 1));
+        assert_eq!(out[chunks[1] as usize], fill(0, 0, 0));
+        assert_eq!(out[chunks[2] as usize], fill(0, 1, 0));
+        assert_eq!(out[chunks[2] as usize + 6], fill(0, 1, 1));
         assert_eq!(table(&out, &[b"moov", b"trak", b"mdia", b"mdhd"], 12)[0], 5 * 1001, "mdhd duration");
         assert!(!payload(&out, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"])
             .windows(4)
@@ -920,23 +1096,56 @@ mod tests {
     /// maps onto just the bytes of Google's file that it covers.
     #[test]
     fn a_range_maps_onto_the_header_and_the_fragments_it_covers() {
-        let file = fragmented(&[&[5, 3, 4], &[6, 2]]);
-        let l = layout_of(&file).unwrap();
-        let whole = served(&file, &l, 0, l.total - 1);
+        let file = fragmented(&[&[5, 3, 4], &[6, 2]], 0);
+        let l = layout_of(&[&file]).unwrap();
+        let whole = served(&[&file], &l, 0, l.total - 1);
         let (first, second) = (l.pieces[0], l.pieces[1]);
         let (start, end) = (l.head.len() as u64 - 2, second.at);
         assert_eq!(
             parts(&l, start, end),
             [
                 Part::Inline(l.head.slice(l.head.len() - 2..)),
-                Part::Remote { from: first.from, to: first.from + first.len - 1 },
-                Part::Remote { from: second.from, to: second.from },
+                Part::Remote { source: 0, from: first.from, to: first.from + first.len - 1 },
+                Part::Remote { source: 0, from: second.from, to: second.from },
             ]
         );
         for (start, end) in
             [(0, 0), (3, first.at + 1), (first.at + 2, first.at + 4), (second.at + 1, l.total - 1)]
         {
-            assert_eq!(served(&file, &l, start, end), whole[start as usize..=end as usize], "{start}-{end}");
+            assert_eq!(
+                served(&[&file], &l, start, end),
+                whole[start as usize..=end as usize],
+                "{start}-{end}"
+            );
+        }
+    }
+
+    /// With sound, the served file carries both tracks, numbered 1 and 2 and each with tables pointing at
+    /// its own bytes, and their chunks alternate by time rather than all the picture before all the sound.
+    #[test]
+    fn a_video_and_its_audio_are_served_as_one_file_interleaved_by_time() {
+        // The video's fragments start at 0 and 3003 of 24000, the audio's at 0, 2002 and 4004.
+        let video = fragmented(&[&[5, 3, 4], &[6, 2, 1]], 0);
+        let audio = fragmented(&[&[2, 2], &[2, 2], &[2, 2]], 1);
+        let l = layout_of(&[&video, &audio]).expect("a layout");
+        let sources: Vec<usize> = l.pieces.iter().map(|p| p.source).collect();
+        assert_eq!(sources, [0, 1, 1, 0, 1], "chunks in time order, the picture first on a tie");
+        let out = served(&[&video, &audio], &l, 0, l.total - 1);
+        assert_eq!(out.len() as u64, l.total);
+
+        let moov = find(&atoms(&out, 0, out.len(), false).unwrap(), b"moov").unwrap();
+        let kids = atoms(&out, moov.body, moov.end, false).unwrap();
+        assert_eq!(be32(&out, find(&kids, b"mvhd").unwrap().body + 96).unwrap(), 3, "next_track_ID");
+        let traks: Vec<Atom> = kids.iter().copied().filter(|a| &a.kind == b"trak").collect();
+        assert_eq!(traks.len(), 2);
+        for (i, trak) in traks.iter().enumerate() {
+            let tkhd = find(&atoms(&out, trak.body, trak.end, false).unwrap(), b"tkhd").unwrap();
+            assert_eq!(be32(&out, tkhd.body + 12).unwrap(), i as u32 + 1, "track id");
+            let stco = payload(&out[trak.body..trak.end], &[b"mdia", b"minf", b"stbl", b"stco"]);
+            for (f, at) in stco[8..].chunks(4).map(|c| u32::from_be_bytes(c.try_into().unwrap())).enumerate()
+            {
+                assert_eq!(out[at as usize], fill(i, f, 0), "track {} chunk {f}", i + 1);
+            }
         }
     }
 
@@ -949,18 +1158,20 @@ mod tests {
         assert!(!e.retry, "a file that cannot be indexed is not worth asking again");
     }
 
-    /// Against a real googlevideo URL: `REEL_PROGRESSIVE_URL=<video url> REEL_PROGRESSIVE_OUT=<path>`
-    /// writes the served file, for `ffprobe` or a browser to judge.
+    /// Against real googlevideo URLs: `REEL_PROGRESSIVE_URL=<video url> REEL_PROGRESSIVE_OUT=<path>`, with
+    /// `REEL_PROGRESSIVE_AUDIO_URL=<audio url>` for both tracks, writes the served file for `ffprobe` or a
+    /// browser to judge.
     #[tokio::test]
     #[ignore]
     async fn a_real_stream_is_served_whole() {
-        let url = std::env::var("REEL_PROGRESSIVE_URL").expect("REEL_PROGRESSIVE_URL");
+        let mut urls = vec![std::env::var("REEL_PROGRESSIVE_URL").expect("REEL_PROGRESSIVE_URL")];
+        urls.extend(std::env::var("REEL_PROGRESSIVE_AUDIO_URL").ok());
         let out = std::env::var("REEL_PROGRESSIVE_OUT").expect("REEL_PROGRESSIVE_OUT");
         let http = reqwest::Client::new();
         let started = Instant::now();
-        let l = build(&http, &url).await.expect("a layout");
+        let l = build(&http, &urls).await.expect("a layout");
         eprintln!("indexed {} pieces in {:?}; {} bytes", l.pieces.len(), started.elapsed(), l.total);
-        let bytes = body(http, url, parts(&l, 0, l.total - 1)).collect().await.expect("the body").to_bytes();
+        let bytes = body(http, urls, parts(&l, 0, l.total - 1)).collect().await.expect("the body").to_bytes();
         assert_eq!(bytes.len() as u64, l.total);
         std::fs::write(out, &bytes).unwrap();
     }

@@ -288,7 +288,7 @@ fn build_state_full(
         searcher,
         prewarm,
         // Never the real one: /meta would spawn yt-dlp behind every test that browses a title.
-        direct_warm: Box::new(|_state, _id, _cap| {}),
+        direct_warm: Box::new(|_state, _id, _cap, _index| {}),
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
@@ -4032,10 +4032,11 @@ fn the_resident_workers_replies_are_read_as_answers_or_reasons() {
 /// `/play` — no native HLS, so nothing else carries sound — still needs both.
 #[test]
 fn prewarm_asks_for_what_the_client_will_actually_use() {
-    assert_eq!(crate::addon::prewarm_choice(None), (true, true), "the TV needs the file");
-    assert_eq!(crate::addon::prewarm_choice(Some("1")), (true, true));
-    assert_eq!(crate::addon::prewarm_choice(Some("direct")), (false, true));
-    assert_eq!(crate::addon::prewarm_choice(Some("0")), (false, false), "browse-time prefetch");
+    assert_eq!(crate::addon::prewarm_choice(None), (true, true, false), "the TV needs the file");
+    assert_eq!(crate::addon::prewarm_choice(Some("1")), (true, true, false));
+    assert_eq!(crate::addon::prewarm_choice(Some("direct")), (false, true, false));
+    assert_eq!(crate::addon::prewarm_choice(Some("progressive")), (false, true, true), "and the index");
+    assert_eq!(crate::addon::prewarm_choice(Some("0")), (false, false, false), "browse-time prefetch");
 }
 
 /// `/meta`'s warm-up and the `/direct` chasing it a moment later have to be ONE yt-dlp run between

@@ -653,7 +653,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 return bad_signature();
             }
             let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
-            return progressive::handle_progressive(state, &parts.headers, id.to_string(), cap).await;
+            let audio = query_param(query, "audio").as_deref() == Some("1");
+            return progressive::handle_progressive(state, &parts.headers, id.to_string(), cap, audio).await;
         }
     }
 

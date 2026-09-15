@@ -385,17 +385,23 @@ pub(crate) async fn answer(
 /// why the direct path felt slower for a title that had been browsed: it traded a warm file for a
 /// cold resolve. This puts the resolve on the same footing. Fire-and-forget, and it takes the same
 /// probe permit, so a browse cannot spend more of the budget than a probe would.
-pub fn warm(state: Arc<AppState>, vid: String, cap: Option<u32>) {
+///
+/// `progressive`, when set, also builds `/progressive`'s index once the resolve is in — with the sound
+/// track when it is `true` — which is a round of range requests to Google rather than a yt-dlp run.
+pub fn warm(state: Arc<AppState>, vid: String, cap: Option<u32>, progressive: Option<bool>) {
     if !crate::is_valid_vid(&vid) {
         return;
     }
-    // Nothing to do if the answer is already standing — checked before spawning, so a browse over
-    // titles that are all cached costs no tasks at all.
-    if cached(&state, &key(&vid, cap), (state.clock)()).is_some() {
+    // Nothing to do if the answer is already standing and no index is wanted — checked before spawning,
+    // so a browse over titles that are all cached costs no tasks at all.
+    if progressive.is_none() && cached(&state, &key(&vid, cap), (state.clock)()).is_some() {
         return;
     }
     tokio::spawn(async move {
-        let _ = answer(&state, &vid, cap).await;
+        let (answer, _) = answer(&state, &vid, cap).await;
+        if let (Ok(direct), Some(audio)) = (answer, progressive) {
+            crate::progressive::warm(&state, &vid, cap, &direct, audio).await;
+        }
     });
 }
 

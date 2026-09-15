@@ -101,7 +101,8 @@ GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client 
                                              without this server in the middle (the web app);
                                              ?height=720 caps the rung
 GET /progressive/<youtube_id>.mp4         →  that video stream as an ordinary MP4, index first
-                                             (range-enabled); same query as /direct
+                                             (range-enabled); same query as /direct; ?audio=1
+                                             adds its sound as a second track
 GET /hls/<youtube_id>.m3u8                →  YouTube's own HLS master, best variant first, every URI
                                              through /hls/seg; ?native=1 keeps Google's URIs and no
                                              rung under 540p; with X-Den-Playable or ?playable=,
@@ -140,6 +141,8 @@ while the current one shows. Knobs:
   the user will watch). Prewarm on the real detail view.
 - `?prewarm=direct` — warm the direct resolve and not the download, for a browser that plays
   `/direct`, `/hls` or `/progressive`; add the same `?height=` the play request will carry.
+- `?prewarm=progressive` — the direct resolve, then `/progressive`'s index, so its first request
+  starts at once; add the same `?height=` and `?audio=` the `/progressive` request will carry.
 - A **successful** `/meta` sends `Cache-Control: public, max-age=86400, stale-while-revalidate=518400,
   stale-if-error=604800`: fresh for the day the server trusts a resolve, then usable for the rest of the
   week while the client re-asks (or while this server is down). `/<config>/meta` and
@@ -257,13 +260,18 @@ no download, no ffmpeg and nothing on the cache volume, but the video bytes do c
 `/direct`'s. Only the index is kept, until Google's URL is close to expiring; the bodies are not cached
 here, only by the browser (`private, max-age` until then, and a stable `ETag`).
 
-Video only, for muted surfaces. It takes `/direct`'s query, `?height=` included, and resolves through
-the same cache, so `/meta?prewarm=direct` warms the resolve, though not the index: the first request
-for a stream builds that (about 0.6 s on the box; `Server-Timing: index;dur=…`) and later ones read it
-from memory. A resolve failure answers like `/direct`. A stream
-that cannot be indexed (not fragmented, a box it cannot read, a failed fetch) answers `302` to Google's
-raw URL with `X-Den-Degraded: progressive_unavailable` and a log line, which is what the page played
-before.
+By default it carries the picture only, for muted surfaces. `?audio=1` adds YouTube's separate audio
+stream as a second track: it is fragmented the same way (15 fragments for the same trailer), so its
+index is built alongside the video's, and the two tracks' chunks are interleaved by time in the body so
+a player reading along the file finds picture and sound together.
+
+It takes `/direct`'s query, `?height=` included, and resolves through the same cache. With
+`/meta?prewarm=direct` the first request for a stream still builds the index (about 0.6 s on the box;
+`Server-Timing: index;dur=…`); `/meta?prewarm=progressive` builds it during the warm-up, so that request
+reads it from memory. A resolve failure answers like `/direct`. A stream that cannot be indexed (not
+fragmented, a box it cannot read, a failed fetch) answers `302` to Google's raw URL with
+`X-Den-Degraded: progressive_unavailable` and a log line, which is what the page played before; with
+`?audio=1` it answers `502 progressive_unavailable` instead, since that raw URL has no sound.
 
 `/play` failures return a real status + JSON so the caller can say *why*:
 
