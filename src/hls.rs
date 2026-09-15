@@ -578,6 +578,32 @@ mod tests {
         assert_eq!(lines[7], "unsized.m3u8", "a variant with no bandwidth sorts last: {out}");
     }
 
+    /// den-edge starts hls.js on the first rung of what it is served (`startLevel: 0`), trusting that to be the
+    /// best. So the proxied master itself — rewritten, not just sorted — has every rung, highest BANDWIDTH first,
+    /// however YouTube listed them.
+    #[tokio::test]
+    async fn a_proxied_master_is_served_highest_bandwidth_first() {
+        use http_body_util::BodyExt;
+        let playlist = "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=238435,RESOLUTION=426x240\n\
+             https://manifest.googlevideo.com/v/240.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=4272159,RESOLUTION=1920x1080\n\
+             https://manifest.googlevideo.com/v/1080.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=154256,RESOLUTION=256x144\n\
+             https://manifest.googlevideo.com/v/144.m3u8\n\
+             #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9999999,BANDWIDTH=1154419,RESOLUTION=1280x720\n\
+             https://manifest.googlevideo.com/v/720.m3u8\n";
+        let resp = respond_playlist(playlist, MASTER, Some("s3cret"), Uris::Proxy, 0);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        let rungs: Vec<u64> =
+            body.lines().filter(|l| l.starts_with("#EXT-X-STREAM-INF")).map(bandwidth).collect();
+        assert_eq!(rungs, [4272159, 1154419, 238435, 154256], "every rung, best first: {body}");
+        // Each rung still names its own playlist, through this server.
+        let first_uri = body.lines().skip_while(|l| !l.starts_with("#EXT-X-STREAM-INF")).nth(1).unwrap();
+        assert!(first_uri.starts_with("seg?u=") && first_uri.contains("1080.m3u8"), "{body}");
+    }
+
     /// What a phone is offered. Sorting alone did not settle it: Safari opens on a rung of its own
     /// choosing whatever the order says, so the short ones are not listed to it at all.
     #[test]
