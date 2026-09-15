@@ -126,6 +126,26 @@ anything else                             →  404 {"error":"not_found"}
 
 Every response carries `Access-Control-Allow-Origin: *`.
 
+### Choosing a route for a browser: mind the index
+
+Ask `/sources` and play what it lists; it already orders forms by what was measured. If you pick a route
+yourself, the one trap is `/progressive`'s index. It serves an ordinary MP4 with its index in front, which
+is far faster to a first frame, but it has to *build* that index first — per video, height and URL — and
+the first caller waits for it. `/hls` builds none. Safari 18.6 on macOS, same trailer, milliseconds to a
+painted frame (2026-09-15):
+
+| route | cold | warm |
+|---|---|---|
+| `/progressive?audio=1` | 5131 (`resolve;dur=1559, index;dur=2874`) | 115–232 |
+| `/hls` (native master) | no index to build | 748–848 |
+
+The build is not one number: 0.3–0.6 s video-only, about 2.9 s with `?audio=1`, which indexes the audio
+stream too. So use `/progressive` where something builds the index well before the play — a carousel
+warming its next slide, a press that comes seconds before navigation, `/meta?prewarm=progressive`, or a
+`/sources` request made ahead. Use `/hls` where playback starts on demand and nothing warmed it; the warm
+figure you see while developing is not what a first viewer gets. `Server-Timing` says which case a
+response was: `cache;desc=hit` is warm, `index;dur=` means that caller just paid for the build.
+
 `/meta`, `/play` and `/crop` send `Server-Timing` naming what the handler did — `tmdb`,
 `kinocheck`, `search`, `download`, `cropdetect` and `bake` with `dur` in milliseconds, or
 `cache;desc=hit` / `cache;desc=stale` when the answer came from memory or the volume — then
