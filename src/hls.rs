@@ -543,7 +543,8 @@ fn respond_playlist(
         .header("vary", crate::client::HEADER)
         // Playlists name URLs that expire; a stale one is a trailer that stops mid-play.
         .header("cache-control", format!("private, max-age={max_age}"))
-        // So a player revalidating the playlist it holds gets a 304 while the resolve behind it stands.
+        // A validator of the text served. Google signs every URI in a master afresh on each fetch, so two fetches of
+        // one trailer's playlist rarely match and a revalidation is usually a 200 (measured 2026-09-15).
         .header("etag", httputil::etag_of(body.as_bytes()))
         .body(httputil::full(body))
         .unwrap()
@@ -801,7 +802,7 @@ mod tests {
         }
     }
 
-    /// A playlist's validator follows its text, so an unchanged one revalidates to a 304.
+    /// A playlist's validator follows its text: the same text, the same tag, and any change a new one.
     #[test]
     fn a_playlist_carries_a_validator_of_its_own_text() {
         let tag =
