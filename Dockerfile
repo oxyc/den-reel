@@ -7,13 +7,24 @@
 # spawning the standalone binary spends ~840ms starting an interpreter before it looks at anything,
 # and that is paid again for every trailer. Builds amd64, the box's arch.
 
+# ---- manifests, without this crate's own version --------------------------
+# Every release bumps `version` in Cargo.toml and den-reel's entry in Cargo.lock, and a layer is keyed on the
+# bytes it copies, so the dependency compile below was redone on every release with no dependency changed. It
+# is keyed on these copies instead, which read 0.0.0 whatever was released.
+FROM rust:1-trixie AS manifests
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+RUN sed -i '0,/^version = /s/^version = .*/version = "0.0.0"/' Cargo.toml \
+    && sed -i '/^name = "den-reel"$/{n;s/^version = .*/version = "0.0.0"/}' Cargo.lock
+
 # ---- build ----------------------------------------------------------------
 FROM rust:1-trixie AS build
 WORKDIR /src
 # Cache deps: build against manifests + a dummy main first, so a code-only change re-runs only the
 # final (LTO'd) link of our crate, not the whole dependency compile.
-COPY Cargo.toml Cargo.lock ./
+COPY --from=manifests /src/Cargo.toml /src/Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in the release profile
 
