@@ -100,6 +100,8 @@ GET /crop/<youtube_id>.json               →  detected content rectangle (lette
 GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
                                              without this server in the middle (the web app);
                                              ?height=720 caps the rung
+GET /progressive/<youtube_id>.mp4         →  that video stream as an ordinary MP4, index first
+                                             (range-enabled); same query as /direct
 GET /hls/<youtube_id>.m3u8                →  YouTube's own HLS master, best variant first, every URI
                                              through /hls/seg; ?native=1 keeps Google's URIs and no
                                              rung under 540p; with X-Den-Playable or ?playable=,
@@ -107,8 +109,8 @@ GET /hls/<youtube_id>.m3u8                →  YouTube's own HLS master, best va
 GET /hls/seg?u=…&s=…                      →  one googlevideo URL a master named, fetched here
      …/play requires ?s=<tag>&i=<iid>&e=<ep> when PLAY_SECRET is set (403 without,
        or for a revoked install, unless PLAY_SIGNING_GRACE_UNTIL is still ahead and
-       the tag is missing); the same query opens /crop and /direct — /crop without it
-       answers "play the full frame" instead of refusing, /direct refuses like /play
+       the tag is missing); the same query opens /crop, /direct and /progressive — /crop
+       without it answers "play the full frame" instead of refusing, the others refuse like /play
 GET /health                               →  200 {status} — ok, or degraded (see below)
 GET /metrics                              →  Prometheus text (bearer METRICS_TOKEN; 404 without it)
 OPTIONS <any path>                        →  204 CORS preflight
@@ -232,6 +234,28 @@ baked-in letterbox keeps its bars here; `/crop` cannot help, as it reads that sa
 Failures are the `/play` shapes below, with the same reason-aware `Retry-After` cooldown, plus
 `502 no_direct_url` — yt-dlp exited 0 and printed nothing usable, which is not an extraction failure
 and deliberately does not feed `extractor_unavailable`.
+
+## `/progressive` — the same stream, index first
+
+YouTube's adaptive streams are fragmented MP4: a `moov` with empty sample tables, a `sidx`, then a
+`moof`+`mdat` pair every few seconds (28 of them in a two-and-a-half-minute trailer). Chrome plays
+that from `/direct` in under a second. Safari's progressive player reads every `moof` first, one range
+request each, and took about five seconds where `/play`'s faststart copy took one.
+
+`/progressive/<id>.mp4` serves the stream `/direct` names as `video` with a complete `moov` at the
+front, built from Google's own boxes: the `sidx` says where each fragment starts, the `moof`s are
+fetched in small ranged requests, and their sample sizes, durations and sync flags become ordinary
+sample tables. The body is that header, then the fragments' sample bytes end to end, and each byte
+range a player asks for is fetched from the matching range of Google's file as it is sent. There is
+no download, no ffmpeg and nothing on the cache volume, but the video bytes do cross this box, unlike
+`/direct`'s. Only the index is kept, until Google's URL is close to expiring; the bodies are not cached
+here, only by the browser (`private, max-age` until then, and a stable `ETag`).
+
+Video only, for muted surfaces. It takes `/direct`'s query, `?height=` included, and resolves through
+the same cache, so `/meta?prewarm=direct` warms it. A resolve failure answers like `/direct`. A stream
+that cannot be indexed (not fragmented, a box it cannot read, a failed fetch) answers `302` to Google's
+raw URL with `X-Den-Degraded: progressive_unavailable` and a log line, which is what the page played
+before.
 
 `/play` failures return a real status + JSON so the caller can say *why*:
 

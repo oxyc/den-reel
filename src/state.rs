@@ -91,6 +91,9 @@ pub struct AppState {
     /// vid -> the resolve already running for it. The probe budget is six, so a warm-up and the
     /// request chasing it never queued behind one another — they simply both ran.
     pub direct_inflight: Mutex<HashMap<String, SharedResolve>>,
+    /// vid (and height step) -> the `/progressive` index built for that stream's URL, finished or
+    /// still building, kept until the URL is close to expiring.
+    pub progressive: Mutex<HashMap<String, crate::progressive::Entry>>,
     /// The resident yt-dlp, when one is configured and running (`worker.rs`). Every failure of it
     /// falls back to spawning the binary, so this is only ever an optimisation.
     pub worker: crate::worker::Worker,
@@ -177,6 +180,7 @@ impl AppState {
             play_fails: Mutex::new(HashMap::new()),
             direct_cache: Mutex::new(HashMap::new()),
             direct_inflight: Mutex::new(HashMap::new()),
+            progressive: Mutex::new(HashMap::new()),
             worker: Default::default(),
             upstream,
             http,

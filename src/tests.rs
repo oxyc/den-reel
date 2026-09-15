@@ -278,6 +278,7 @@ fn build_state_full(
         play_fails: Mutex::new(HashMap::new()),
         direct_cache: Mutex::new(HashMap::new()),
         direct_inflight: Mutex::new(HashMap::new()),
+        progressive: Mutex::new(HashMap::new()),
         worker: Default::default(),
         upstream,
         // Never used by a test: nothing here reaches the HLS proxy, and a client builds no

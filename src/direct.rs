@@ -253,7 +253,7 @@ pub(crate) fn height_cap(cfg: &Config, asked: Option<&str>) -> Option<u32> {
 }
 
 /// Where an answer is kept: the id alone at the full ladder, the id and its rung below it.
-fn key(vid: &str, cap: Option<u32>) -> String {
+pub(crate) fn key(vid: &str, cap: Option<u32>) -> String {
     match cap {
         Some(h) => format!("{vid}@{h}"),
         None => vid.to_string(),

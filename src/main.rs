@@ -26,6 +26,7 @@ mod direct;
 mod hls;
 mod httputil;
 mod play;
+mod progressive;
 mod seal;
 mod sign;
 mod state;
@@ -459,7 +460,7 @@ fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
 /// or pasting the bare segment, which would otherwise put the key in the log through a 404.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
-    const ROUTES: [&str; 12] = [
+    const ROUTES: [&str; 13] = [
         "",
         "health",
         "metrics",
@@ -470,6 +471,7 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "crop",
         "play",
         "direct",
+        "progressive",
         "hls",
         "seg",
     ];
@@ -640,6 +642,18 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             }
             let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
             return direct::handle_direct(state, id.to_string(), cap).await;
+        }
+    }
+
+    // progressive: /progressive/<id>.mp4 → the stream /direct names, served with its index first so a
+    // player need not read every fragment before it starts (see `progressive.rs`). Signed like /direct.
+    if let Some(id) = path.strip_prefix("/progressive/").and_then(|r| r.strip_suffix(".mp4")) {
+        if is_valid_vid(id) {
+            if !signature_ok(&state, id, query) {
+                return bad_signature();
+            }
+            let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
+            return progressive::handle_progressive(state, &parts.headers, id.to_string(), cap).await;
         }
     }
 
