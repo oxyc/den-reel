@@ -107,8 +107,9 @@ GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <p
                                                                  sources: <sources url> } ] } }
 GET /sources/<youtube_id>.json            →  the forms of that trailer a page should try, in order:
                                              ?surface=silent|audible&player=native|hls.js
-GET /m/<blob>                             →  one form /sources minted (range-enabled video, or a
-                                             master); /m/seg serves a proxied master's URIs
+GET /m/<n|s>/<blob>                       →  one form /sources minted: n a native master (only its
+                                             playlist crosses the box), s anything carried here;
+                                             /m/s/seg serves a proxied master's URIs
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint);
                                              ?detect=keyframes measures it now, with no download
@@ -290,8 +291,8 @@ best first, and never the same URL twice:
 
 ```
 { "id":"…", "expires":1789521638,
-  "sources":[ {"kind":"mp4","url":"…/m/<blob>?s=…","audio":false,"height":720},
-              {"kind":"hls","url":"…/m/<blob>?s=…","audio":true,"height":null} ],
+  "sources":[ {"kind":"mp4","url":"…/m/s/<blob>?s=…","audio":false,"height":720},
+              {"kind":"hls","url":"…/m/n/<blob>?s=…","audio":true,"height":null} ],
   "crop":{"letterboxed":true,"aspect":2.4,"rect":[0.0,0.1296,1.0,0.7407]} }
 ```
 
@@ -314,12 +315,14 @@ The order follows what was measured on macOS:
 Asking is the warm-up. The answer waits for the resolve its first entry plays from, and for its index
 when that entry is a progressive file; a file that turns out not to be indexable is left off the list.
 
-Every URL but Google's own is `/m/<blob>`: the variant — video, form, height, sound, the install it was
-minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is
+Every URL but Google's own is `/m/<n|s>/<blob>`: the variant — video, form, height, sound, the install it
+was minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is
 refused (403) with a wrong tag or for a revoked install, and answers 410 once expired, when the page asks
-for the list again. A native master served from there keeps its segment URIs on googlevideo, so only the
-playlist crosses this box; a proxied master names `seg?u=…`, which resolves to `/m/seg` beside it.
-Everything playable therefore sits under one prefix a relay can treat as media.
+for the list again. Everything playable sits under one prefix a relay can treat as media, and the segment
+says how much of it crosses this box: `n` is a native master, which keeps its segment URIs on googlevideo so
+only the playlist does; `s` is anything carried here — a progressive file, or a proxied master, whose
+`seg?u=…` URIs resolve to `/m/s/seg` beside it. A relay can meter on the segment because it is enforced: a
+blob filed under the other one answers 404.
 
 ### Measuring a letterbox from keyframes
 

@@ -10,14 +10,15 @@
 //! **Two surfaces**, told apart by whether sound can be asked for in place: `silent` never gets it (a
 //! billboard slide), `audible` has it from the first frame or on demand without a new page (a detail hero).
 //!
-//! **Media URLs are `/m/<blob>`**: the variant — video, form, height, sound, the install it was minted for,
-//! and when it expires — as base64url JSON, tagged with `PLAY_SECRET` over the blob. The one entry that is not
-//! is Google's own video URL, offered to a Media Source player for a silent surface: Chrome starts it without
-//! an index, and its bytes never cross this box.
+//! **Media URLs are `/m/<n|s>/<blob>`**: the variant — video, form, height, sound, the install it was minted
+//! for, and when it expires — as base64url JSON, tagged with `PLAY_SECRET` over the blob. The one entry that is
+//! not is Google's own video URL, offered to a Media Source player for a silent surface: Chrome starts it
+//! without an index, and its bytes never cross this box.
 //!
-//! Safari's HLS entry keeps its segment URIs on googlevideo, as `/hls?native=1` does, so only the playlist
-//! crosses the box. A proxied master's URIs are relative (`seg?u=…`), which from `/m/<blob>` resolves to
-//! `/m/seg` under whatever prefix the relay mounts this at.
+//! The segment says how much crosses the box, for a relay that meters it: `n` is Safari's HLS entry, which
+//! keeps its segment URIs on googlevideo as `/hls?native=1` does, so only the playlist crosses; `s` is what
+//! this server carries. A proxied master's URIs are relative (`seg?u=…`), which from `/m/s/<blob>` resolves
+//! to `/m/s/seg` under whatever prefix the relay mounts this at.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -136,13 +137,25 @@ fn message(blob: &str) -> String {
     format!("m\0{blob}")
 }
 
+/// The path segment a media URL is filed under: `n` for a native master, whose segments stay on googlevideo so
+/// only its playlist crosses this box, and `s` for everything this server carries. A relay accounts for the two
+/// differently, and can trust the segment, because `handle_media` refuses a blob filed under the other.
+pub(crate) fn segment(media: &Media) -> &'static str {
+    if media.f == "h" && media.n {
+        "n"
+    } else {
+        "s"
+    }
+}
+
 /// The path and query of the media URL for `media`, tagged when there is a signer.
 pub(crate) fn seal(signer: Option<&crate::sign::Signer>, media: &Media) -> String {
     let json = serde_json::to_vec(media).unwrap_or_default();
     let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    let segment = segment(media);
     match signer {
-        Some(signer) => format!("m/{blob}?s={}", signer.tag(&message(&blob))),
-        None => format!("m/{blob}"),
+        Some(signer) => format!("m/{segment}/{blob}?s={}", signer.tag(&message(&blob))),
+        None => format!("m/{segment}/{blob}"),
     }
 }
 
@@ -273,10 +286,12 @@ pub async fn handle_sources(
     httputil::timed(resp, &timing)
 }
 
-/// `/m/<blob>`: a form `/sources` minted, served by the handler that plays it.
+/// `/m/<segment>/<blob>`: a form `/sources` minted, served by the handler that plays it — and only under the
+/// segment it was minted for (`segment`).
 pub async fn handle_media(
     state: Arc<AppState>,
     headers: &HeaderMap,
+    filed: &str,
     blob: &str,
     query: &str,
 ) -> Response<Body> {
@@ -290,7 +305,8 @@ pub async fn handle_media(
             "This URL is not one this server serves.",
         );
     };
-    if !crate::is_valid_vid(&media.v) {
+    // Filed under the other segment, a URL would be accounted for as something it is not.
+    if !crate::is_valid_vid(&media.v) || segment(&media) != filed {
         return httputil::not_found();
     }
     if media.x.saturating_mul(1000) <= (state.clock)() {
@@ -365,7 +381,7 @@ mod tests {
     }
 
     fn split(path: &str) -> (&str, Option<&str>) {
-        let rest = path.strip_prefix("m/").unwrap();
+        let rest = path.strip_prefix("m/").unwrap().split_once('/').unwrap().1;
         match rest.split_once("?s=") {
             Some((blob, tag)) => (blob, Some(tag)),
             None => (rest, None),

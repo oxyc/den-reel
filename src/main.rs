@@ -742,15 +742,18 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
 
     // One URL out of a playlist this server rewrote. Its signature covers that URL rather than a
     // video id, so `signature_ok` is not the check here — `handle_segment` makes its own. It lives
-    // beside the master rather than at the root so the rewritten URIs can be relative to it: a master
-    // served from /m/<blob> names `seg?u=…`, which lands on /m/seg.
-    if path == "/hls/seg" || path == "/m/seg" {
+    // beside the master rather than at the root so the rewritten URIs can be relative to it: a proxied
+    // master served from /m/s/<blob> names `seg?u=…`, which lands on /m/s/seg.
+    if path == "/hls/seg" || path == "/m/s/seg" {
         return hls::handle_segment(state, query, &parts.headers).await;
     }
 
-    // media: /m/<blob> → a form /sources minted. The blob carries its own tag, expiry and install.
-    if let Some(blob) = path.strip_prefix("/m/") {
-        return sources::handle_media(state, &parts.headers, blob, query).await;
+    // media: /m/<n|s>/<blob> → a form /sources minted. The blob carries its own tag, expiry and install;
+    // the segment says whether it is a native master, whose segments this box never carries.
+    if let Some((filed, blob)) = path.strip_prefix("/m/").and_then(|r| r.split_once('/')) {
+        if matches!(filed, "n" | "s") {
+            return sources::handle_media(state, &parts.headers, filed, blob, query).await;
+        }
     }
 
     // HLS: /hls/<id>.m3u8 → YouTube's own master playlist, best variant first, with every URI in it

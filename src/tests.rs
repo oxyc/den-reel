@@ -4123,7 +4123,7 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         "a Media Source player previews Google's own file"
     );
     assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(false)));
-    assert!(list[1]["url"].as_str().unwrap().contains("/m/"), "{}", list[1]["url"]);
+    assert!(list[1]["url"].as_str().unwrap().contains("/m/s/"), "carried by this server: {}", list[1]["url"]);
     assert_eq!(list[2]["kind"], "hls");
 
     let body = direct_body(ask("surface=audible&player=native").await).await;
@@ -4132,7 +4132,8 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(true)));
     let urls: std::collections::HashSet<&str> = list.iter().map(|s| s["url"].as_str().unwrap()).collect();
     assert_eq!(urls.len(), list.len(), "no URL twice");
-    let blob = list[0]["url"].as_str().unwrap().split("/m/").nth(1).unwrap();
+    let blob =
+        list[0]["url"].as_str().unwrap().split("/m/n/").nth(1).expect("a native master is filed under n");
     let media = crate::sources::unseal(None, &[], blob, None).expect("a URL this server minted");
     assert!(media.n && media.f == "h", "the native master keeps Google's segment URIs: {media:?}");
 
@@ -4174,10 +4175,15 @@ async fn a_media_url_opens_only_as_minted_and_until_it_expires() {
     let open = |path: String| {
         let state = state.clone();
         async move {
-            let (blob, query) = path.strip_prefix("m/").unwrap().split_once('?').unwrap();
-            crate::sources::handle_media(state, &hyper::HeaderMap::new(), blob, query).await.status()
+            let (filed, rest) = path.strip_prefix("m/").unwrap().split_once('/').unwrap();
+            let (blob, query) = rest.split_once('?').unwrap();
+            crate::sources::handle_media(state, &hyper::HeaderMap::new(), filed, blob, query).await.status()
         }
     };
+    // Carried by this server, so filed under `s`; the same URL under `n` would be metered as a playlist.
+    let carried = crate::sources::seal(Some(&signer), &media(4_000_000_000));
+    assert!(carried.starts_with("m/s/"), "{carried}");
+    assert_eq!(open(carried.replacen("m/s/", "m/n/", 1)).await, 404, "filed under the wrong segment");
 
     assert_eq!(
         open(crate::sources::seal(Some(&signer), &media(4_000_000_000))).await,
