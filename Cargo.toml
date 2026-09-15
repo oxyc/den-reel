@@ -24,9 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # rustls (not OpenSSL) with bundled webpki roots → no ca-certificates package needed at runtime,
 # and a static-friendly TLS stack for a slim image.
-# http2: googlevideo speaks it, and a /progressive index is dozens of range requests to one host. Over
-# HTTP/1.1 each ran on its own TLS connection, up to sixteen opened at once on this single-threaded runtime,
-# and a cold build cost 0.9–3.2 s where the same build on connections already open cost under half a second.
+# http2: manifest.googlevideo.com speaks it, so the HLS playlists /hls and /m/ fetch share a connection.
+# The rr*.googlevideo.com media hosts do not (they answer HTTP/1.1 even when h2 is offered, checked with curl
+# from the box on 2026-09-15), so it does nothing for /progressive's index or its body.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
 tokio-util = { version = "0.7", features = ["io"] }
 # Only need Shared/FutureExt/TryStreamExt — skip the sink/io/compat machinery in the defaults.
