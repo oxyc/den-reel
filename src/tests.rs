@@ -1042,6 +1042,30 @@ fn the_request_log_carries_the_callers_request_id() {
     assert_eq!(line(Some("!!!")), "GET /<config>/manifest.json 200 12ms", "nothing left is no rid");
 }
 
+/// A /sources line says what was asked, so a detail page opening and a press can be told apart, and says nothing a
+/// caller wrote or the signature carried.
+#[test]
+fn the_request_log_says_what_a_sources_ask_was_for() {
+    let line = |uri: &str| {
+        let (parts, _) = hyper::Request::builder().uri(uri).body(()).unwrap().into_parts();
+        crate::request_line(&parts, hyper::StatusCode::OK, std::time::Duration::from_millis(0))
+    };
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?surface=audible&player=native&intent=warm&s=secrettag&i=install&e=3"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=audible player=native intent=warm"
+    );
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?player=hls.js&surface=silent"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=silent player=hls.js"
+    );
+    assert_eq!(
+        line("/sources/dQw4w9WgXcQ.json?surface=x%0Afake%3D1&intent=cold"),
+        "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=? player=?",
+        "an unknown value is not written"
+    );
+    assert_eq!(line("/play/dQw4w9WgXcQ.mp4?surface=silent"), "GET /play/dQw4w9WgXcQ.mp4 200 0ms");
+}
+
 /// Off when unset, empty or exactly "0"; on for anything else — the rule every Den addon shares.
 #[test]
 fn log_requests_is_off_only_when_unset_empty_or_zero() {

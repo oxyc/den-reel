@@ -494,8 +494,8 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp
 }
 
-/// `<METHOD> <redacted path> <status> <ms>ms[ rid=<id>]`. The `rid` is the caller's `X-Request-Id`, so a
-/// line here can be matched to the one the app logged for the same request.
+/// `<METHOD> <redacted path> <status> <ms>ms[ <sources ask>][ rid=<id>]`. The `rid` is the caller's `X-Request-Id`,
+/// so a line here can be matched to the one the app logged for the same request.
 fn request_line(
     parts: &hyper::http::request::Parts,
     status: StatusCode,
@@ -508,11 +508,37 @@ fn request_line(
         status.as_u16(),
         elapsed.as_millis()
     );
+    if let Some(ask) = sources_ask(&parts.uri) {
+        line.push(' ');
+        line.push_str(&ask);
+    }
     if let Some(rid) = request_id(&parts.headers) {
         line.push_str(" rid=");
         line.push_str(&rid);
     }
     line
+}
+
+/// What a `/sources` request asked: its surface, its player, and whether it was a warm-up. The same path answers a
+/// detail page opening and a press on a title link, and only these tell the two apart. Each is written only as one of
+/// its known values, so nothing a caller wrote reaches the log — and `s`, `i` and `e` never do.
+fn sources_ask(uri: &hyper::Uri) -> Option<String> {
+    if !uri.path().starts_with("/sources/") {
+        return None;
+    }
+    let query = uri.query().unwrap_or("");
+    let known = |key: &str, values: [&'static str; 2]| {
+        query_param(query, key).and_then(|v| values.into_iter().find(|known| *known == v)).unwrap_or("?")
+    };
+    let mut ask = format!(
+        "surface={} player={}",
+        known("surface", ["silent", "audible"]),
+        known("player", ["native", "hls.js"])
+    );
+    if query_param(query, "intent").as_deref() == Some("warm") {
+        ask.push_str(" intent=warm");
+    }
+    Some(ask)
 }
 
 /// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is written into the
