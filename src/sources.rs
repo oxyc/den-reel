@@ -280,7 +280,6 @@ pub async fn handle_sources(
     }
 
     let now = (state.clock)();
-    let base = crate::addon::self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
     let signer = state.cfg.play_secret.as_deref().map(crate::sign::Signer::new);
     let iid = query_param(query, "i");
     let ep = query_param(query, "e").and_then(|e| e.parse().ok());
@@ -288,7 +287,10 @@ pub async fn handle_sources(
     let expires = now / 1000 + MEDIA_TTL_SECS;
     let media_url = |f: &str, h: Option<u32>, a: bool, n: bool, p: Option<String>| {
         let media = Media { v: vid.clone(), f: f.into(), h, a, n, p, i: iid.clone(), e: ep, x: expires };
-        format!("{base}/{}", seal(signer.as_ref(), &media))
+        // Relative to this answer's own URL, `/sources/<id>.json`, for the reason a proxied playlist's URIs are: this
+        // server is reached at several addresses and under a relay's prefix, and knows neither. A page resolves it
+        // against the URL it asked, which is by definition one it can reach.
+        format!("../{}", seal(signer.as_ref(), &media))
     };
 
     let mut seen = HashSet::new();
@@ -337,12 +339,8 @@ pub async fn handle_sources(
     };
     let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
     let cache = format!("private, max-age={max_age}");
-    // Its URLs are built from `self_base`, so the host it was asked at is part of the answer as well.
-    let resp = httputil::json(
-        StatusCode::OK,
-        &body,
-        &[("cache-control", &cache), ("vary", crate::client::HEADER), httputil::VARY_SELF_BASE],
-    );
+    let resp =
+        httputil::json(StatusCode::OK, &body, &[("cache-control", &cache), ("vary", crate::client::HEADER)]);
     httputil::timed(resp, &timing)
 }
 

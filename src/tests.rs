@@ -4114,9 +4114,11 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     let resp = ask("surface=silent&player=hls.js").await;
     let vary: Vec<String> =
         resp.headers().get_all("vary").iter().map(|v| v.to_str().unwrap().to_ascii_lowercase()).collect();
-    for name in [crate::client::HEADER.to_ascii_lowercase().as_str(), "x-forwarded-host", "host"] {
-        assert!(vary.iter().flat_map(|v| v.split(", ")).any(|v| v == name), "not varied on {name}: {vary:?}");
-    }
+    assert_eq!(
+        vary,
+        [crate::client::HEADER.to_ascii_lowercase()],
+        "the answer names no host, so varies on none"
+    );
     let body = direct_body(resp).await;
     assert_eq!(
         body["crop"],
@@ -4129,7 +4131,11 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         "a Media Source player previews Google's own file"
     );
     assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(false)));
-    assert!(list[1]["url"].as_str().unwrap().contains("/m/s/"), "carried by this server: {}", list[1]["url"]);
+    assert!(
+        list[1]["url"].as_str().unwrap().starts_with("../m/s/"),
+        "carried by this server, and named relative to /sources/<id>.json: {}",
+        list[1]["url"]
+    );
     assert_eq!(list[2]["kind"], "hls");
 
     let resp = ask("surface=audible&player=native").await;

@@ -291,8 +291,8 @@ best first, and never the same URL twice:
 
 ```
 { "id":"…", "expires":1789521638,
-  "sources":[ {"kind":"mp4","url":"…/m/s/<blob>?s=…","audio":false,"height":720},
-              {"kind":"hls","url":"…/m/n/<blob>?s=…","audio":true,"height":null} ],
+  "sources":[ {"kind":"mp4","url":"../m/s/<blob>?s=…","audio":false,"height":720},
+              {"kind":"hls","url":"../m/n/<blob>?s=…","audio":true,"height":null} ],
   "crop":{"letterboxed":true,"aspect":2.4,"rect":[0.0,0.1296,1.0,0.7407]} }
 ```
 
@@ -337,7 +337,10 @@ again, while a new connection costs 40–180 ms. So no connection tuning moves i
 index before a viewer needs it. A range googlevideo refuses for the moment (401, 429, 5xx; a burst drew 17
 refusals in 29) is asked again after 250 ms and then 1 s rather than failing the build.
 
-Every URL but Google's own is `/m/<n|s>/<blob>`: the variant — video, form, height, sound, the install it
+Every URL but Google's own is `../m/<n|s>/<blob>`, **relative to the `/sources` URL that was asked**: resolve it
+against that (`new URL(url, sourcesUrl)`), which leaves Google's absolute URL as it is. This server is reached
+at several addresses and under a relay's prefix, and can know neither, so it names no host — as a proxied
+playlist's URIs do not. What it names is the variant — video, form, height, sound, the install it
 was minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is
 refused (403) with a wrong tag or for a revoked install, and answers 410 once expired, when the page asks
 for the list again. Everything playable sits under one prefix a relay can treat as media, and the segment
