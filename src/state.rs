@@ -79,6 +79,8 @@ pub struct AppState {
     /// side was cached above, and the comment where the pass is spawned says what that costs: a
     /// whole-file ffmpeg read on every call, forever, for exactly the trailers it cannot read.
     pub crop_unknown: Mutex<HashMap<String, u64>>,
+    /// vids whose letterbox is being measured from keyframes right now, so a second ask does not start another.
+    pub crop_inflight: Mutex<std::collections::HashSet<String>>,
     /// vid -> (why it failed, when to try again). A `/play` verdict was the one thing this service
     /// learned and then threw away: the in-flight entry is cleared however a download ends, so the
     /// next request for a video YouTube has REMOVED spent another of three download permits, and
@@ -178,6 +180,7 @@ impl AppState {
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
             crop_unknown: Mutex::new(HashMap::new()),
+            crop_inflight: Mutex::new(Default::default()),
             play_fails: Mutex::new(HashMap::new()),
             direct_cache: Mutex::new(HashMap::new()),
             direct_inflight: Mutex::new(HashMap::new()),

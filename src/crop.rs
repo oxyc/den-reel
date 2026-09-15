@@ -325,6 +325,101 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
     Some(refine_report(report_from(id, src, typical)))
 }
 
+/// How many keyframes a detection from keyframes reads: every one in a trailer (two dozen to a hundred),
+/// evenly thinned past this for a longer video.
+///
+/// Every one, not one a fragment: on 2026-09-15 a trailer read from the first keyframe of each fragment came
+/// out full frame where the whole file measured a 2.40 letterbox, and read from all of them it measured 2.41.
+const KEYFRAMES_MAX: usize = 64;
+
+/// The rung `/crop?detect=keyframes` reads keyframes from: the one Den Web's billboard plays, so its index is
+/// usually built already.
+const KEYFRAME_HEIGHT: &str = "720";
+
+/// The content rectangle, from the keyframes of YouTube's own stream at `cap` rather than a downloaded file.
+///
+/// `/progressive`'s index already says where every keyframe sits, so this fetches only those — half a
+/// megabyte to a few for a trailer — and hands them to the same `detect` pass as one H.264 stream of still
+/// pictures. No yt-dlp download, no cache slot. Measured against the whole-file pass on eight cached trailers
+/// it agreed on seven; the eighth's downloaded file carries twice the keyframes of Google's stream, two of
+/// them full frame, which is enough to hold the mixed-framing guard there and not here.
+pub async fn detect_from_keyframes(
+    state: &Arc<AppState>,
+    id: &str,
+    cap: Option<u32>,
+) -> Result<CropReport, String> {
+    let (layout, url) = crate::progressive::indexed(state, id, cap).await?;
+    let stream = crate::progressive::keyframe_stream(&state.http, &url, &layout, KEYFRAMES_MAX).await?;
+    let n = state.dl_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A dotfile at the top of the cache: eviction leaves it alone, and the partial sweep reclaims it
+    // should the removal below ever not happen.
+    let path = state.cfg.cache_dir.join(format!(".crop-{id}-{n}.h264"));
+    tokio::fs::write(&path, &stream).await.map_err(|e| format!("write the keyframes: {e}"))?;
+    let detected = {
+        let _permit = state.probe_sem.acquire().await;
+        detect(&state.cfg, id, &path).await
+    };
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        crate::log_limited("crop keyframes cleanup", || format!("[{id}] keyframes left behind: {e}"));
+    }
+    detected.ok_or_else(|| "cropdetect found no box in the keyframes".into())
+}
+
+/// `/crop/<id>.json?detect=keyframes`: detect now, from keyframes, whatever is cached.
+pub async fn handle_keyframe_crop(state: Arc<AppState>, id: String) -> Response<Body> {
+    let started = Instant::now();
+    let cap = crate::direct::height_cap(&state.cfg, Some(KEYFRAME_HEIGHT));
+    let detected = detect_from_keyframes(&state, &id, cap).await;
+    let timing = httputil::timing("keyframes", started.elapsed());
+    match detected {
+        Ok(report) => httputil::timed(json(&report), &timing),
+        Err(why) => {
+            crate::log_limited("crop keyframes", || format!("[{id}] no crop from keyframes ({why})"));
+            httputil::timed(json(&CropReport::unknown(&id)), &timing)
+        }
+    }
+}
+
+/// Measure `id`'s letterbox from its keyframes at `cap`, in the background, unless it is known, already being
+/// measured, or recently found unmeasurable. A result never replaces one a whole-file pass cached.
+pub fn measure_in_background(state: &Arc<AppState>, id: &str, cap: Option<u32>) {
+    if unknown_is_fresh(state, id) {
+        return;
+    }
+    if !state.crop_inflight.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string()) {
+        return;
+    }
+    let (state, id) = (state.clone(), id.to_string());
+    tokio::spawn(async move {
+        match detect_from_keyframes(&state, &id, cap).await {
+            Ok(report) => {
+                if !state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
+                    cache_report(&state, &id, report);
+                }
+            }
+            Err(why) => {
+                crate::log_limited("crop keyframes", || format!("[{id}] no crop from keyframes ({why})"));
+                record_unknown(&state, &id);
+            }
+        }
+        state.crop_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    });
+}
+
+impl CropReport {
+    /// The content rectangle as fractions of the frame — `[x, y, width, height]` — which hold at whatever height
+    /// a page plays, with the aspect and whether it is letterboxed at all. `None` when nothing was measured.
+    pub fn fractions(&self) -> Option<serde_json::Value> {
+        let (s, c) = (self.source.as_ref()?, self.content.as_ref()?);
+        let f = |n: u32, of: u32| (n as f64 / of.max(1) as f64 * 10_000.0).round() / 10_000.0;
+        Some(serde_json::json!({
+            "letterboxed": self.letterboxed,
+            "aspect": self.aspect,
+            "rect": [f(c.x, s.w), f(c.y, s.h), f(c.w, s.w), f(c.h, s.h)],
+        }))
+    }
+}
+
 /// The `clap` box params for a letterboxed report: `(width, height, horizOffNum, vertOffNum)`, each
 /// offset over denominator 2. Offsets are the content-centre relative to the frame centre — so a
 /// symmetric letterbox is 0, and an off-centre crop (e.g. a logo kept in one bar) gets the right

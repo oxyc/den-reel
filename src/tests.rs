@@ -275,6 +275,7 @@ fn build_state_full(
         dl_gen: std::sync::atomic::AtomicU64::new(0),
         crop_cache: Mutex::new(HashMap::new()),
         crop_unknown: Mutex::new(HashMap::new()),
+        crop_inflight: Mutex::new(Default::default()),
         play_fails: Mutex::new(HashMap::new()),
         direct_cache: Mutex::new(HashMap::new()),
         direct_inflight: Mutex::new(HashMap::new()),
@@ -4076,6 +4077,13 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
          https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\\n'",
     );
     let state = direct_state(&dir, yt);
+    // A letterbox already measured, so no answer here sets off a measurement of its own.
+    let measured = crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+    crate::crop::cache_report(&state, "dQw4w9WgXcQ", measured);
     let ask = |query: &'static str| {
         let state = state.clone();
         async move {
@@ -4084,6 +4092,11 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     };
 
     let body = direct_body(ask("surface=silent&player=hls.js").await).await;
+    assert_eq!(
+        body["crop"],
+        serde_json::json!({ "letterboxed": true, "aspect": 2.4, "rect": [0.0, 0.1296, 1.0, 0.7407] }),
+        "the letterbox as fractions of the frame, whatever height is played"
+    );
     let list = body["sources"].as_array().unwrap();
     assert_eq!(
         list[0]["url"], "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000",

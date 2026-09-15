@@ -91,6 +91,10 @@ pub struct Layout {
     pub pieces: Vec<Piece>,
     pub total: u64,
     pub etag: String,
+    /// Where each of the video's sync samples sits in Google's file, and how long it is.
+    pub keyframes: Vec<(u64, u32)>,
+    /// The video's H.264 decoder configuration (`avcC`'s payload), when it is H.264.
+    pub avcc: Option<Vec<u8>>,
 }
 
 /// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's file `source`
@@ -463,6 +467,37 @@ impl Read<'_> {
         }
         starts
     }
+
+    /// Where every sync sample sits in its file, and how long it is.
+    fn keyframes(&self) -> Vec<(u64, u32)> {
+        let s = &self.samples;
+        let mut out = Vec::new();
+        let mut sample = 0usize;
+        for &(from, _, count) in &s.chunks {
+            let end = sample + count as usize;
+            let mut at = from;
+            for i in sample..end {
+                if s.sync[i] {
+                    out.push((at, s.sizes[i]));
+                }
+                at += s.sizes[i] as u64;
+            }
+            sample = end;
+        }
+        out
+    }
+
+    /// The H.264 decoder configuration — `avcC`'s payload — in the track's first sample entry. An `avc1`
+    /// entry's child boxes follow 78 bytes of fixed fields.
+    fn avcc(&self) -> Option<Vec<u8>> {
+        let b = self.moov;
+        let entry = atoms(b, self.stsd.body + 8, self.stsd.end, false).ok()?.into_iter().next()?;
+        if !matches!(&entry.kind, b"avc1" | b"avc3") {
+            return None;
+        }
+        let config = find(&atoms(b, entry.body + 78, entry.end, false).ok()?, b"avcC").ok()?;
+        Some(b[config.body..config.end].to_vec())
+    }
 }
 
 /// Read the one track of a fragmented file whose `moov` box is `moov` and whose `moof`s (each with its
@@ -610,7 +645,48 @@ pub(crate) fn layout(sources: &[Source]) -> Result<Layout, Unbuilt> {
     head.extend_from_slice(&((8 + payload) as u32).to_be_bytes());
     head.extend_from_slice(b"mdat");
     let etag = httputil::etag_of(&head);
-    Ok(Layout { total: mdat_start + payload, head: head.into(), pieces, etag })
+    Ok(Layout {
+        total: mdat_start + payload,
+        head: head.into(),
+        pieces,
+        etag,
+        keyframes: first.keyframes(),
+        avcc: first.avcc(),
+    })
+}
+
+/// Keyframes as an H.264 Annex B stream a decoder reads as a run of still pictures: each frame's NAL units
+/// behind start codes, with the parameter sets from `avcc` before every one. `None` when the configuration
+/// or a frame does not read.
+pub(crate) fn annexb(avcc: &[u8], frames: &[Bytes]) -> Option<Vec<u8>> {
+    const START: [u8; 4] = [0, 0, 0, 1];
+    let length_size = (*avcc.get(4)? & 0x03) as usize + 1;
+    let mut params = Vec::new();
+    let mut at = 5;
+    // The SPS count sits in the low five bits of its byte; the PPS count has the whole of its own.
+    for mask in [0x1f, 0xff] {
+        let count = (*avcc.get(at)? & mask) as usize;
+        at += 1;
+        for _ in 0..count {
+            let len = be16(avcc, at).ok()? as usize;
+            params.extend_from_slice(&START);
+            params.extend_from_slice(avcc.get(at + 2..at + 2 + len)?);
+            at += 2 + len;
+        }
+    }
+    let mut out = Vec::new();
+    for frame in frames {
+        out.extend_from_slice(&params);
+        let mut p = 0;
+        while p + length_size <= frame.len() {
+            let len = frame[p..p + length_size].iter().fold(0usize, |n, b| n << 8 | *b as usize);
+            p += length_size;
+            out.extend_from_slice(&START);
+            out.extend_from_slice(frame.get(p..p + len)?);
+            p += len;
+        }
+    }
+    Some(out)
 }
 
 /// What serving `start..=end` of a layout takes: some of the header, then ranges of Google's files.
@@ -883,6 +959,45 @@ pub(crate) async fn warm(
     }
 }
 
+/// The index for `vid`'s video at `cap`, and the Google URL it indexes — built, or joined, as a request would.
+pub(crate) async fn indexed(
+    state: &Arc<AppState>,
+    vid: &str,
+    cap: Option<u32>,
+) -> Result<(Arc<Layout>, String), String> {
+    let (answer, _) = crate::direct::answer(state, vid, cap).await;
+    let direct = answer.map_err(|e| format!("resolve: {}", e.reason))?;
+    let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
+    let (key, urls) = streams(vid, cap, &direct, false);
+    let layout = layout_for(state, &key, &urls, until).await.0.map_err(|e| e.why)?;
+    Ok((layout, direct.video))
+}
+
+/// Up to `max` of the video's keyframes, evenly spread across it, fetched from `url` as one Annex B stream
+/// (`annexb`).
+pub(crate) async fn keyframe_stream(
+    http: &reqwest::Client,
+    url: &str,
+    layout: &Layout,
+    max: usize,
+) -> Result<Vec<u8>, String> {
+    let avcc = layout.avcc.as_deref().ok_or("the video is not H.264")?;
+    let step = layout.keyframes.len().div_ceil(max.max(1)).max(1);
+    let picked: Vec<(u64, u32)> =
+        layout.keyframes.iter().copied().filter(|(_, size)| *size > 0).step_by(step).collect();
+    if picked.is_empty() {
+        return Err("no keyframes".into());
+    }
+    let frames: Vec<Bytes> = futures_util::stream::iter(
+        picked.into_iter().map(|(at, size)| fetch(http, url, at, at + size as u64 - 1)),
+    )
+    .buffered(MOOF_FETCHES)
+    .try_collect()
+    .await
+    .map_err(|e| e.why)?;
+    annexb(avcc, &frames).ok_or_else(|| "a keyframe or the decoder configuration does not read".into())
+}
+
 /// `/progressive/<vid>.mp4`: the stream `/direct` would name, with its index first, and its sound with it
 /// when `audio` asks.
 pub async fn handle_progressive(
@@ -968,7 +1083,7 @@ mod tests {
         let stbl = make(
             b"stbl",
             &[
-                &make(b"stsd", &[&words(&[0, 1]), &make(b"avc1", &[&[0u8; 78]])]),
+                &make(b"stsd", &[&words(&[0, 1]), &make(b"avc1", &[&[0u8; 78], &make(b"avcC", &[AVCC])])]),
                 &make(b"stts", &[&words(&[0, 0])]),
                 &make(b"stsc", &[&words(&[0, 0])]),
                 &make(b"stsz", &[&words(&[0, 0, 0])]),
@@ -1055,6 +1170,64 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A decoder configuration: version, High profile, level 4.0, 4-byte NAL lengths, one two-byte SPS and one
+    /// two-byte PPS.
+    const AVCC: &[u8] = &[1, 0x64, 0, 0x28, 0xff, 0xe1, 0, 2, 0x67, 0x64, 1, 0, 2, 0x68, 0xee];
+
+    /// A detection reads every sync sample, and those frames become a stream a decoder reads on its own: the
+    /// parameter sets, then each NAL unit behind a start code.
+    #[test]
+    fn a_videos_keyframes_are_found_and_read_as_one_stream() {
+        // Only the first sample of each fragment is a sync sample here.
+        let file = fragmented(&[&[5, 3, 4], &[6, 2]], 0);
+        let l = layout_of(&[&file]).unwrap();
+        let found: Vec<(u8, u32)> = l.keyframes.iter().map(|&(at, size)| (file[at as usize], size)).collect();
+        assert_eq!(found, [(fill(0, 0, 0), 5), (fill(0, 1, 0), 6)], "every sync sample, and nothing else");
+        let avcc = l.avcc.as_deref().expect("the decoder configuration");
+        assert_eq!(avcc, AVCC);
+
+        // One frame of two NAL units, each behind a four-byte length.
+        let frame = Bytes::from_static(&[0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 1, 0x06]);
+        let one: &[u8] =
+            &[0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa, 0, 0, 0, 1, 0x06];
+        assert_eq!(annexb(avcc, &[frame.clone(), frame]).unwrap(), [one, one].concat());
+        assert!(
+            annexb(avcc, &[Bytes::from_static(&[0, 0, 0, 9, 0x65])]).is_none(),
+            "a NAL unit past its frame"
+        );
+    }
+
+    /// Against real googlevideo URLs: `REEL_KEYFRAME_URLS=<file of "id url" lines>` prints what cropdetect
+    /// reads from each video's keyframes, to set beside `/crop`'s whole-file answer.
+    #[tokio::test]
+    #[ignore]
+    async fn real_keyframes_are_cropdetected() {
+        let list = std::fs::read_to_string(std::env::var("REEL_KEYFRAME_URLS").expect("REEL_KEYFRAME_URLS"))
+            .unwrap();
+        let http = reqwest::Client::new();
+        let cfg = crate::config::Config::from_env();
+        let dir = std::env::temp_dir().join(format!("reel-keyframes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, url) in list.lines().filter_map(|l| l.split_once(' ')) {
+            let started = Instant::now();
+            let l = build(&http, &[url.to_string()]).await.expect("a layout");
+            let stream = keyframe_stream(&http, url, &l, 64).await.expect("keyframes");
+            let fetched = started.elapsed();
+            let path = dir.join(format!("{id}.h264"));
+            std::fs::write(&path, &stream).unwrap();
+            let report = crate::crop::detect(&cfg, id, &path).await;
+            eprintln!(
+                "{id} {} of {} keyframes in {}, {} bytes, {fetched:?} to fetch, {:?} in all: {}",
+                l.keyframes.len().min(64),
+                l.keyframes.len(),
+                path.display(),
+                stream.len(),
+                started.elapsed(),
+                serde_json::to_string(&report).unwrap()
+            );
+        }
     }
 
     /// The payload of the box at `path` under the top level of `b`.

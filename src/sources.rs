@@ -252,13 +252,21 @@ pub async fn handle_sources(
         }
     }
 
+    // The letterbox, when it is known. Nothing here waits for it: an unmeasured trailer is measured from its
+    // keyframes in the background, and the next answer carries it.
+    let crop =
+        state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&vid).and_then(|r| r.fractions());
+    if crop.is_none() {
+        crate::crop::measure_in_background(&state, &vid, first.cap());
+    }
+
     let max_age = direct
         .expires
         .saturating_sub(now)
         .saturating_sub(crate::direct::EXPIRY_MARGIN_MS)
         .min(MEDIA_TTL_SECS * 1000)
         / 1000;
-    let body = json!({ "id": vid, "sources": sources, "expires": soonest / 1000 });
+    let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
     let cache = format!("private, max-age={max_age}");
     let resp =
         httputil::json(StatusCode::OK, &body, &[("cache-control", &cache), ("vary", crate::client::HEADER)]);

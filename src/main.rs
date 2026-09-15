@@ -630,6 +630,10 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             if !signature_ok(&state, id, query) {
                 return crop::unsigned_response(id);
             }
+            // `?detect=keyframes`: measure now, from YouTube's own keyframes, with no download.
+            if query_param(query, "detect").as_deref() == Some("keyframes") {
+                return crop::handle_keyframe_crop(state, id.to_string()).await;
+            }
             return crop::handle_crop(state, id.to_string()).await;
         }
     }

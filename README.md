@@ -101,7 +101,8 @@ GET /sources/<youtube_id>.json            →  the forms of that trailer a page 
 GET /m/<blob>                             →  one form /sources minted (range-enabled video, or a
                                              master); /m/seg serves a proxied master's URIs
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
-GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
+GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint);
+                                             ?detect=keyframes measures it now, with no download
 GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
                                              without this server in the middle (the web app);
                                              ?height=720 caps the rung
@@ -261,8 +262,15 @@ best first, and never the same URL twice:
 ```
 { "id":"…", "expires":1789521638,
   "sources":[ {"kind":"mp4","url":"…/m/<blob>?s=…","audio":false,"height":720},
-              {"kind":"hls","url":"…/m/<blob>?s=…","audio":true,"height":null} ] }
+              {"kind":"hls","url":"…/m/<blob>?s=…","audio":true,"height":null} ],
+  "crop":{"letterboxed":true,"aspect":2.4,"rect":[0.0,0.1296,1.0,0.7407]} }
 ```
+
+`crop` is the trailer's letterbox as fractions of the frame (`[x, y, width, height]`), so it holds at
+whatever height is played, or `null` until it has been measured. No answer waits for it: an unmeasured
+trailer is measured in the background from the keyframes of the stream the first entry plays (the pass
+`/crop?detect=keyframes` runs), and the next answer carries it. A whole-file measurement from `/play`
+is kept over it.
 
 `kind` says how to play it (`mp4` in the element, `hls` in the page's HLS player); the URL says nothing.
 The order follows what was measured on macOS:
@@ -283,6 +291,20 @@ refused (403) with a wrong tag or for a revoked install, and answers 410 once ex
 for the list again. A native master served from there keeps its segment URIs on googlevideo, so only the
 playlist crosses this box; a proxied master names `seg?u=…`, which resolves to `/m/seg` beside it.
 Everything playable therefore sits under one prefix a relay can treat as media.
+
+### Measuring a letterbox from keyframes
+
+`/crop/<id>.json?detect=keyframes` (signed like `/crop`) measures the letterbox now, from YouTube's own
+720p stream rather than a downloaded file: the `/progressive` index already says where every keyframe
+sits, so only those are fetched — every one in a trailer, thinned past 64 — and handed to the same
+cropdetect pass as an H.264 stream of still pictures. About half a megabyte to a few, and half a second to
+a second once the index is built; `Server-Timing: keyframes;dur=…`.
+
+Set against the whole-file pass on eight cached trailers (2026-09-15) it agreed on seven. The eighth's
+downloaded file carries twice the keyframes of Google's stream, two of them full frame, which holds the
+mixed-framing guard there (play the full frame) and not here (a 2.4 letterbox); Google's 1080p stream
+reads the same as its 720p one. Reading only the first keyframe of each fragment disagreed on one more,
+which is why every keyframe is read.
 
 ## `/progressive` — the same stream, index first
 
@@ -306,9 +328,17 @@ index is built alongside the video's, and the two tracks' chunks are interleaved
 a player reading along the file finds picture and sound together.
 
 It takes `/direct`'s query, `?height=` included, and resolves through the same cache. With
-`/meta?prewarm=direct` the first request for a stream still builds the index (about 0.6 s on the box;
-`Server-Timing: index;dur=…`); `/meta?prewarm=progressive` builds it during the warm-up, so that request
-reads it from memory. A resolve failure answers like `/direct`. A stream that cannot be indexed (not
+`/meta?prewarm=direct` the first request for a stream still builds the index
+(`Server-Timing: index;dur=…`); `/meta?prewarm=progressive` builds it during the warm-up, so that request
+reads it from memory. A resolve failure answers like `/direct`.
+
+**The index is a cliff, and the caller pays it in full.** One is built per video, height and URL, and there
+is no single figure for it. Measured on 2026-09-15: about 0.3–0.6 s for a video-only stream, and 2.9 s with
+`?audio=1` from a browser (Safari, O3S7aKk0ALw at 480p, resolve 1.6 s on top). Warm, the same request is a
+cache hit in under 20 ms. The same URL painted its first frame in 232 ms warm and 5131 ms cold. So choose
+`/progressive` only where something builds the index well ahead of the viewer: a billboard warming its next
+slide can, a detail hero opened on a click cannot. The HLS master builds no index and has no cold case,
+which is why `/sources` offers it first for an audible surface. A stream that cannot be indexed (not
 fragmented, a box it cannot read, a failed fetch) answers `302` to Google's raw URL with
 `X-Den-Degraded: progressive_unavailable` and a log line, which is what the page played before; with
 `?audio=1` it answers `502 progressive_unavailable` instead, since that raw URL has no sound.
