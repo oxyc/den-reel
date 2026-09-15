@@ -23,6 +23,8 @@ pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send +
 /// YouTube-search fallback: query → candidate video ids. Injectable so tests stay hermetic.
 pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Option<Vec<String>>> + Send + Sync>;
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
+/// A direct warm-up: the id, and the height cap the request that follows will ask for.
+pub type DirectWarmFn = Box<dyn Fn(Arc<AppState>, String, Option<u32>) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
 pub type SharedDownload = Shared<BoxFuture<Result<crate::play::Fetched, PlayError>>>;
@@ -103,7 +105,7 @@ pub struct AppState {
     pub prewarm: PrewarmFn,
     /// Resolve the direct URLs ahead of the request, as `prewarm` does the download. Injectable for
     /// the same reason it is: a test has to be able to keep yt-dlp out of the `/meta` path.
-    pub direct_warm: PrewarmFn,
+    pub direct_warm: DirectWarmFn,
     pub clock: ClockFn,
     /// Global caps on concurrent subprocess trees, so a burst of distinct ids can't fork-bomb the
     /// box: downloads (yt-dlp+ffmpeg) and probes (yt-dlp --simulate).
@@ -301,8 +303,8 @@ pub fn default_prewarm() -> PrewarmFn {
 }
 
 /// Real direct warm-up: resolve into the cache so the `/direct` that follows is a hash lookup.
-pub fn default_direct_warm() -> PrewarmFn {
-    Box::new(|state: Arc<AppState>, id: String| crate::direct::warm(state, id))
+pub fn default_direct_warm() -> DirectWarmFn {
+    Box::new(|state: Arc<AppState>, id: String, cap: Option<u32>| crate::direct::warm(state, id, cap))
 }
 
 /// Read the resolve cache left by the previous process, dropping whatever no longer holds.

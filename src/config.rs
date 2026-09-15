@@ -233,6 +233,31 @@ pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 /// Fallback when MAX_HEIGHT is unset or not a number. avc1's practical ceiling on YouTube.
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
 
+/// The rungs under a cap that the ladder steps down through, highest first.
+pub const LADDER_STEPS: [u32; 2] = [720, 480];
+
+/// The yt-dlp format string for a height cap: avc1 + mp4a at the cap, then each step below it.
+///
+/// The ladder degrades in QUALITY ORDER. It used to fall from the ≤max_height rungs straight to itag
+/// 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
+/// panel even when a perfectly good 720p existed. The intermediate rungs cost nothing when the top
+/// one resolves (yt-dlp stops at the first match) and only matter when it doesn't.
+/// Only rungs BELOW the cap. A fixed 720/480 ladder meant MAX_HEIGHT=480 still matched a
+/// 720p rendition — looser than the cap it was asked to honour — whenever the ≤480 avc1
+/// stream was missing. The last rung keeps the avc1+mp4a filter for the same reason the
+/// whole string exists: an unfiltered fallback can hand AVPlayer a VP9/AV1 file.
+pub fn format_ladder(cap: u32) -> String {
+    let rung = |h: u32| {
+        format!("bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1][acodec^=mp4a]/")
+    };
+    let mut ladder = rung(cap);
+    for step in LADDER_STEPS.into_iter().filter(|s| *s < cap) {
+        ladder.push_str(&rung(step));
+    }
+    ladder.push_str("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]");
+    ladder
+}
+
 impl Config {
     pub fn from_env() -> Config {
         let port = env_opt("PORT").and_then(|v| v.parse().ok()).unwrap_or(8092);
@@ -254,19 +279,6 @@ impl Config {
         );
         let ytdlp_cache = cache_dir.join("yt-dlp");
         let resolve_cache = cache_dir.join("state").join("resolve.json");
-        // The ladder degrades in QUALITY ORDER. It used to fall from the ≤max_height rungs straight to itag
-        // 18 — 360p — so any trailer whose 1080p avc1 stream was unavailable was served at 360p on a 4K
-        // panel even when a perfectly good 720p existed. The intermediate rungs cost nothing when the top
-        // one resolves (yt-dlp stops at the first match) and only matter when it doesn't.
-        // Only rungs BELOW the cap. A fixed 720/480 ladder meant MAX_HEIGHT=480 still matched a
-        // 720p rendition — looser than the cap it was asked to honour — whenever the ≤480 avc1
-        // stream was missing. The last rung keeps the avc1+mp4a filter for the same reason the
-        // whole string exists: an unfiltered fallback can hand AVPlayer a VP9/AV1 file.
-        let rung = |h: &str| {
-            format!(
-                "bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1][acodec^=mp4a]/"
-            )
-        };
         // The PARSED cap everywhere, including the first rung. Interpolating the raw string put
         // `height<=abc` into the selector, and yt-dlp rejects a malformed filter while BUILDING it
         // — so the whole `/`-chain dies, terminal fallback included, and every trailer 502s until
@@ -275,13 +287,7 @@ impl Config {
         // fails through to the uncapped terminal fallback — the cap inverted into no cap at all.
         // 144 is YouTube's lowest rendition; below it no rung can ever match.
         let cap: u32 = max_height.parse().ok().filter(|c| *c >= 144).unwrap_or(DEFAULT_MAX_HEIGHT);
-        let mut ytdlp_format = rung(&cap.to_string());
-        for step in [720u32, 480] {
-            if step < cap {
-                ytdlp_format.push_str(&rung(&step.to_string()));
-            }
-        }
-        ytdlp_format.push_str("18/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]");
+        let ytdlp_format = format_ladder(cap);
         // Unset = pass no flag = yt-dlp chooses. See the field's doc for why pinning was removed:
         // the pinned client no longer existed, and an unknown name is skipped with a warning that
         // `--no-warnings` hid.

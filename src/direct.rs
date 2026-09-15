@@ -170,11 +170,11 @@ fn from_worker(answer: crate::worker::Answer, now: u64) -> Option<Direct> {
 
 /// Ask yt-dlp for the URLs, without downloading anything.
 ///
-/// The format string is `cfg.ytdlp_format` — the very same ladder `/play` extracts with. That is
-/// deliberate: it pins avc1 + mp4a under `MAX_HEIGHT`, which is what a browser's own hardware
-/// decoder wants for the same reasons AVPlayer does, and it means this endpoint cannot start
-/// answering with a VP9/AV1 stream that only some browsers can play.
-pub async fn resolve(cfg: &Config, vid: &str, now: u64) -> Result<Direct, PlayError> {
+/// The format string is `cfg.ytdlp_format` — the very same ladder `/play` extracts with — or that
+/// ladder from a lower rung (`height_cap`). Either way it pins avc1 + mp4a under `MAX_HEIGHT`, which
+/// is what a browser's own hardware decoder wants for the same reasons AVPlayer does, and it means
+/// this endpoint cannot start answering with a VP9/AV1 stream that only some browsers can play.
+pub async fn resolve(cfg: &Config, vid: &str, format: &str, now: u64) -> Result<Direct, PlayError> {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let mut cmd = Command::new(&cfg.ytdlp);
     cmd.args([
@@ -186,7 +186,7 @@ pub async fn resolve(cfg: &Config, vid: &str, now: u64) -> Result<Direct, PlayEr
         "--cache-dir",
         &cache, // the same nsig/player-JS work a probe or a download already paid for
         "-f",
-        &cfg.ytdlp_format,
+        format,
         "--print",
         "%(width)s %(height)s",
         "--print",
@@ -236,14 +236,38 @@ pub async fn resolve(cfg: &Config, vid: &str, now: u64) -> Result<Direct, PlayEr
     })
 }
 
-/// The still-standing cached answer for `vid`, if it has not expired.
-fn cached(state: &AppState, vid: &str, now: u64) -> Option<Result<Direct, PlayError>> {
+/// The rung a request's `?height=` caps the answer at, or `None` for the full `MAX_HEIGHT` ladder.
+///
+/// A muted preview behind text has no use for 1080p, and Safari will not say it can play through
+/// until it has buffered ahead, which takes longer the more bytes each second carries. Rounded down
+/// to a step of the ladder (and up to its lowest) so one video resolves at most once per step, not
+/// once per number a caller can type — the height is not part of the signature.
+pub(crate) fn height_cap(cfg: &Config, asked: Option<&str>) -> Option<u32> {
+    let asked: u32 = asked?.parse().ok()?;
+    let max: u32 = cfg.max_height.parse().ok()?;
+    let steps: Vec<u32> = crate::config::LADDER_STEPS.into_iter().filter(|s| *s < max).collect();
+    if asked >= max {
+        return None;
+    }
+    steps.iter().copied().find(|s| *s <= asked).or(steps.last().copied())
+}
+
+/// Where an answer is kept: the id alone at the full ladder, the id and its rung below it.
+fn key(vid: &str, cap: Option<u32>) -> String {
+    match cap {
+        Some(h) => format!("{vid}@{h}"),
+        None => vid.to_string(),
+    }
+}
+
+/// The still-standing cached answer under `key`, if it has not expired.
+fn cached(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayError>> {
     let map = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
-    map.get(vid).filter(|(_, exp)| *exp > now).map(|(r, _)| r.clone())
+    map.get(key).filter(|(_, exp)| *exp > now).map(|(r, _)| r.clone())
 }
 
 /// Remember an answer until `exp`. Bounded exactly like `play_fails`, and for the same reason.
-fn remember(state: &AppState, vid: &str, entry: CachedDirect, now: u64) {
+fn remember(state: &AppState, key: &str, entry: CachedDirect, now: u64) {
     let mut map = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
     if map.len() >= DIRECT_CACHE_MAX {
         map.retain(|_, (_, exp)| *exp > now);
@@ -251,7 +275,7 @@ fn remember(state: &AppState, vid: &str, entry: CachedDirect, now: u64) {
             map.clear();
         }
     }
-    map.insert(vid.to_string(), entry);
+    map.insert(key.to_string(), entry);
 }
 
 /// How long this answer may stand: until its URLs are close to expiring, and never past the moment
@@ -264,15 +288,18 @@ fn ttl_ms(answer: &Result<Direct, PlayError>, now: u64) -> u64 {
     }
 }
 
-/// This id's answer, from memory or from yt-dlp. `None` timing means it came from the cache.
+/// This id's answer at `cap` (`height_cap`), from memory or from yt-dlp. `None` timing means it
+/// came from the cache.
 ///
 /// Shared by the request path and by the warm-up `/meta` fires, so a speculative resolve and a real
 /// one cannot drift apart — and so the warm-up genuinely fills the cache the request then reads.
 pub(crate) async fn answer(
     state: &Arc<AppState>,
     vid: &str,
+    cap: Option<u32>,
 ) -> (Result<Direct, PlayError>, Option<std::time::Duration>) {
-    if let Some(answer) = cached(state, vid, (state.clock)()) {
+    let key = key(vid, cap);
+    if let Some(answer) = cached(state, &key, (state.clock)()) {
         return (answer, None);
     }
     let started = std::time::Instant::now();
@@ -284,11 +311,13 @@ pub(crate) async fn answer(
     // same video. The warm-up bought nothing at all, which is the opposite of what it is for.
     let shared: SharedResolve = {
         let mut map = state.direct_inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(running) = map.get(vid) {
+        if let Some(running) = map.get(&key) {
             running.clone()
         } else {
             let st = state.clone();
             let v = vid.to_string();
+            let k = key.clone();
+            let format = cap.map(crate::config::format_ladder).unwrap_or_else(|| st.cfg.ytdlp_format.clone());
             let fut: BoxFuture<Result<Direct, PlayError>> = Box::pin(async move {
                 // While YouTube is throttling this box nothing is asked — the same gate a download
                 // meets, since a resolve is an extraction too.
@@ -300,7 +329,7 @@ pub(crate) async fn answer(
                     let _permit = st.probe_sem.acquire().await;
                     // The resident worker first, and the binary whenever it cannot answer — which is
                     // every way it can fail, including not being configured at all.
-                    match st.worker.resolve(&st.cfg, &v).await {
+                    match st.worker.resolve(&st.cfg, &v, &format).await {
                         Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
                             status: 502,
                             reason: "no_direct_url".into(),
@@ -309,7 +338,7 @@ pub(crate) async fn answer(
                         }),
                         // Its own words about this video, classified exactly as the binary's stderr is.
                         Some(Err(said)) => Err(classify(None, &said)),
-                        None => resolve(&st.cfg, &v, (st.clock)()).await,
+                        None => resolve(&st.cfg, &v, &format, (st.clock)()).await,
                     }
                 };
                 let now = (st.clock)();
@@ -329,13 +358,13 @@ pub(crate) async fn answer(
                 // A throttle says nothing about this video; the pause answers for every id, and a
                 // cached copy would outlive it.
                 if !matches!(&answer, Err(e) if e.reason == "throttled") {
-                    remember(&st, &v, (answer.clone(), now + ttl_ms(&answer, now)), now);
+                    remember(&st, &k, (answer.clone(), now + ttl_ms(&answer, now)), now);
                 }
-                st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&v);
+                st.direct_inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&k);
                 answer
             });
             let shared = fut.shared();
-            map.insert(vid.to_string(), shared.clone());
+            map.insert(key, shared.clone());
             // Driven by a task of its own, so a client that navigates away mid-resolve cannot leave
             // the entry standing with a future nobody will poll — which would wedge the id until
             // restart. Same reason the download path detaches its driver.
@@ -356,22 +385,22 @@ pub(crate) async fn answer(
 /// why the direct path felt slower for a title that had been browsed: it traded a warm file for a
 /// cold resolve. This puts the resolve on the same footing. Fire-and-forget, and it takes the same
 /// probe permit, so a browse cannot spend more of the budget than a probe would.
-pub fn warm(state: Arc<AppState>, vid: String) {
+pub fn warm(state: Arc<AppState>, vid: String, cap: Option<u32>) {
     if !crate::is_valid_vid(&vid) {
         return;
     }
     // Nothing to do if the answer is already standing — checked before spawning, so a browse over
     // titles that are all cached costs no tasks at all.
-    if cached(&state, &vid, (state.clock)()).is_some() {
+    if cached(&state, &key(&vid, cap), (state.clock)()).is_some() {
         return;
     }
     tokio::spawn(async move {
-        let _ = answer(&state, &vid).await;
+        let _ = answer(&state, &vid, cap).await;
     });
 }
 
-pub async fn handle_direct(state: Arc<AppState>, vid: String) -> Response<Body> {
-    let (answer, spent) = answer(&state, &vid).await;
+pub async fn handle_direct(state: Arc<AppState>, vid: String, cap: Option<u32>) -> Response<Body> {
+    let (answer, spent) = answer(&state, &vid, cap).await;
     let now = (state.clock)();
     let timing = match spent {
         Some(d) => httputil::timing("resolve", d),

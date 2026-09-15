@@ -76,7 +76,7 @@ impl Worker {
     /// `None` means "this path is not available" — not configured, could not start, died, or took
     /// too long — and the caller should spawn the binary. `Some(Err)` is yt-dlp's own failure for
     /// this video, which the caller classifies exactly as it classifies stderr from the binary.
-    pub async fn resolve(&self, cfg: &Config, vid: &str) -> Option<Result<Answer, String>> {
+    pub async fn resolve(&self, cfg: &Config, vid: &str, format: &str) -> Option<Result<Answer, String>> {
         let path = cfg.ytdlp_worker.as_deref()?;
         let mut held = self.0.lock().await;
         if held.is_none() {
@@ -86,7 +86,7 @@ impl Worker {
 
         let request = serde_json::json!({
             "id": vid,
-            "format": cfg.ytdlp_format,
+            "format": format,
             "cache": cfg.ytdlp_cache.to_string_lossy(),
             "extractor_args": cfg.ytdlp_extractor_args,
         });

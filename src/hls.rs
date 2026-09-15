@@ -316,7 +316,7 @@ pub async fn handle_master(
     uris: Uris,
     playable: Option<crate::client::Playable>,
 ) -> Response<Body> {
-    let (answer, spent) = crate::direct::answer(&state, &vid).await;
+    let (answer, spent) = crate::direct::answer(&state, &vid, None).await;
     let direct = match answer {
         Ok(d) => d,
         Err(e) => return crate::play::play_error(&state, &vid, &e),

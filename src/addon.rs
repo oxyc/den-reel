@@ -489,8 +489,10 @@ pub async fn handle_meta(
             // `/play` was already a warm file while `/direct` still had a cold yt-dlp run in front
             // of it. A resolve is a metadata round-trip, so it spends a probe permit rather than a
             // download slot or room on the cache volume.
+            // At the `?height=` the `/direct` that follows will ask for, or that is a second resolve.
             if direct {
-                (state.direct_warm)(state.clone(), primary.clone());
+                let cap = crate::direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
+                (state.direct_warm)(state.clone(), primary.clone(), cap);
             }
         }
     }

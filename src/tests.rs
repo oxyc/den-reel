@@ -287,7 +287,7 @@ fn build_state_full(
         searcher,
         prewarm,
         // Never the real one: /meta would spawn yt-dlp behind every test that browses a title.
-        direct_warm: noop_prewarm(),
+        direct_warm: Box::new(|_state, _id, _cap| {}),
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
@@ -3941,7 +3941,7 @@ async fn direct_answers_the_urls_and_resolves_each_id_once() {
     );
     let state = direct_state(&dir, yt);
 
-    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
     assert_eq!(resp.status(), 200);
     let body = direct_body(resp).await;
     assert_eq!(body["video"], "https://rr7.googlevideo.com/videoplayback?itag=137&expire=4000000000");
@@ -3951,9 +3951,60 @@ async fn direct_answers_the_urls_and_resolves_each_id_once() {
     assert_eq!(spawn_count(&runs), 1);
 
     // The URLs are good for hours. Re-resolving would spend a yt-dlp run to print the same thing.
-    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
+}
+
+/// `?height=` lands on a step of the ladder, so a caller cannot make one video resolve once per
+/// number, and it never reaches past `MAX_HEIGHT`.
+#[test]
+fn a_height_cap_lands_on_a_step_of_the_ladder() {
+    let cfg = test_cfg(temp_dir());
+    let cap = |asked: &str| crate::direct::height_cap(&cfg, Some(asked));
+    assert_eq!(cap("720"), Some(720));
+    assert_eq!(cap("900"), Some(720), "rounded down, never up past what was asked");
+    assert_eq!(cap("600"), Some(480));
+    assert_eq!(cap("240"), Some(480), "below the lowest step is the lowest step");
+    assert_eq!(cap("1080"), None, "the full ladder is the uncapped answer");
+    assert_eq!(cap("2160"), None, "MAX_HEIGHT still caps");
+    assert_eq!(cap("720p"), None);
+    assert_eq!(crate::direct::height_cap(&cfg, None), None);
+}
+
+/// A preview asking for 720p gets the ladder from 720 down, and an answer of its own: the 1080p one
+/// standing in the cache must not be handed to it, nor it to the next request at full height.
+#[tokio::test]
+async fn a_capped_direct_resolves_its_own_ladder_once() {
+    let dir = temp_dir();
+    let args = dir.join("args");
+    let (yt, runs) = fake_resolver(
+        &dir,
+        "yt-capped",
+        &format!(
+            "printf '%s\\n' \"$*\" >> {}\nprintf '1280 720\\nhttps://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\\n'",
+            args.display()
+        ),
+    );
+    let state = direct_state(&dir, yt);
+
+    let full = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(full.status(), 200);
+    let capped = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), Some(720)).await;
+    assert_eq!(capped.status(), 200);
+    assert_eq!(spawn_count(&runs), 2, "the capped ask was answered from the full-height resolve");
+
+    let asked = std::fs::read_to_string(&args).unwrap();
+    let mut lines = asked.lines();
+    // The test config's own ladder is `fmt`: the full-height ask uses it unchanged.
+    assert!(lines.next().unwrap().contains("-f fmt "));
+    let second = lines.next().unwrap();
+    assert!(!second.contains("height<=1080"), "a 720p cap still reached 1080p: {second}");
+    assert!(second.contains("height<=720") && second.contains("height<=480"), "{second}");
+
+    let again = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), Some(720)).await;
+    assert_eq!(again.status(), 200);
+    assert_eq!(spawn_count(&runs), 2, "the capped answer was resolved twice inside its own expiry");
 }
 
 /// The resident worker's protocol, held still. A success carries the streams flattened alongside
@@ -4001,8 +4052,8 @@ async fn concurrent_asks_for_one_id_share_a_single_resolve() {
     let state = direct_state(&dir, yt);
 
     let (first, second) = tokio::join!(
-        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()),
-        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()),
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None),
+        crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None),
     );
 
     assert_eq!(first.status(), 200);
@@ -4018,11 +4069,11 @@ async fn a_removed_video_is_classified_and_not_re_resolved() {
     let (yt, runs) = fake_resolver(&dir, "yt-gone", "echo 'ERROR: Video unavailable' >&2\nexit 1");
     let state = direct_state(&dir, yt);
 
-    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
     assert_eq!(resp.status(), 404, "a removed video is a 404, as it is on /play");
     assert_eq!(direct_body(resp).await["error"], "unavailable");
 
-    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into()).await;
+    let resp = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
     assert_eq!(resp.status(), 404);
     assert_eq!(spawn_count(&runs), 1, "a known-dead id was re-resolved");
 }

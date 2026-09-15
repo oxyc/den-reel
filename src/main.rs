@@ -638,7 +638,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             if !signature_ok(&state, id, query) {
                 return bad_signature();
             }
-            return direct::handle_direct(state, id.to_string()).await;
+            let cap = direct::height_cap(&state.cfg, query_param(query, "height").as_deref());
+            return direct::handle_direct(state, id.to_string(), cap).await;
         }
     }
 

@@ -98,7 +98,8 @@ GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <p
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
 GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
-                                             without this server in the middle (the web app)
+                                             without this server in the middle (the web app);
+                                             ?height=720 caps the rung
 GET /hls/<youtube_id>.m3u8                →  YouTube's own HLS master, best variant first, every URI
                                              through /hls/seg; ?native=1 keeps Google's URIs and no
                                              rung under 540p; with X-Den-Playable or ?playable=,
@@ -204,6 +205,13 @@ answers with the googlevideo URLs:
 The page then streams from Google directly: no wait for a download, no cache volume, and none of the
 trailer's bytes through this box. Same format ladder as `/play` (avc1 + mp4a under `MAX_HEIGHT`), so
 it cannot start handing out a VP9/AV1 stream only some browsers decode.
+
+**`?height=`** caps that ladder for a surface that needs less: a muted preview behind text asks for
+`720` and gets the 720p/480p rungs, so a browser that buffers ahead before it says it can play
+(Safari) has fewer bytes to wait for. The number is rounded down to a step of the ladder (720, 480;
+anything lower is 480) and never raises `MAX_HEIGHT`, so one video resolves at most once per step.
+It is not part of the signature. Each step is cached apart, so `/meta?prewarm=direct` takes the same
+`height` and warms the answer the `/direct` that follows will ask for.
 
 **The URLs work away from this server.** They carry `ip=<this box>` inside the signed `sparams` set,
 which reads like the IP binding the section above describes — but Google does not enforce it; a URL
