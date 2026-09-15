@@ -1,16 +1,23 @@
-# den-reel — our binary + yt-dlp + ffmpeg, in one slim image.
+# den-reel — Rust binary + yt-dlp + ffmpeg, in one slim image.
 #
-# The binary is NOT built here: it is copied in from dist/den-reel, compiled beforehand in rust:1-trixie so it
-# links against this image's glibc (docker-publish.yml's `binary` job; README "Run" for a local build). Compiled
-# in a stage of this file, the Rust stage never took from the Actions build cache and recompiled every dependency
-# on every release (measured 2026-09-15), where rust-cache in a plain job keeps them.
-#
-# Two throwaway stages build MP4Box and fetch the extractor tools (deno + yt-dlp) with curl/unzip, then
-# the runtime image carries neither toolchain nor curl/unzip — just ffmpeg, ca-certs, the two extractor
-# binaries, and our ~2 MB binary. No Node, no npm. python3 is here for exactly one thing: the resident
-# resolver (worker/resolve.py), because spawning the standalone binary spends ~840ms starting an
-# interpreter before it looks at anything, and that is paid again for every trailer. Builds amd64, the
-# box's arch.
+# Three stages: build the Rust binary, fetch the extractor tools (deno + yt-dlp) with curl/unzip in
+# a throwaway stage, then assemble a runtime image that carries neither the Rust toolchain nor
+# curl/unzip — just ffmpeg, ca-certs, the two extractor binaries, and our ~2 MB binary. No Node, no
+# npm. python3 is here for exactly one thing: the resident resolver (worker/resolve.py), because
+# spawning the standalone binary spends ~840ms starting an interpreter before it looks at anything,
+# and that is paid again for every trailer. Builds amd64, the box's arch.
+
+# ---- build ----------------------------------------------------------------
+FROM rust:1-trixie AS build
+WORKDIR /src
+# Cache deps: build against the manifests + a dummy main first, so a code-only change re-runs only the
+# final (LTO'd) link of our crate, not the whole dependency compile. In Actions it is rebuilt every
+# release anyway — this stage never took from the GHA build cache, even for its WORKDIR (measured
+# 2026-09-15) — but it holds for a local rebuild, and nothing found makes it hit there.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
+COPY src ./src
+RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in the release profile
 
 # ---- build MP4Box (GPAC) — writes the clap box; gpac is gone from Debian repos ----------
 # Plain default build → MP4Box + libgpac.so (~10 MB total), linking only libc/libm/libz. Copying the
@@ -100,8 +107,7 @@ COPY worker/resolve.py /app/resolve.py
 COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
 COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
 RUN ldconfig
-# Built before this runs (see the top). --chmod, because a binary handed between workflow jobs loses its mode.
-COPY --chmod=755 dist/den-reel /usr/local/bin/den-reel
+COPY --from=build /src/target/release/den-reel /usr/local/bin/den-reel
 
 # Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532), so the box chowns
 # one uid for every writable host dir. A real account rather than a bare number: deno keeps its cache

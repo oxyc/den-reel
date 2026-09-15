@@ -470,12 +470,7 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 
 ## Run
 
-The image copies a binary built beforehand (`dist/den-reel`), compiled in the image's own Debian so it links
-against the same glibc:
-
 ```bash
-docker run --rm -v "$PWD:/src" -w /src rust:1-trixie cargo build --release --locked
-mkdir -p dist && cp target/release/den-reel dist/
 docker build -t den-reel .
 docker run -d --name trailers -p 8092:8092 -v den-reel-cache:/cache \
   -e TMDB_KEY=<your-tmdb-key> den-reel

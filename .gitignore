@@ -1,5 +1,4 @@
 /target
-/dist
 cache/
 *.mp4
 .env

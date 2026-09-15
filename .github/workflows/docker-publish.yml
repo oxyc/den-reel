@@ -71,37 +71,10 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
-  # den-reel itself, compiled here rather than in the image build. Compiled in a Dockerfile stage it never took
-  # from the Actions build cache and recompiled every dependency on every release (2026-09-15); rust-cache keeps
-  # them between runs. In rust:1-trixie, so the binary links against the glibc the trixie runtime image has.
-  binary:
-    needs: [source]
-    runs-on: ubuntu-latest
-    container: rust:1-trixie
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/tags/${{ needs.source.outputs.ref }}
-          persist-credentials: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Build
-        run: cargo build --release --locked   # `strip = true` in the release profile
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: den-reel
-          path: target/release/den-reel
-          if-no-files-found: error
-          retention-days: 1
-
   # Builds, pushes by digest and version tags, and scans. What it pushes is unsigned and not :latest, which is
   # all the box deploys, so building before CI has passed publishes nothing the box would take.
   build:
-    needs: [source, binary]
+    needs: [source]
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -114,13 +87,6 @@ jobs:
         with:
           ref: refs/tags/${{ needs.source.outputs.ref }}
           persist-credentials: false
-
-      # Where the Dockerfile copies it from.
-      - name: Fetch the binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: den-reel
-          path: dist
 
       # The manifest reads env!("CARGO_PKG_VERSION") and the image tag is the git tag — so a v* release
       # must equal v<Cargo.toml version> or the reported version would be a lie. Fail fast on a mismatch.
