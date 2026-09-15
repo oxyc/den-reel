@@ -298,6 +298,12 @@ fn build_state_full(
         cache_trailer_count: std::sync::atomic::AtomicU64::new(0),
         cache_scratch_bytes: std::sync::atomic::AtomicU64::new(0),
         cache_measured_at: std::sync::atomic::AtomicU64::new(0),
+        index_video: Default::default(),
+        index_audio: Default::default(),
+        index_failures: std::sync::atomic::AtomicU64::new(0),
+        index_hits: std::sync::atomic::AtomicU64::new(0),
+        index_waits: std::sync::atomic::AtomicU64::new(0),
+        resolves: Default::default(),
         extract_fails: std::sync::atomic::AtomicU32::new(0),
         local_fails: std::sync::atomic::AtomicU32::new(0),
         youtube: crate::state::youtube_backoff(),
@@ -853,6 +859,20 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
     );
     assert!(has(&body, &format!("reel_downloads_max {}", crate::DOWNLOAD_CONCURRENCY)));
     assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
+
+    // What the web's trailers cost, as they are recorded.
+    state.index_audio.record(std::time::Duration::from_millis(2874));
+    state.index_audio.record(std::time::Duration::from_millis(1126));
+    state.index_hits.fetch_add(3, Ordering::Relaxed);
+    state.resolves.record(std::time::Duration::from_millis(1559));
+    let body = scrape_metrics(&base, Some("scrape-me")).await.text().await.unwrap();
+    assert!(has(&body, "# TYPE reel_index_builds_total counter"));
+    assert!(has(&body, "reel_index_builds_total{streams=\"video+audio\"} 2"));
+    assert!(has(&body, "reel_index_builds_total{streams=\"video\"} 0"));
+    assert!(has(&body, "reel_index_build_milliseconds_total{streams=\"video+audio\"} 4000"));
+    assert!(has(&body, "reel_index_requests_total{index=\"built\"} 3"));
+    assert!(has(&body, "reel_resolve_milliseconds_total 1559"));
+    assert!(has(&body, "reel_last_milliseconds{of=\"index_video+audio\"} 1126"), "the last, not the largest");
 }
 
 /// The fleet reads the token one way: `Bearer ` required, the rest trimmed. A bare token is a refusal,

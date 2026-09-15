@@ -59,6 +59,10 @@ const INDEX_TIMEOUT: Duration = Duration::from_secs(15);
 /// One fragment's bytes on their way to a player: long enough for a slow line.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// An index build this slow is logged: its first caller waited all of it (2.9 s was measured for a trailer
+/// with sound, cold, against well under a second video-only).
+const SLOW_INDEX: Duration = Duration::from_secs(3);
+
 /// Bound on the kept indexes. Each is tens of kilobytes and expires with its URL.
 pub const PROGRESSIVE_MAX: usize = 64;
 
@@ -785,7 +789,26 @@ async fn layout_for(
             _ => {
                 let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {
+                    let started = Instant::now();
                     let built = build(&st.http, &urls).await.map(Arc::new);
+                    let took = started.elapsed();
+                    match (&built, urls.len()) {
+                        (Ok(_), 1) => st.index_video.record(took),
+                        (Ok(_), _) => st.index_audio.record(took),
+                        (Err(_), _) => {
+                            st.index_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    // Whoever asked first waited all of it, so a slow build is worth a line of its own.
+                    if took >= SLOW_INDEX {
+                        crate::log_limited("progressive slow index", || {
+                            format!(
+                                "progressive: [{k}] index took {:.1} s for {} stream(s)",
+                                took.as_secs_f64(),
+                                urls.len()
+                            )
+                        });
+                    }
                     // A fetch that failed may work next time; a file that cannot be indexed will not.
                     if matches!(&built, Err(e) if e.retry) {
                         let mut map = st.progressive.lock().unwrap_or_else(|e| e.into_inner());
@@ -814,6 +837,8 @@ async fn layout_for(
         }
     };
     let waited = shared.peek().is_none().then(Instant::now);
+    let counted = if waited.is_some() { &state.index_waits } else { &state.index_hits };
+    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let built = shared.await;
     (built, waited.map(|t| t.elapsed()))
 }
@@ -1228,6 +1253,80 @@ mod tests {
                 serde_json::to_string(&report).unwrap()
             );
         }
+    }
+
+    /// Serve `files` over plain HTTP ranges on 127.0.0.1, as googlevideo does, counting every request.
+    async fn serve_ranges(files: Vec<Vec<u8>>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (count, files) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(files));
+        let counted = count.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let (count, files) = (counted.clone(), files.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match conn.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        buf.drain(..end + 4);
+                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let file: usize = head
+                            .split(' ')
+                            .nth(1)
+                            .and_then(|p| p.trim_start_matches('/').parse().ok())
+                            .unwrap();
+                        let range = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase().strip_prefix("range: bytes=").map(str::to_string)
+                            })
+                            .unwrap();
+                        let (from, to) = range.split_once('-').unwrap();
+                        let data = &files[file];
+                        let from: usize = from.parse().unwrap();
+                        let to = to.parse::<usize>().unwrap().min(data.len() - 1);
+                        let reply = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{to}/{}\r\n\r\n",
+                            to + 1 - from,
+                            data.len()
+                        );
+                        if conn.write_all(reply.as_bytes()).await.is_err()
+                            || conn.write_all(&data[from..=to]).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, count)
+    }
+
+    /// What an index costs Google in requests — the one thing about its speed a viewer would feel and a test
+    /// can hold still: one for each file's first bytes, then one per fragment, never one per sample.
+    #[tokio::test]
+    async fn an_index_costs_one_request_per_fragment_and_no_more() {
+        let video_fragments: Vec<Vec<u32>> = (0..40).map(|_| vec![7, 3, 3, 3]).collect();
+        let audio_fragments: Vec<Vec<u32>> = (0..15).map(|_| vec![2, 2, 2]).collect();
+        let video = fragmented(&video_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let audio = fragmented(&audio_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 1);
+        let (base, requests) = serve_ranges(vec![video, audio]).await;
+        let http = reqwest::Client::new();
+        let count = || requests.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+        build(&http, &[format!("{base}/0")]).await.expect("a video index");
+        assert_eq!(count(), 1 + 40, "the first bytes, then each fragment's moof");
+        build(&http, &[format!("{base}/0"), format!("{base}/1")]).await.expect("an index with sound");
+        assert_eq!(count(), (1 + 40) + (1 + 15), "and the same again for the audio file");
     }
 
     /// The payload of the box at `path` under the top level of `b`.

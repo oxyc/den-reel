@@ -358,6 +358,69 @@ fn metrics_body(state: &AppState) -> String {
             ("kind=\"local\"", state.local_fails.load(Relaxed) as u64),
         ],
     );
+    // What the web's trailers cost: counts only rise, so these are counters.
+    let mut counter = |name: &str, help: &str, samples: &[(&str, u64)]| {
+        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} counter");
+        for (labels, v) in samples {
+            if labels.is_empty() {
+                let _ = writeln!(b, "{name} {v}");
+            } else {
+                let _ = writeln!(b, "{name}{{{labels}}} {v}");
+            }
+        }
+    };
+    let (video, audio) = (&state.index_video, &state.index_audio);
+    counter(
+        "reel_index_builds_total",
+        "/progressive indexes built, by the streams they index.",
+        &[
+            ("streams=\"video\"", video.count.load(Relaxed)),
+            ("streams=\"video+audio\"", audio.count.load(Relaxed)),
+        ],
+    );
+    counter(
+        "reel_index_build_milliseconds_total",
+        "Time spent building them; divide by the builds for the mean.",
+        &[
+            ("streams=\"video\"", video.total_ms.load(Relaxed)),
+            ("streams=\"video+audio\"", audio.total_ms.load(Relaxed)),
+        ],
+    );
+    counter(
+        "reel_index_build_failures_total",
+        "Index builds that failed.",
+        &[("", state.index_failures.load(Relaxed))],
+    );
+    counter(
+        "reel_index_requests_total",
+        "Requests for an index: found built, or waited for its build.",
+        &[
+            ("index=\"built\"", state.index_hits.load(Relaxed)),
+            ("index=\"waited\"", state.index_waits.load(Relaxed)),
+        ],
+    );
+    counter("reel_resolves_total", "yt-dlp resolves that ran.", &[("", state.resolves.count.load(Relaxed))]);
+    counter(
+        "reel_resolve_milliseconds_total",
+        "Time spent resolving, once each had its permit.",
+        &[("", state.resolves.total_ms.load(Relaxed))],
+    );
+    // The last of each, for a glance without a second scrape to take a difference over.
+    let mut gauge = |name: &str, help: &str, samples: &[(&str, u64)]| {
+        let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} gauge");
+        for (labels, v) in samples {
+            let _ = writeln!(b, "{name}{{{labels}}} {v}");
+        }
+    };
+    gauge(
+        "reel_last_milliseconds",
+        "How long the last one took.",
+        &[
+            ("of=\"index_video\"", video.last_ms.load(Relaxed)),
+            ("of=\"index_video+audio\"", audio.last_ms.load(Relaxed)),
+            ("of=\"resolve\"", state.resolves.last_ms.load(Relaxed)),
+        ],
+    );
     b
 }
 

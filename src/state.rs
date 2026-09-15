@@ -49,6 +49,24 @@ pub struct YtEntry {
     pub confirmed: u64,
 }
 
+/// How many times something ran and how long it took, in total and the last time, for `/metrics`.
+#[derive(Default)]
+pub struct Timings {
+    pub count: AtomicU64,
+    pub total_ms: AtomicU64,
+    pub last_ms: AtomicU64,
+}
+
+impl Timings {
+    pub fn record(&self, took: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = took.as_millis() as u64;
+        self.count.fetch_add(1, Relaxed);
+        self.total_ms.fetch_add(ms, Relaxed);
+        self.last_ms.store(ms, Relaxed);
+    }
+}
+
 pub struct AppState {
     pub cfg: Arc<Config>,
     /// Decrypts a sealed config path segment (den-scout/docs/SEALED-CONFIG.md). `None` = sealed URLs
@@ -134,6 +152,16 @@ pub struct AppState {
     pub cache_trailer_count: AtomicU64,
     pub cache_scratch_bytes: AtomicU64,
     pub cache_measured_at: AtomicU64,
+    /// `/progressive` index builds — video only, and with sound — and how long they took, for `/metrics`.
+    pub index_video: Timings,
+    pub index_audio: Timings,
+    /// Index builds that failed.
+    pub index_failures: AtomicU64,
+    /// Requests that found their index built already, and requests that had to wait for one.
+    pub index_hits: AtomicU64,
+    pub index_waits: AtomicU64,
+    /// yt-dlp resolves that ran, and how long each took once it had its permit.
+    pub resolves: Timings,
     pub extract_fails: AtomicU32,
     /// Consecutive downloads that failed for a LOCAL reason — exit 0 with no file, a bake killed
     /// mid-rewrite. Separate from `extract_fails` because the fix is different: nothing about
@@ -200,6 +228,12 @@ impl AppState {
             cache_trailer_count: AtomicU64::new(0),
             cache_scratch_bytes: AtomicU64::new(0),
             cache_measured_at: AtomicU64::new(0),
+            index_video: Timings::default(),
+            index_audio: Timings::default(),
+            index_failures: AtomicU64::new(0),
+            index_hits: AtomicU64::new(0),
+            index_waits: AtomicU64::new(0),
+            resolves: Timings::default(),
             extract_fails: AtomicU32::new(0),
             local_fails: AtomicU32::new(0),
             youtube: youtube_backoff(),

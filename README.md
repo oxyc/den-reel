@@ -62,7 +62,9 @@ The log is state changes, not events: one line when `/health` turns degraded (wi
 one when it recovers; one when a host pause starts and one when an answer lifts it; upstream, search and download failures at most once a minute per condition,
 with a count of what was held back; the version and a secret-free summary at startup. It never
 carries a key, a config segment, a play signature or a query string. `LOG_REQUESTS` adds a
-per-request line.
+per-request line. A `/progressive` index build that takes 3 s or more writes
+`progressive: [<id>] index took N s for K stream(s)`, at most once a minute: whoever asked for it first
+waited all of it.
 
 `/metrics` is the detail behind that verdict, as Prometheus gauges prefixed `reel_`: bytes and
 trailers on the volume against `CACHE_MAX_BYTES` (plus the scratch that also counts against it),
@@ -72,6 +74,13 @@ and `reel_build_info{version}`. The cache figures come from the eviction pass �
 every download and hourly — not from a directory walk per request, so
 `reel_cache_measured_at_seconds` says how fresh they are and reads `0` until the first pass on a new
 process. Nothing is computed until a scrape asks.
+
+What the web's trailers cost is there too, as counters since the process started:
+`reel_index_builds_total{streams="video"|"video+audio"}` with `reel_index_build_milliseconds_total` beside it
+(divide for the mean), `reel_index_build_failures_total`, `reel_index_requests_total{index="built"|"waited"}`
+(how often a `/progressive` request found its index ready), and `reel_resolves_total` with
+`reel_resolve_milliseconds_total`. `reel_last_milliseconds{of=…}` holds the most recent of each, for a glance
+without a second scrape.
 
 It is **off unless `METRICS_TOKEN` is set**, and then answers only
 `Authorization: Bearer <METRICS_TOKEN>`; every refusal is the same 404 an unknown path gets. In-flight

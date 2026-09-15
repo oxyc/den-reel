@@ -327,9 +327,10 @@ pub(crate) async fn answer(
                     // The permit is taken INSIDE the shared future, so waiters queue on the resolve
                     // rather than on the budget: one permit is spent per video, not per caller.
                     let _permit = st.probe_sem.acquire().await;
+                    let started = std::time::Instant::now();
                     // The resident worker first, and the binary whenever it cannot answer — which is
                     // every way it can fail, including not being configured at all.
-                    match st.worker.resolve(&st.cfg, &v, &format).await {
+                    let answer = match st.worker.resolve(&st.cfg, &v, &format).await {
                         Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
                             status: 502,
                             reason: "no_direct_url".into(),
@@ -339,7 +340,9 @@ pub(crate) async fn answer(
                         // Its own words about this video, classified exactly as the binary's stderr is.
                         Some(Err(said)) => Err(classify(None, &said)),
                         None => resolve(&st.cfg, &v, &format, (st.clock)()).await,
-                    }
+                    };
+                    st.resolves.record(started.elapsed());
+                    answer
                 };
                 let now = (st.clock)();
                 match &answer {
