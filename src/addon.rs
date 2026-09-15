@@ -152,16 +152,16 @@ pub fn build_meta(
     let links: Vec<Value> = yt_ids
         .iter()
         .map(|id| {
-            let url = match &signer {
-                Some(s) => {
-                    format!("{base}/play/{id}.mp4?s={}{bound}", s.tag(&crate::sign::message(id, binding)))
-                }
-                None => format!("{base}/play/{id}.mp4"),
+            let signed = match &signer {
+                Some(s) => format!("?s={}{bound}", s.tag(&crate::sign::message(id, binding))),
+                None => String::new(),
             };
             json!({
                 "name": "Trailer",
                 "category": "Trailer",
-                "trailers": url,
+                "trailers": format!("{base}/play/{id}.mp4{signed}"),
+                // Where a web page asks which forms of this trailer to play (`sources.rs`), under the same tag.
+                "sources": format!("{base}/sources/{id}.json{signed}"),
                 "provider": "Den Reel",
             })
         })

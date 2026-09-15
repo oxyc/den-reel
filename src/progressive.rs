@@ -856,9 +856,21 @@ fn streams(
     }
 }
 
-/// Build a stream's index ahead of the request that will play it, as `/meta?prewarm=progressive` asks, so
-/// that request costs a lookup rather than a round of range requests. `direct` is the resolve the warm-up
-/// has just finished.
+/// Build a stream's index ahead of the request that will play it, so that request costs a lookup rather
+/// than a round of range requests. `direct` is the resolve it is built from.
+pub(crate) async fn prepare(
+    state: &Arc<AppState>,
+    vid: &str,
+    cap: Option<u32>,
+    direct: &crate::direct::Direct,
+    audio: bool,
+) -> Result<(), Unbuilt> {
+    let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
+    let (key, urls) = streams(vid, cap, direct, audio);
+    layout_for(state, &key, &urls, until).await.0.map(|_| ())
+}
+
+/// `prepare`, as `/meta?prewarm=progressive` asks for it: nobody is waiting, so a failure is only said.
 pub(crate) async fn warm(
     state: &Arc<AppState>,
     vid: &str,
@@ -866,9 +878,7 @@ pub(crate) async fn warm(
     direct: &crate::direct::Direct,
     audio: bool,
 ) {
-    let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
-    let (key, urls) = streams(vid, cap, direct, audio);
-    if let (Err(e), _) = layout_for(state, &key, &urls, until).await {
+    if let Err(e) = prepare(state, vid, cap, direct, audio).await {
         crate::log_limited("progressive warm", || format!("[{vid}] no index built ahead ({})", e.why));
     }
 }

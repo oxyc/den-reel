@@ -49,12 +49,21 @@ pub struct DolbyVision {
 /// there or what is there doesn't parse — a master listing every variant is a worse answer for that browser, not a
 /// wrong one.
 pub fn from_request(headers: &HeaderMap, query: &str) -> Option<Playable> {
-    let raw = headers
+    parse(&raw_report(headers, query)?)
+}
+
+/// The report's text as a request carries it, header first, unparsed: what a minted media URL carries on.
+pub fn raw_report(headers: &HeaderMap, query: &str) -> Option<String> {
+    headers
         .get(HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
-        .or_else(|| crate::httputil::query_param(query, PARAM))?;
-    let parsed = (raw.len() <= MAX_REPORT_BYTES).then(|| serde_json::from_str(&raw).ok()).flatten();
+        .or_else(|| crate::httputil::query_param(query, PARAM))
+}
+
+/// A report's text, read. `None`, and said once in a while, when it is too long or does not parse.
+pub fn parse(raw: &str) -> Option<Playable> {
+    let parsed = (raw.len() <= MAX_REPORT_BYTES).then(|| serde_json::from_str(raw).ok()).flatten();
     if parsed.is_none() {
         crate::log_limited("playable report", || {
             "hls: a playable report that does not parse; listing every variant".to_string()

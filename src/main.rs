@@ -29,6 +29,7 @@ mod play;
 mod progressive;
 mod seal;
 mod sign;
+mod sources;
 mod state;
 mod upstream;
 mod userconfig;
@@ -460,7 +461,7 @@ fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
 /// or pasting the bare segment, which would otherwise put the key in the log through a 404.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
-    const ROUTES: [&str; 13] = [
+    const ROUTES: [&str; 15] = [
         "",
         "health",
         "metrics",
@@ -474,6 +475,8 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "progressive",
         "hls",
         "seg",
+        "sources",
+        "m",
     ];
     let rest = path.strip_prefix('/').unwrap_or(path);
     let (first, tail) = match rest.split_once('/') {
@@ -658,11 +661,29 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
         }
     }
 
+    // sources: /sources/<id>.json?surface=silent|audible&player=native|hls.js → the forms of this trailer
+    // a page should try, in order, as URLs minted under /m/ (see `sources.rs`). Signed like /direct, whose
+    // resolve it waits for.
+    if let Some(id) = path.strip_prefix("/sources/").and_then(|r| r.strip_suffix(".json")) {
+        if is_valid_vid(id) {
+            if !signature_ok(&state, id, query) {
+                return bad_signature();
+            }
+            return sources::handle_sources(state, &parts.headers, id.to_string(), query).await;
+        }
+    }
+
     // One URL out of a playlist this server rewrote. Its signature covers that URL rather than a
     // video id, so `signature_ok` is not the check here — `handle_segment` makes its own. It lives
-    // beside the master rather than at the root so the rewritten URIs can be relative to it.
-    if path == "/hls/seg" {
+    // beside the master rather than at the root so the rewritten URIs can be relative to it: a master
+    // served from /m/<blob> names `seg?u=…`, which lands on /m/seg.
+    if path == "/hls/seg" || path == "/m/seg" {
         return hls::handle_segment(state, query, &parts.headers).await;
+    }
+
+    // media: /m/<blob> → a form /sources minted. The blob carries its own tag, expiry and install.
+    if let Some(blob) = path.strip_prefix("/m/") {
+        return sources::handle_media(state, &parts.headers, blob, query).await;
     }
 
     // HLS: /hls/<id>.m3u8 → YouTube's own master playlist, best variant first, with every URI in it

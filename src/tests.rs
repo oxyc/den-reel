@@ -4063,6 +4063,99 @@ async fn concurrent_asks_for_one_id_share_a_single_resolve() {
     assert_eq!(spawn_count(&runs), 1, "one video, resolved twice at once");
 }
 
+/// A page names its surface and player and gets the forms to try in order, as URLs this server minted,
+/// never the same one twice — and `/meta` says where to ask, under the play URL's own tag.
+#[tokio::test]
+async fn sources_list_the_forms_a_surface_should_try_in_order() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-sources",
+        "printf '1280 720\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\\n'",
+    );
+    let state = direct_state(&dir, yt);
+    let ask = |query: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+        }
+    };
+
+    let body = direct_body(ask("surface=silent&player=hls.js").await).await;
+    let list = body["sources"].as_array().unwrap();
+    assert_eq!(
+        list[0]["url"], "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000",
+        "a Media Source player previews Google's own file"
+    );
+    assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(false)));
+    assert!(list[1]["url"].as_str().unwrap().contains("/m/"), "{}", list[1]["url"]);
+    assert_eq!(list[2]["kind"], "hls");
+
+    let body = direct_body(ask("surface=audible&player=native").await).await;
+    let list = body["sources"].as_array().unwrap();
+    assert_eq!(list[0]["kind"], "hls", "Safari's own HLS player started soonest with sound");
+    assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(true)));
+    let urls: std::collections::HashSet<&str> = list.iter().map(|s| s["url"].as_str().unwrap()).collect();
+    assert_eq!(urls.len(), list.len(), "no URL twice");
+    let blob = list[0]["url"].as_str().unwrap().split("/m/").nth(1).unwrap();
+    let media = crate::sources::unseal(None, &[], blob, None).expect("a URL this server minted");
+    assert!(media.n && media.f == "h", "the native master keeps Google's segment URIs: {media:?}");
+
+    assert_eq!(ask("player=native").await.status(), 400, "a surface is required");
+    assert_eq!(ask("surface=silent").await.status(), 400, "and so is a player");
+
+    let meta = crate::addon::build_meta(
+        "movie",
+        "tt0111161",
+        "https://t.example",
+        &["dQw4w9WgXcQ".into()],
+        None,
+        crate::sign::Binding::Unbound,
+    );
+    assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
+}
+
+/// A media URL opens only as it was minted, for the install it was minted for, and until it expires.
+#[tokio::test]
+async fn a_media_url_opens_only_as_minted_and_until_it_expires() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let signer = crate::sign::Signer::new("s3cret");
+    // A form no handler plays, so a URL that passes every check answers 404 without fetching anything.
+    let media = |x: u64| crate::sources::Media {
+        v: "dQw4w9WgXcQ".into(),
+        f: "none".into(),
+        h: None,
+        a: false,
+        n: false,
+        p: None,
+        i: None,
+        e: None,
+        x,
+    };
+    let open = |path: String| {
+        let state = state.clone();
+        async move {
+            let (blob, query) = path.strip_prefix("m/").unwrap().split_once('?').unwrap();
+            crate::sources::handle_media(state, &hyper::HeaderMap::new(), blob, query).await.status()
+        }
+    };
+
+    assert_eq!(
+        open(crate::sources::seal(Some(&signer), &media(4_000_000_000))).await,
+        404,
+        "passes every check"
+    );
+    assert_eq!(open(crate::sources::seal(Some(&signer), &media(1))).await, 410, "expired");
+    let forged = crate::sources::seal(Some(&crate::sign::Signer::new("other")), &media(4_000_000_000));
+    assert_eq!(open(forged).await, 403, "another secret's tag");
+}
+
 /// The download path learned this lesson the expensive way: without a remembered verdict, every
 /// request for a video YouTube has removed spends another yt-dlp run rediscovering it.
 #[tokio::test]

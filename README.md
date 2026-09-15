@@ -94,7 +94,12 @@ GET /<config>/manifest.json               →  addon manifest for a sealed insta
                                              400 bad_config if undecodable or revoked
 GET /<config>/meta/<type>/<imdbId>.json    →  as below, resolved with that install's own key
 GET /manifest.json                       →  manifest with no config (uses the TMDB_KEY fallback)
-GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
+GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url>,
+                                                                 sources: <sources url> } ] } }
+GET /sources/<youtube_id>.json            →  the forms of that trailer a page should try, in order:
+                                             ?surface=silent|audible&player=native|hls.js
+GET /m/<blob>                             →  one form /sources minted (range-enabled video, or a
+                                             master); /m/seg serves a proxied master's URIs
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
 GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
@@ -243,6 +248,41 @@ baked-in letterbox keeps its bars here; `/crop` cannot help, as it reads that sa
 Failures are the `/play` shapes below, with the same reason-aware `Retry-After` cooldown, plus
 `502 no_direct_url` — yt-dlp exited 0 and printed nothing usable, which is not an extraction failure
 and deliberately does not feed `extractor_unavailable`.
+
+## `/sources` — what a page should play, in order
+
+A page asks `/sources/<id>.json` (each `/meta` link names it as `sources`, under the play URL's own tag)
+with two facts it knows and this server does not: its **surface** — `silent`, which never gets sound (a
+billboard slide), or `audible`, which has sound from the first frame or on demand in place (a detail
+hero) — and its **player**, `native` (Safari's own) or `hls.js`. It may add its playable report
+(`X-Den-Playable` or `?playable=`), which the HLS entries carry on. The answer lists the forms to try,
+best first, and never the same URL twice:
+
+```
+{ "id":"…", "expires":1789521638,
+  "sources":[ {"kind":"mp4","url":"…/m/<blob>?s=…","audio":false,"height":720},
+              {"kind":"hls","url":"…/m/<blob>?s=…","audio":true,"height":null} ] }
+```
+
+`kind` says how to play it (`mp4` in the element, `hls` in the page's HLS player); the URL says nothing.
+The order follows what was measured on macOS:
+
+| surface | player | forms, best first |
+|---|---|---|
+| silent | native | progressive 720p · HLS master, segments on googlevideo |
+| silent | hls.js | Google's own 720p file · progressive 720p · proxied HLS master |
+| audible | native | HLS master, segments on googlevideo · progressive with sound |
+| audible | hls.js | proxied HLS master · progressive with sound |
+
+Asking is the warm-up. The answer waits for the resolve its first entry plays from, and for its index
+when that entry is a progressive file; a file that turns out not to be indexable is left off the list.
+
+Every URL but Google's own is `/m/<blob>`: the variant — video, form, height, sound, the install it was
+minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is
+refused (403) with a wrong tag or for a revoked install, and answers 410 once expired, when the page asks
+for the list again. A native master served from there keeps its segment URIs on googlevideo, so only the
+playlist crosses this box; a proxied master names `seg?u=…`, which resolves to `/m/seg` beside it.
+Everything playable therefore sits under one prefix a relay can treat as media.
 
 ## `/progressive` — the same stream, index first
 
