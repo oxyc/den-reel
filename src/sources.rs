@@ -217,14 +217,33 @@ pub async fn handle_sources(
     // first entry is a master whose URL needs neither, and it is asked for as a page opens, where waiting here
     // would put a round trip in front of a player that waits on the same resolve anyway. That resolve is started
     // instead, and the master's request joins it. A video already known to be gone is still said at once.
+    //
+    // Behind the resolve, the index for the progressive file with sound is built too, which is this surface's
+    // fallback. A cold index costs 0.7–3.9 s, almost all of it Google's edge fetching regions of the file it has
+    // not served lately (measured 2026-09-15), so the only way to spare a viewer that is to build it before they
+    // need it — and the build probably warms the edge for the playback that follows.
     let (direct, mut timing) = if surface == Surface::Audible {
+        let fallback = forms.iter().find_map(|f| match f {
+            Form::Progressive { cap, audio: true } => Some(*cap),
+            _ => None,
+        });
         match crate::direct::peek(&state, &vid, first.cap()) {
             Some(Err(e)) => {
                 return httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")
             }
-            Some(Ok(d)) => (Some(d), "cache;desc=hit".to_string()),
+            Some(Ok(d)) => {
+                if let Some(cap) = fallback {
+                    (state.direct_warm)(state.clone(), vid.clone(), cap, Some(true));
+                }
+                (Some(d), "cache;desc=hit".to_string())
+            }
             None => {
-                crate::direct::warm(state.clone(), vid.clone(), first.cap(), None);
+                (state.direct_warm)(
+                    state.clone(),
+                    vid.clone(),
+                    fallback.unwrap_or(first.cap()),
+                    fallback.map(|_| true),
+                );
                 (None, "resolve;desc=background".to_string())
             }
         }
@@ -292,7 +311,8 @@ pub async fn handle_sources(
     let crop =
         state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&vid).and_then(|r| r.fractions());
     if crop.is_none() {
-        crate::crop::measure_in_background(&state, &vid, first.cap());
+        // From the index this surface is building anyway: the one with sound for an audible surface.
+        crate::crop::measure_in_background(&state, &vid, first.cap(), surface == Surface::Audible);
     }
 
     let max_age = match &direct {

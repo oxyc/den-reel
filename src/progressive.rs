@@ -717,20 +717,36 @@ pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
     out
 }
 
+/// How long to wait before asking again for a range googlevideo refused for the moment, once per retry.
+const REFUSED_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(1000)];
+
 /// Bytes `from..=to` of `url`, which must come back as that range.
+///
+/// A 401, 429 or 5xx is asked again after `REFUSED_BACKOFF`: googlevideo refuses a burst of ranges for a moment
+/// — 17 of 29 in one build measured on 2026-09-15 — and answers the same URL shortly after, and one refused
+/// range would otherwise throw away a build every other range of which worked. A 403 is not: that is a URL
+/// that has expired, which asking again does not change.
 async fn fetch(http: &reqwest::Client, url: &str, from: u64, to: u64) -> Result<Bytes, Unbuilt> {
     let fault = |why: String| Unbuilt { why, retry: true };
-    let res = http
-        .get(url)
-        .header(RANGE.as_str(), format!("bytes={from}-{to}"))
-        .timeout(INDEX_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| fault(crate::upstream::body_fault_why(e)))?;
-    if res.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(fault(format!("googlevideo answered {} for bytes {from}-{to}", res.status())));
+    let mut backoff = REFUSED_BACKOFF.iter();
+    loop {
+        let res = http
+            .get(url)
+            .header(RANGE.as_str(), format!("bytes={from}-{to}"))
+            .timeout(INDEX_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| fault(crate::upstream::body_fault_why(e)))?;
+        let status = res.status();
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            return res.bytes().await.map_err(|e| fault(crate::upstream::body_fault_why(e)));
+        }
+        let for_now = matches!(status.as_u16(), 401 | 429) || status.is_server_error();
+        match backoff.next().filter(|_| for_now) {
+            Some(wait) => tokio::time::sleep(*wait).await,
+            None => return Err(fault(format!("googlevideo answered {status} for bytes {from}-{to}"))),
+        }
     }
-    res.bytes().await.map_err(|e| fault(crate::upstream::body_fault_why(e)))
 }
 
 /// The `moof` at the start of the fragment `at`, `size` bytes long.
@@ -984,16 +1000,18 @@ pub(crate) async fn warm(
     }
 }
 
-/// The index for `vid`'s video at `cap`, and the Google URL it indexes — built, or joined, as a request would.
+/// The index for `vid`'s video at `cap` — with its sound when `audio` says, which is the same video index plus
+/// one — and the Google URL of the video, built or joined as a request would.
 pub(crate) async fn indexed(
     state: &Arc<AppState>,
     vid: &str,
     cap: Option<u32>,
+    audio: bool,
 ) -> Result<(Arc<Layout>, String), String> {
     let (answer, _) = crate::direct::answer(state, vid, cap).await;
     let direct = answer.map_err(|e| format!("resolve: {}", e.reason))?;
     let until = direct.expires.saturating_sub(crate::direct::EXPIRY_MARGIN_MS);
-    let (key, urls) = streams(vid, cap, &direct, false);
+    let (key, urls) = streams(vid, cap, &direct, audio);
     let layout = layout_for(state, &key, &urls, until).await.0.map_err(|e| e.why)?;
     Ok((layout, direct.video))
 }
@@ -1255,8 +1273,12 @@ mod tests {
         }
     }
 
-    /// Serve `files` over plain HTTP ranges on 127.0.0.1, as googlevideo does, counting every request.
-    async fn serve_ranges(files: Vec<Vec<u8>>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    /// Serve `files` over plain HTTP ranges on 127.0.0.1, as googlevideo does, counting every request — and
+    /// refusing the first `refuse` of them with a 401, as googlevideo does to a burst.
+    async fn serve_ranges(
+        files: Vec<Vec<u8>>,
+        refuse: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1278,7 +1300,14 @@ mod tests {
                         };
                         let head = String::from_utf8_lossy(&buf[..end]).to_string();
                         buf.drain(..end + 4);
-                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < refuse {
+                            let refused = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+                            if conn.write_all(refused.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         let file: usize = head
                             .split(' ')
                             .nth(1)
@@ -1319,7 +1348,7 @@ mod tests {
         let audio_fragments: Vec<Vec<u32>> = (0..15).map(|_| vec![2, 2, 2]).collect();
         let video = fragmented(&video_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
         let audio = fragmented(&audio_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 1);
-        let (base, requests) = serve_ranges(vec![video, audio]).await;
+        let (base, requests) = serve_ranges(vec![video, audio], 0).await;
         let http = reqwest::Client::new();
         let count = || requests.swap(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -1327,6 +1356,22 @@ mod tests {
         assert_eq!(count(), 1 + 40, "the first bytes, then each fragment's moof");
         build(&http, &[format!("{base}/0"), format!("{base}/1")]).await.expect("an index with sound");
         assert_eq!(count(), (1 + 40) + (1 + 15), "and the same again for the audio file");
+    }
+
+    /// googlevideo refuses a burst of ranges with 401 for a moment (17 of 29 in one measured build) and answers
+    /// the same URL a little later. One refusal must not throw away a build every other range of which worked.
+    #[tokio::test]
+    async fn a_refused_range_is_asked_again_rather_than_failing_the_index() {
+        let fragments: Vec<Vec<u32>> = (0..4).map(|_| vec![7, 3]).collect();
+        let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let (base, requests) = serve_ranges(vec![video], 1).await;
+        let http = reqwest::Client::new();
+        build(&http, &[format!("{base}/0")]).await.expect("an index despite the refusal");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            1 + (1 + 4),
+            "the refused range, once more"
+        );
     }
 
     /// The payload of the box at `path` under the top level of `b`.

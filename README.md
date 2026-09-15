@@ -320,7 +320,16 @@ An **audible** surface is answered at once: its first entry is a master whose UR
 page asks as it opens, so waiting would only put a round trip in front of a player that waits on the same
 resolve anyway. The resolve is started instead (`Server-Timing: resolve;desc=background`), the master's
 request joins it, and `height` and `crop` are more often `null` in that first answer. A video already known
-to be unavailable is still refused at once.
+to be unavailable is still refused at once. Behind the resolve the index of the progressive file with sound
+— the audible fallback — is built too, and the letterbox is read from it, so that fallback is warm if the
+master ever fails.
+
+A cold index costs 0.7–3.9 s, and measured from this box on 2026-09-15 almost all of that is Google's edge:
+on one reused connection, cold 16 KB ranges waited 522–773 ms for their first byte and 9–11 ms when asked
+again, while a new connection costs 40–180 ms. So no connection tuning moves it much — HTTP/2 does not apply
+(the media hosts speak HTTP/1.1), and more parallel ranges draw refusals — and the only lever is building the
+index before a viewer needs it. A range googlevideo refuses for the moment (401, 429, 5xx; a burst drew 17
+refusals in 29) is asked again after 250 ms and then 1 s rather than failing the build.
 
 Every URL but Google's own is `/m/<n|s>/<blob>`: the variant — video, form, height, sound, the install it
 was minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is

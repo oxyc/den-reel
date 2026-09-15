@@ -343,12 +343,16 @@ const KEYFRAME_HEIGHT: &str = "720";
 /// pictures. No yt-dlp download, no cache slot. Measured against the whole-file pass on eight cached trailers
 /// it agreed on seven; the eighth's downloaded file carries twice the keyframes of Google's stream, two of
 /// them full frame, which is enough to hold the mixed-framing guard there and not here.
+///
+/// `audio` reads the keyframes from the index built with sound, whose video half is the same, so a surface that
+/// is warming that index anyway does not build a second one to measure from.
 pub async fn detect_from_keyframes(
     state: &Arc<AppState>,
     id: &str,
     cap: Option<u32>,
+    audio: bool,
 ) -> Result<CropReport, String> {
-    let (layout, url) = crate::progressive::indexed(state, id, cap).await?;
+    let (layout, url) = crate::progressive::indexed(state, id, cap, audio).await?;
     let stream = crate::progressive::keyframe_stream(&state.http, &url, &layout, KEYFRAMES_MAX).await?;
     let n = state.dl_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // A dotfile at the top of the cache: eviction leaves it alone, and the partial sweep reclaims it
@@ -369,7 +373,7 @@ pub async fn detect_from_keyframes(
 pub async fn handle_keyframe_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     let started = Instant::now();
     let cap = crate::direct::height_cap(&state.cfg, Some(KEYFRAME_HEIGHT));
-    let detected = detect_from_keyframes(&state, &id, cap).await;
+    let detected = detect_from_keyframes(&state, &id, cap, false).await;
     let timing = httputil::timing("keyframes", started.elapsed());
     match detected {
         Ok(report) => httputil::timed(json(&report), &timing),
@@ -380,9 +384,10 @@ pub async fn handle_keyframe_crop(state: Arc<AppState>, id: String) -> Response<
     }
 }
 
-/// Measure `id`'s letterbox from its keyframes at `cap`, in the background, unless it is known, already being
-/// measured, or recently found unmeasurable. A result never replaces one a whole-file pass cached.
-pub fn measure_in_background(state: &Arc<AppState>, id: &str, cap: Option<u32>) {
+/// Measure `id`'s letterbox from its keyframes at `cap` (from the index with sound when `audio`), in the
+/// background, unless it is known, already being measured, or recently found unmeasurable. A result never
+/// replaces one a whole-file pass cached.
+pub fn measure_in_background(state: &Arc<AppState>, id: &str, cap: Option<u32>, audio: bool) {
     if unknown_is_fresh(state, id) {
         return;
     }
@@ -391,7 +396,7 @@ pub fn measure_in_background(state: &Arc<AppState>, id: &str, cap: Option<u32>) 
     }
     let (state, id) = (state.clone(), id.to_string());
     tokio::spawn(async move {
-        match detect_from_keyframes(&state, &id, cap).await {
+        match detect_from_keyframes(&state, &id, cap, audio).await {
             Ok(report) => {
                 if !state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id) {
                     cache_report(&state, &id, report);
