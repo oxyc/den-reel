@@ -463,11 +463,12 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
     // Retry-After as well, or a browser client cannot honour the cooldown a refusal carries, and the
-    // validators, or it cannot make the conditional and If-Range requests they exist for.
+    // validators, or it cannot make the conditional and If-Range requests they exist for. Content-Range and
+    // Accept-Ranges, or a Media Source player fetching parts cannot learn a file's size or that it may seek.
     resp.headers_mut().insert(
         "access-control-expose-headers",
         hyper::header::HeaderValue::from_static(
-            "Server-Timing, X-Den-Degraded, Retry-After, ETag, Last-Modified",
+            "Server-Timing, X-Den-Degraded, Retry-After, ETag, Last-Modified, Content-Range, Accept-Ranges",
         ),
     );
     resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));

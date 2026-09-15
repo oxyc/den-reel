@@ -31,7 +31,7 @@ use std::time::Duration;
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::{HeaderMap, IF_NONE_MATCH, IF_RANGE, RANGE};
+use hyper::header::{HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, RANGE};
 use hyper::{Response, StatusCode};
 
 use crate::httputil::{self, Body};
@@ -373,7 +373,7 @@ fn refused() -> Response<Body> {
 /// segment is the same bytes for as long as its URL lives, so Google's own validators answer both.
 fn upstream(http: &reqwest::Client, url: &str, headers: &HeaderMap) -> reqwest::RequestBuilder {
     let mut req = http.get(url).timeout(FETCH_TIMEOUT);
-    for name in [RANGE, IF_RANGE, IF_NONE_MATCH] {
+    for name in [RANGE, IF_RANGE, IF_NONE_MATCH, IF_MODIFIED_SINCE] {
         if let Some(v) = headers.get(&name).and_then(|v| v.to_str().ok()) {
             req = req.header(name.as_str(), v);
         }
@@ -406,8 +406,9 @@ async fn through(
         }
     };
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    // The copy the player holds is still Google's: say so, with the validators it keeps.
-    if status == StatusCode::NOT_MODIFIED {
+    // The copy the player holds is still Google's: say so, with the validators it keeps. A range past the end is
+    // Google's answer to the player too, with the size it needs to ask again.
+    if status == StatusCode::NOT_MODIFIED || status == StatusCode::RANGE_NOT_SATISFIABLE {
         return media(res, url, (state.clock)());
     }
     if !status.is_success() {
@@ -542,6 +543,8 @@ fn respond_playlist(
         .header("vary", crate::client::HEADER)
         // Playlists name URLs that expire; a stale one is a trailer that stops mid-play.
         .header("cache-control", format!("private, max-age={max_age}"))
+        // So a player revalidating the playlist it holds gets a 304 while the resolve behind it stands.
+        .header("etag", httputil::etag_of(body.as_bytes()))
         .body(httputil::full(body))
         .unwrap()
 }
@@ -798,18 +801,31 @@ mod tests {
         }
     }
 
+    /// A playlist's validator follows its text, so an unchanged one revalidates to a 304.
+    #[test]
+    fn a_playlist_carries_a_validator_of_its_own_text() {
+        let tag =
+            |text: &str| respond_playlist(text, MASTER, None, Uris::Proxy, 0, None).headers()["etag"].clone();
+        assert_eq!(tag("#EXTM3U\n"), tag("#EXTM3U\n"));
+        assert_ne!(tag("#EXTM3U\n"), tag("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n"));
+    }
+
     /// A player's seek and its revalidation reach Google; nothing else it sends does.
     #[test]
     fn a_players_seek_and_revalidation_travel_upstream() {
         let mut headers = HeaderMap::new();
-        for (name, value) in
-            [("range", "bytes=0-99"), ("if-range", "\"abc\""), ("if-none-match", "\"abc\""), ("cookie", "x")]
-        {
+        for (name, value) in [
+            ("range", "bytes=0-99"),
+            ("if-range", "\"abc\""),
+            ("if-none-match", "\"abc\""),
+            ("if-modified-since", "Tue, 15 Sep 2026 10:00:00 GMT"),
+            ("cookie", "x"),
+        ] {
             headers.insert(name, value.parse().unwrap());
         }
         let url = "https://r1.googlevideo.com/videoplayback";
         let req = upstream(&reqwest::Client::new(), url, &headers).build().unwrap();
-        for name in ["range", "if-range", "if-none-match"] {
+        for name in ["range", "if-range", "if-none-match", "if-modified-since"] {
             assert_eq!(req.headers()[name], headers[name], "{name}");
         }
         assert!(!req.headers().contains_key("cookie"));

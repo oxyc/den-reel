@@ -157,9 +157,10 @@ pub fn apply_conditional(method: &Method, req_headers: &HeaderMap, resp: Respons
         headers.insert(CACHE_CONTROL, v.clone());
     }
     // RFC 9110 §15.4.5: a 304 carries the Vary the 200 would have. Caches keep the stored one, but
-    // it is the header this response exists to be correct about.
-    if let Some(v) = resp.headers().get("vary") {
-        headers.insert("vary", v.clone());
+    // it is the header this response exists to be correct about. Every line of it: a body can vary on a
+    // client report and on the host both, sent as two.
+    for v in resp.headers().get_all("vary") {
+        headers.append("vary", v.clone());
     }
     // What the handler did, and whether the answer is a fallback, describe THIS response; the
     // client's stored copy can say neither. The same body can be fresh one hour and a stand-in the
@@ -256,8 +257,9 @@ fn hex(c: u8) -> Option<u8> {
     }
 }
 
-/// A parsed `Range: bytes=start-end` against a known file size. Mirrors the Node regex
-/// `bytes=(\d+)-(\d*)`: a header that doesn't match is treated as no range at all.
+/// A parsed `Range: bytes=start-end`, `bytes=start-` or `bytes=-length` against a known file size. A header
+/// that is none of those — several ranges among them — is treated as no range at all, and the whole file goes
+/// out, which RFC 9110 §14.2 allows.
 pub enum RangeReq {
     /// Serve `[start, end]` inclusive (206).
     Satisfiable { start: u64, end: u64 },
@@ -269,7 +271,15 @@ pub fn parse_range(header: Option<&str>, size: u64) -> Option<RangeReq> {
     let h = header?;
     let rest = h.trim().strip_prefix("bytes=")?;
     let (a, b) = rest.split_once('-')?;
-    let start: u64 = a.trim().parse().ok()?; // `\d+` required
+    if a.trim().is_empty() {
+        // The last `length` bytes: how a player reads an index kept at the end of a file.
+        let length: u64 = b.trim().parse().ok()?;
+        if length == 0 || size == 0 {
+            return Some(RangeReq::Unsatisfiable);
+        }
+        return Some(RangeReq::Satisfiable { start: size.saturating_sub(length), end: size - 1 });
+    }
+    let start: u64 = a.trim().parse().ok()?;
     if !b.trim().is_empty() && b.trim().parse::<u64>().is_err() {
         return None; // trailing junk that isn't `\d*` → not a match, fall back to full body
     }
@@ -281,4 +291,42 @@ pub fn parse_range(header: Option<&str>, size: u64) -> Option<RangeReq> {
         return Some(RangeReq::Unsatisfiable);
     }
     Some(RangeReq::Satisfiable { start, end })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_suffix_range_is_the_end_of_the_file() {
+        let at = |h: &str, size| match parse_range(Some(h), size) {
+            Some(RangeReq::Satisfiable { start, end }) => Some((start, end)),
+            Some(RangeReq::Unsatisfiable) => None,
+            None => panic!("{h} was read as no range at all"),
+        };
+        assert_eq!(at("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(at("bytes=-5000", 1000), Some((0, 999)), "longer than the file: all of it");
+        assert_eq!(at("bytes=-0", 1000), None, "none of it");
+        assert_eq!(at("bytes=10-", 1000), Some((10, 999)));
+        assert_eq!(at("bytes=10-19", 1000), Some((10, 19)));
+        assert!(parse_range(Some("bytes=-"), 1000).is_none());
+        assert!(parse_range(Some("bytes=0-1,5-6"), 1000).is_none(), "several ranges: the whole file");
+    }
+
+    #[test]
+    fn a_304_keeps_every_vary_the_200_had() {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(ETAG, "\"a\"")
+            .header("vary", "X-Den-Playable")
+            .header("vary", "Host")
+            .body(full("x"))
+            .unwrap();
+        let mut req = HeaderMap::new();
+        req.insert(IF_NONE_MATCH, HeaderValue::from_static("\"a\""));
+        let out = apply_conditional(&Method::GET, &req, resp);
+        assert_eq!(out.status(), StatusCode::NOT_MODIFIED);
+        let vary: Vec<&str> = out.headers().get_all("vary").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(vary, ["X-Den-Playable", "Host"]);
+    }
 }

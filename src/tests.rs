@@ -4111,7 +4111,13 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         }
     };
 
-    let body = direct_body(ask("surface=silent&player=hls.js").await).await;
+    let resp = ask("surface=silent&player=hls.js").await;
+    let vary: Vec<String> =
+        resp.headers().get_all("vary").iter().map(|v| v.to_str().unwrap().to_ascii_lowercase()).collect();
+    for name in [crate::client::HEADER.to_ascii_lowercase().as_str(), "x-forwarded-host", "host"] {
+        assert!(vary.iter().flat_map(|v| v.split(", ")).any(|v| v == name), "not varied on {name}: {vary:?}");
+    }
+    let body = direct_body(resp).await;
     assert_eq!(
         body["crop"],
         serde_json::json!({ "letterboxed": true, "aspect": 2.4, "rect": [0.0, 0.1296, 1.0, 0.7407] }),
@@ -5109,7 +5115,7 @@ async fn a_youtube_throttle_pauses_every_new_extraction_until_one_works() {
     let left = state.youtube.remaining_ms(now()).expect("paused");
     assert_eq!(r.headers()["retry-after"].to_str().unwrap(), left.div_ceil(1000).to_string());
     let exposed = r.headers()["access-control-expose-headers"].to_str().unwrap();
-    for name in ["Retry-After", "ETag", "Last-Modified"] {
+    for name in ["Retry-After", "ETag", "Last-Modified", "Content-Range", "Accept-Ranges"] {
         assert!(exposed.contains(name), "{name} is not readable cross-origin: {exposed}");
     }
     assert_eq!(spawn_count(&spawns), 1);

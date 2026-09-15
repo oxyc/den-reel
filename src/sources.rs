@@ -329,8 +329,12 @@ pub async fn handle_sources(
     };
     let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
     let cache = format!("private, max-age={max_age}");
-    let resp =
-        httputil::json(StatusCode::OK, &body, &[("cache-control", &cache), ("vary", crate::client::HEADER)]);
+    // Its URLs are built from `self_base`, so the host it was asked at is part of the answer as well.
+    let resp = httputil::json(
+        StatusCode::OK,
+        &body,
+        &[("cache-control", &cache), ("vary", crate::client::HEADER), httputil::VARY_SELF_BASE],
+    );
     httputil::timed(resp, &timing)
 }
 

@@ -725,7 +725,8 @@ const REFUSED_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::fr
 /// A 401, 429 or 5xx is asked again after `REFUSED_BACKOFF`: googlevideo refuses a burst of ranges for a moment
 /// — 17 of 29 in one build measured on 2026-09-15 — and answers the same URL shortly after, and one refused
 /// range would otherwise throw away a build every other range of which worked. A 403 is not: that is a URL
-/// that has expired, which asking again does not change.
+/// that has expired, which asking again does not change. A `Retry-After` is kept to when it asks for no longer
+/// than the longest wait here, and given up on when it asks for more: a viewer is waiting on the build.
 async fn fetch(http: &reqwest::Client, url: &str, from: u64, to: u64) -> Result<Bytes, Unbuilt> {
     let fault = |why: String| Unbuilt { why, retry: true };
     let mut backoff = REFUSED_BACKOFF.iter();
@@ -742,9 +743,14 @@ async fn fetch(http: &reqwest::Client, url: &str, from: u64, to: u64) -> Result<
             return res.bytes().await.map_err(|e| fault(crate::upstream::body_fault_why(e)));
         }
         let for_now = matches!(status.as_u16(), 401 | 429) || status.is_server_error();
+        let asked = crate::upstream::retry_after_ms(res.headers(), crate::state::default_clock())
+            .map(Duration::from_millis);
+        let longest = REFUSED_BACKOFF[REFUSED_BACKOFF.len() - 1];
         match backoff.next().filter(|_| for_now) {
-            Some(wait) => tokio::time::sleep(*wait).await,
-            None => return Err(fault(format!("googlevideo answered {status} for bytes {from}-{to}"))),
+            Some(wait) if asked.is_none_or(|asked| asked <= longest) => {
+                tokio::time::sleep(asked.map_or(*wait, |asked| asked.max(*wait))).await
+            }
+            _ => return Err(fault(format!("googlevideo answered {status} for bytes {from}-{to}"))),
         }
     }
 }
@@ -901,22 +907,25 @@ async fn relay(
     false
 }
 
-/// The response body for `parts`, fetched in order by a task that stops when the player hangs up.
+/// The response body for `parts`, fetched in order by a task that stops when the player hangs up. Nothing is
+/// fetched before the body is first read, so a HEAD or a 304, whose body never is, asks Google for nothing.
 fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
-    let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(4);
-    tokio::spawn(async move {
-        for part in parts {
-            let going = match part {
-                Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
-                Part::Remote { source, from, to } => relay(&http, &urls[source], from, to, &tx).await,
-            };
-            if !going {
-                return;
+    let started = futures_util::stream::once(async move {
+        let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        tokio::spawn(async move {
+            for part in parts {
+                let going = match part {
+                    Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
+                    Part::Remote { source, from, to } => relay(&http, &urls[source], from, to, &tx).await,
+                };
+                if !going {
+                    return;
+                }
             }
-        }
+        });
+        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
     });
-    let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)).map_ok(Frame::data);
-    BodyExt::boxed(StreamBody::new(stream))
+    BodyExt::boxed(StreamBody::new(started.flatten().map_ok(Frame::data)))
 }
 
 fn serve(
@@ -1274,10 +1283,12 @@ mod tests {
     }
 
     /// Serve `files` over plain HTTP ranges on 127.0.0.1, as googlevideo does, counting every request — and
-    /// refusing the first `refuse` of them with a 401, as googlevideo does to a burst.
+    /// refusing the first `refuse` of them with a 401, as googlevideo does to a burst, with the header lines
+    /// `said` on each refusal.
     async fn serve_ranges(
         files: Vec<Vec<u8>>,
         refuse: usize,
+        said: &'static str,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1302,7 +1313,8 @@ mod tests {
                         buf.drain(..end + 4);
                         let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if n < refuse {
-                            let refused = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+                            let refused =
+                                format!("HTTP/1.1 401 Unauthorized\r\n{said}Content-Length: 0\r\n\r\n");
                             if conn.write_all(refused.as_bytes()).await.is_err() {
                                 return;
                             }
@@ -1348,7 +1360,7 @@ mod tests {
         let audio_fragments: Vec<Vec<u32>> = (0..15).map(|_| vec![2, 2, 2]).collect();
         let video = fragmented(&video_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
         let audio = fragmented(&audio_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 1);
-        let (base, requests) = serve_ranges(vec![video, audio], 0).await;
+        let (base, requests) = serve_ranges(vec![video, audio], 0, "").await;
         let http = reqwest::Client::new();
         let count = || requests.swap(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -1364,7 +1376,7 @@ mod tests {
     async fn a_refused_range_is_asked_again_rather_than_failing_the_index() {
         let fragments: Vec<Vec<u32>> = (0..4).map(|_| vec![7, 3]).collect();
         let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
-        let (base, requests) = serve_ranges(vec![video], 1).await;
+        let (base, requests) = serve_ranges(vec![video], 1, "").await;
         let http = reqwest::Client::new();
         build(&http, &[format!("{base}/0")]).await.expect("an index despite the refusal");
         assert_eq!(
@@ -1372,6 +1384,37 @@ mod tests {
             1 + (1 + 4),
             "the refused range, once more"
         );
+    }
+
+    /// A refusal that asks for minutes is not waited out by a build a viewer is waiting on.
+    #[tokio::test]
+    async fn a_refusal_asking_for_minutes_fails_the_index_at_once() {
+        let fragments: Vec<Vec<u32>> = (0..4).map(|_| vec![7, 3]).collect();
+        let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let (base, requests) = serve_ranges(vec![video], usize::MAX, "Retry-After: 120\r\n").await;
+        let started = Instant::now();
+        assert!(build(&reqwest::Client::new(), &[format!("{base}/0")]).await.is_err());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "asked again into a stated pause");
+        assert!(started.elapsed() < Duration::from_millis(250), "slept before giving up");
+    }
+
+    /// A HEAD or a 304 never reads the body, and must not cost Google a request for it.
+    #[tokio::test]
+    async fn an_unread_body_asks_google_for_nothing() {
+        let (base, requests) = serve_ranges(vec![vec![0u8; 64]], 0, "").await;
+        let make = || {
+            body(
+                reqwest::Client::new(),
+                vec![format!("{base}/0")],
+                vec![Part::Remote { source: 0, from: 0, to: 9 }],
+            )
+        };
+        drop(make());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 0, "an unread body fetched");
+        let read = make().collect().await.expect("the body").to_bytes();
+        assert_eq!(read.len(), 10);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     /// The payload of the box at `path` under the top level of `b`.
