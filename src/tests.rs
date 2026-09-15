@@ -4163,6 +4163,39 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
 }
 
+/// A warm-up for a trailer a viewer might open starts its resolve and nothing more; the surface's own ask also
+/// builds the index its fallback plays from.
+#[tokio::test]
+async fn a_warm_ask_starts_the_resolve_and_builds_no_fallback_index() {
+    let dir = temp_dir();
+    let mut state = direct_state(&dir, "yt-dlp-never-run".into());
+    crate::crop::cache_report(
+        &state,
+        "dQw4w9WgXcQ",
+        crate::crop::report_from(
+            "dQw4w9WgXcQ",
+            Some((1920, 1080)),
+            crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 },
+        ),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).expect("not yet shared").direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let ask = |query: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await
+        }
+    };
+    let taken = || warmed.lock().unwrap().drain(..).collect::<Vec<_>>();
+
+    assert_eq!(ask("surface=audible&player=native&intent=warm").await.status(), 200);
+    assert_eq!(taken(), [(None, None)], "a warm-up built the fallback's index");
+    assert_eq!(ask("surface=audible&player=native").await.status(), 200);
+    assert_eq!(taken(), [(None, Some(true))], "the hero's own ask builds it");
+}
+
 /// Answering an audible surface ahead of its resolve must not hand out a list for a video already known to be
 /// gone: that is refused at once, as a silent surface's wait would have refused it.
 #[tokio::test]

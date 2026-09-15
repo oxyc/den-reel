@@ -324,6 +324,12 @@ to be unavailable is still refused at once. Behind the resolve the index of the 
 — the audible fallback — is built too, and the letterbox is read from it, so that fallback is warm if the
 master ever fails.
 
+`intent=warm` marks an ask made because a viewer might open the trailer (a press on a title link) rather than
+because a surface is about to play it. The answer is the same; behind it only the resolve is started, with no
+fallback index and no letterbox measured, since most such asks are a title glanced at and left. The surface's
+own ask, without it, does the rest. The two are different URLs, so a browser cache never hands the play the
+warm-up's answer.
+
 A cold index costs 0.7–3.9 s, and measured from this box on 2026-09-15 almost all of that is Google's edge:
 on one reused connection, cold 16 KB ranges waited 522–773 ms for their first byte and 9–11 ms when asked
 again, while a new connection costs 40–180 ms. So no connection tuning moves it much — HTTP/2 does not apply

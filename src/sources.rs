@@ -209,6 +209,11 @@ pub async fn handle_sources(
             )
         }
     };
+    // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it. The
+    // same question with the same answer, so the warm-up and the play cannot drift apart — only less work behind
+    // it: the resolve, which is what a player waits on, but no index for a fallback and no letterbox measured.
+    // Most such asks are a title glanced at and left, and those cost Google about 45 range requests each.
+    let speculative = query_param(query, "intent").as_deref() == Some("warm");
     let mut forms = plan(surface, player, crate::direct::height_cap(&state.cfg, Some(SILENT_HEIGHT)));
     let first = forms[0];
 
@@ -223,10 +228,13 @@ pub async fn handle_sources(
     // not served lately (measured 2026-09-15), so the only way to spare a viewer that is to build it before they
     // need it — and the build probably warms the edge for the playback that follows.
     let (direct, mut timing) = if surface == Surface::Audible {
-        let fallback = forms.iter().find_map(|f| match f {
-            Form::Progressive { cap, audio: true } => Some(*cap),
-            _ => None,
-        });
+        let fallback = forms
+            .iter()
+            .find_map(|f| match f {
+                Form::Progressive { cap, audio: true } => Some(*cap),
+                _ => None,
+            })
+            .filter(|_| !speculative);
         match crate::direct::peek(&state, &vid, first.cap()) {
             Some(Err(e)) => {
                 return httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")
@@ -310,7 +318,7 @@ pub async fn handle_sources(
     // keyframes in the background, and the next answer carries it.
     let crop =
         state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&vid).and_then(|r| r.fractions());
-    if crop.is_none() {
+    if crop.is_none() && !speculative {
         // From the index this surface is building anyway: the one with sound for an audible surface.
         crate::crop::measure_in_background(&state, &vid, first.cap(), surface == Surface::Audible);
     }
