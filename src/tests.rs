@@ -871,6 +871,7 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
     assert!(has(&body, "reel_index_builds_total{streams=\"video\"} 0"));
     assert!(has(&body, "reel_index_build_milliseconds_total{streams=\"video+audio\"} 4000"));
     assert!(has(&body, "reel_index_requests_total{index=\"built\"} 3"));
+    assert!(has(&body, "# TYPE reel_index_ranges_retried_total counter"));
     assert!(has(&body, "reel_resolve_milliseconds_total 1559"));
     assert!(has(&body, "reel_last_milliseconds{of=\"index_video+audio\"} 1126"), "the last, not the largest");
 }

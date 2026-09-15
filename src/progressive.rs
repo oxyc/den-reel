@@ -720,6 +720,10 @@ pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
 /// How long to wait before asking again for a range googlevideo refused for the moment, once per retry.
 const REFUSED_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(1000)];
 
+/// Ranges asked again after a refusal, for `/metrics`: whether `REFUSED_BACKOFF` ever does anything in real traffic.
+/// Process-wide, since a fetch is handed a client and no state.
+pub(crate) static RANGES_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bytes `from..=to` of `url`, which must come back as that range.
 ///
 /// A 401, 429 or 5xx is asked again after `REFUSED_BACKOFF`: googlevideo refuses a burst of ranges for a moment
@@ -748,6 +752,7 @@ async fn fetch(http: &reqwest::Client, url: &str, from: u64, to: u64) -> Result<
         let longest = REFUSED_BACKOFF[REFUSED_BACKOFF.len() - 1];
         match backoff.next().filter(|_| for_now) {
             Some(wait) if asked.is_none_or(|asked| asked <= longest) => {
+                RANGES_RETRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tokio::time::sleep(asked.map_or(*wait, |asked| asked.max(*wait))).await
             }
             _ => return Err(fault(format!("googlevideo answered {status} for bytes {from}-{to}"))),
@@ -1378,7 +1383,13 @@ mod tests {
         let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
         let (base, requests) = serve_ranges(vec![video], 1, "").await;
         let http = reqwest::Client::new();
+        let retried = RANGES_RETRIED.load(std::sync::atomic::Ordering::Relaxed);
         build(&http, &[format!("{base}/0")]).await.expect("an index despite the refusal");
+        // At least: other tests in this process may retry at the same time.
+        assert!(
+            RANGES_RETRIED.load(std::sync::atomic::Ordering::Relaxed) > retried,
+            "a retry went uncounted"
+        );
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::Relaxed),
             1 + (1 + 4),

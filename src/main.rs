@@ -392,6 +392,11 @@ fn metrics_body(state: &AppState) -> String {
         &[("", state.index_failures.load(Relaxed))],
     );
     counter(
+        "reel_index_ranges_retried_total",
+        "Ranges googlevideo refused for the moment (401, 429, 5xx) and an index build asked for again.",
+        &[("", crate::progressive::RANGES_RETRIED.load(Relaxed))],
+    );
+    counter(
         "reel_index_requests_total",
         "Requests for an index: found built, or waited for its build.",
         &[

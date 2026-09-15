@@ -77,7 +77,7 @@ process. Nothing is computed until a scrape asks.
 
 What the web's trailers cost is there too, as counters since the process started:
 `reel_index_builds_total{streams="video"|"video+audio"}` with `reel_index_build_milliseconds_total` beside it
-(divide for the mean), `reel_index_build_failures_total`, `reel_index_requests_total{index="built"|"waited"}`
+(divide for the mean), `reel_index_build_failures_total`, `reel_index_ranges_retried_total` (ranges refused for the moment and asked again), `reel_index_requests_total{index="built"|"waited"}`
 (how often a `/progressive` request found its index ready), and `reel_resolves_total` with
 `reel_resolve_milliseconds_total`. `reel_last_milliseconds{of=…}` holds the most recent of each, for a glance
 without a second scrape.
