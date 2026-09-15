@@ -131,9 +131,15 @@ no trailer), and `crop_unavailable` (`/crop`'s "play the full frame", when no re
 or the call was unsigned). A `/meta` reordered around trailers `/play` found dead is not degraded.
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
-following `/play` is warm. Two knobs:
+following `/play` is warm. The warm-up is started, not awaited: `/meta` answers as soon as it has the
+ids, so a `/direct`, `/hls` or `/progressive` request sent the moment `/meta` answers joins the
+resolve still running and waits out the rest of it (its `Server-Timing` says `resolve;dur=…`). To be
+warm by the time it plays, a surface has to ask `/meta` well ahead, for example for the next slide
+while the current one shows. Knobs:
 - `?prewarm=0` — resolve only, don't pull bytes yet (for a browse-time prefetch that isn't sure
   the user will watch). Prewarm on the real detail view.
+- `?prewarm=direct` — warm the direct resolve and not the download, for a browser that plays
+  `/direct`, `/hls` or `/progressive`; add the same `?height=` the play request will carry.
 - A **successful** `/meta` sends `Cache-Control: public, max-age=86400, stale-while-revalidate=518400,
   stale-if-error=604800`: fresh for the day the server trusts a resolve, then usable for the rest of the
   week while the client re-asks (or while this server is down). `/<config>/meta` and
@@ -252,7 +258,9 @@ no download, no ffmpeg and nothing on the cache volume, but the video bytes do c
 here, only by the browser (`private, max-age` until then, and a stable `ETag`).
 
 Video only, for muted surfaces. It takes `/direct`'s query, `?height=` included, and resolves through
-the same cache, so `/meta?prewarm=direct` warms it. A resolve failure answers like `/direct`. A stream
+the same cache, so `/meta?prewarm=direct` warms the resolve, though not the index: the first request
+for a stream builds that (about 0.6 s on the box; `Server-Timing: index;dur=…`) and later ones read it
+from memory. A resolve failure answers like `/direct`. A stream
 that cannot be indexed (not fragmented, a box it cannot read, a failed fetch) answers `302` to Google's
 raw URL with `X-Den-Degraded: progressive_unavailable` and a log line, which is what the page played
 before.
