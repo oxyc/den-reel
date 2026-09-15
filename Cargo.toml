@@ -38,7 +38,7 @@ crypto_box = { version = "0.9", features = ["seal"] }
 # Keyed BLAKE2b for the optional /play + /crop URL signature (PLAY_SECRET), and a constant-time
 # compare for checking it. Both are ALREADY in the tree — crypto_box uses blake2 for the seal nonce
 # and subtle throughout — so these edges add a direct dependency, not a new crate to compile.
-blake2 = "0.10"
+blake2 = "0.11"
 subtle = "2"
 # HTTP dates for /play's Last-Modified, If-Modified-Since and If-Range. hyper already builds it for
 # the Date header, so this too is a direct edge rather than new code.
