@@ -312,8 +312,15 @@ The order follows what was measured on macOS:
 | audible | native | HLS master, segments on googlevideo · progressive with sound |
 | audible | hls.js | proxied HLS master · progressive with sound |
 
-Asking is the warm-up. The answer waits for the resolve its first entry plays from, and for its index
-when that entry is a progressive file; a file that turns out not to be indexable is left off the list.
+Asking is the warm-up. For a **silent** surface the answer waits for the resolve its first entry plays
+from, and for its index when that entry is a progressive file; a file that turns out not to be indexable is
+left off the list. A billboard asks seconds ahead, so that wait is spent where nobody sees it.
+
+An **audible** surface is answered at once: its first entry is a master whose URL needs no resolve, and a
+page asks as it opens, so waiting would only put a round trip in front of a player that waits on the same
+resolve anyway. The resolve is started instead (`Server-Timing: resolve;desc=background`), the master's
+request joins it, and `height` and `crop` are more often `null` in that first answer. A video already known
+to be unavailable is still refused at once.
 
 Every URL but Google's own is `/m/<n|s>/<blob>`: the variant — video, form, height, sound, the install it
 was minted for, and an expiry a day out — as base64url JSON, tagged with `PLAY_SECRET` over the blob. It is

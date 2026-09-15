@@ -4,8 +4,9 @@
 //! `/progressive/`, repeated `height` and `audio` on a `/meta` warm-up that only helped if they matched the
 //! request that followed, and its relay had to know every media route by name. Here the page says what its
 //! surface needs and which HLS player it has, and this server answers with an ordered list of URLs it signed.
-//! Asking for the list is the warm-up: it waits for the resolve the first entry plays from, and for the index
-//! when that entry is a progressive file.
+//! Asking for the list is the warm-up. For a silent surface it waits for the resolve the first entry plays
+//! from, and for the index when that entry is a progressive file; an audible surface is answered at once and
+//! its resolve started, since its first entry needs neither.
 //!
 //! **Two surfaces**, told apart by whether sound can be asked for in place: `silent` never gets it (a
 //! billboard slide), `audible` has it from the first frame or on demand without a new page (a detail hero).
@@ -35,6 +36,9 @@ use crate::state::AppState;
 /// How long a minted media URL is honoured. Far longer than a page holds a list (den-edge caches one for five
 /// minutes); the Google URLs behind it are resolved again whenever they expire.
 const MEDIA_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// How long an answer given before its resolve may be cached.
+const UNRESOLVED_MAX_AGE_SECS: u64 = 300;
 
 /// The height a silent surface is capped at, before the ladder rounds it.
 const SILENT_HEIGHT: &str = "720";
@@ -208,20 +212,36 @@ pub async fn handle_sources(
     let mut forms = plan(surface, player, crate::direct::height_cap(&state.cfg, Some(SILENT_HEIGHT)));
     let first = forms[0];
 
-    // The resolve the first form plays from is waited for: Google's own URL is that resolve, and the page is
-    // about to ask for it anyway. The other forms are left to their own requests.
-    let (answer, spent) = crate::direct::answer(&state, &vid, first.cap()).await;
-    let mut timing = match spent {
-        Some(d) => httputil::timing("resolve", d),
-        None => "cache;desc=hit".to_string(),
+    // The resolve the first form plays from. A silent surface waits for it: Google's own URL is that resolve, a
+    // progressive entry needs its index, and a billboard asks seconds ahead. An audible surface does not: its
+    // first entry is a master whose URL needs neither, and it is asked for as a page opens, where waiting here
+    // would put a round trip in front of a player that waits on the same resolve anyway. That resolve is started
+    // instead, and the master's request joins it. A video already known to be gone is still said at once.
+    let (direct, mut timing) = if surface == Surface::Audible {
+        match crate::direct::peek(&state, &vid, first.cap()) {
+            Some(Err(e)) => {
+                return httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")
+            }
+            Some(Ok(d)) => (Some(d), "cache;desc=hit".to_string()),
+            None => {
+                crate::direct::warm(state.clone(), vid.clone(), first.cap(), None);
+                (None, "resolve;desc=background".to_string())
+            }
+        }
+    } else {
+        let (answer, spent) = crate::direct::answer(&state, &vid, first.cap()).await;
+        let timing = match spent {
+            Some(d) => httputil::timing("resolve", d),
+            None => "cache;desc=hit".to_string(),
+        };
+        match answer {
+            Ok(d) => (Some(d), timing),
+            Err(e) => return httputil::timed(crate::play::play_error(&state, &vid, &e), &timing),
+        }
     };
-    let direct = match answer {
-        Ok(d) => d,
-        Err(e) => return httputil::timed(crate::play::play_error(&state, &vid, &e), &timing),
-    };
-    if let Form::Progressive { cap, audio } = first {
+    if let (Form::Progressive { cap, audio }, Some(direct)) = (first, &direct) {
         let started = std::time::Instant::now();
-        let built = crate::progressive::prepare(&state, &vid, cap, &direct, audio).await;
+        let built = crate::progressive::prepare(&state, &vid, cap, direct, audio).await;
         timing.push_str(", ");
         timing.push_str(&httputil::timing("index", started.elapsed()));
         // A file that cannot be indexed is left off rather than offered to fail. A fetch that failed stays:
@@ -250,11 +270,13 @@ pub async fn handle_sources(
     for form in forms {
         let (kind, url, audio, height) = match form {
             Form::Google { .. } => {
-                soonest = soonest.min(direct.expires);
-                ("mp4", direct.video.clone(), false, direct.height)
+                // Only a silent surface lists it, and that always has its resolve.
+                let Some(d) = &direct else { continue };
+                soonest = soonest.min(d.expires);
+                ("mp4", d.video.clone(), false, d.height)
             }
             Form::Progressive { cap, audio } => {
-                let height = if cap == first.cap() { direct.height } else { None };
+                let height = direct.as_ref().filter(|_| cap == first.cap()).and_then(|d| d.height);
                 ("mp4", media_url("p", cap, audio, false, None), audio, height)
             }
             Form::Hls { native } => ("hls", media_url("h", None, false, native, report.clone()), true, None),
@@ -273,12 +295,18 @@ pub async fn handle_sources(
         crate::crop::measure_in_background(&state, &vid, first.cap());
     }
 
-    let max_age = direct
-        .expires
-        .saturating_sub(now)
-        .saturating_sub(crate::direct::EXPIRY_MARGIN_MS)
-        .min(MEDIA_TTL_SECS * 1000)
-        / 1000;
+    let max_age = match &direct {
+        Some(d) => {
+            d.expires
+                .saturating_sub(now)
+                .saturating_sub(crate::direct::EXPIRY_MARGIN_MS)
+                .min(MEDIA_TTL_SECS * 1000)
+                / 1000
+        }
+        // An answer given ahead of its resolve is good for as long as its URLs, but its letterbox and heights are
+        // likely to be known minutes later.
+        None => UNRESOLVED_MAX_AGE_SECS,
+    };
     let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
     let cache = format!("private, max-age={max_age}");
     let resp =

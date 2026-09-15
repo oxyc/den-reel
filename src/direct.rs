@@ -262,6 +262,15 @@ pub(crate) fn key(vid: &str, cap: Option<u32>) -> String {
 
 /// The still-standing cached answer under `key`, if it has not expired.
 fn cached(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayError>> {
+    peek_key(state, key, now)
+}
+
+/// The answer standing for `vid` at `cap`, if there is one, without resolving anything.
+pub(crate) fn peek(state: &AppState, vid: &str, cap: Option<u32>) -> Option<Result<Direct, PlayError>> {
+    peek_key(state, &key(vid, cap), (state.clock)())
+}
+
+fn peek_key(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayError>> {
     let map = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
     map.get(key).filter(|(_, exp)| *exp > now).map(|(r, _)| r.clone())
 }

@@ -4126,7 +4126,13 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     assert!(list[1]["url"].as_str().unwrap().contains("/m/s/"), "carried by this server: {}", list[1]["url"]);
     assert_eq!(list[2]["kind"], "hls");
 
-    let body = direct_body(ask("surface=audible&player=native").await).await;
+    let resp = ask("surface=audible&player=native").await;
+    assert_eq!(
+        resp.headers()["server-timing"],
+        "resolve;desc=background",
+        "an audible surface is answered before its resolve, not after"
+    );
+    let body = direct_body(resp).await;
     let list = body["sources"].as_array().unwrap();
     assert_eq!(list[0]["kind"], "hls", "Safari's own HLS player started soonest with sound");
     assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(true)));
@@ -4149,6 +4155,23 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         crate::sign::Binding::Unbound,
     );
     assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
+}
+
+/// Answering an audible surface ahead of its resolve must not hand out a list for a video already known to be
+/// gone: that is refused at once, as a silent surface's wait would have refused it.
+#[tokio::test]
+async fn an_audible_answer_still_refuses_a_video_known_to_be_gone() {
+    let dir = temp_dir();
+    let (yt, runs) = fake_resolver(&dir, "yt-gone-sources", "echo 'ERROR: Video unavailable' >&2\nexit 1");
+    let state = direct_state(&dir, yt);
+    let removed = crate::direct::handle_direct(state.clone(), "dQw4w9WgXcQ".into(), None).await;
+    assert_eq!(removed.status(), 404);
+
+    let query = "surface=audible&player=native";
+    let resp =
+        crate::sources::handle_sources(state, &hyper::HeaderMap::new(), "dQw4w9WgXcQ".into(), query).await;
+    assert_eq!(resp.status(), 404, "the verdict already standing, not a list of URLs that cannot play");
+    assert_eq!(spawn_count(&runs), 1, "and without resolving it again");
 }
 
 /// A media URL opens only as it was minted, for the install it was minted for, and until it expires.
