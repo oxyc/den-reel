@@ -136,14 +136,25 @@ pub enum Uris {
 /// Never everything, though. A playlist whose every rung is below the floor is served whole, because a
 /// small picture beats no picture — and a rung that names no size is kept either way, since unknown is
 /// not the same as small and might be the only one a phone can play.
-fn best_first(playlist: &str, floor: u32) -> String {
+///
+/// With a browser's report (`playable`), a variant whose codecs, level, tier or HDR it can't take is left out
+/// first — for Safari's own player, which picks for itself, listing one last is no protection. The same rule
+/// holds: a master of which it can take nothing is served whole, since a variant it may refuse beats a trailer
+/// with nothing listed.
+fn best_first(playlist: &str, floor: u32, playable: Option<&crate::client::Playable>) -> String {
+    struct Variant {
+        bandwidth: u64,
+        height: u32,
+        takes: bool,
+        text: String,
+    }
     let (mut head, mut tail) = (String::new(), String::new());
-    let mut variants: Vec<(u64, u32, String)> = Vec::new();
-    let mut open: Option<(u64, u32, String)> = None;
+    let mut variants: Vec<Variant> = Vec::new();
+    let mut open: Option<Variant> = None;
     for line in playlist.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
-        if let Some((_, _, text)) = open.as_mut() {
-            text.push_str(line);
+        if let Some(variant) = open.as_mut() {
+            variant.text.push_str(line);
             // The variant's own URI closes it. A blank line or a comment inside it does not.
             if !body.is_empty() && !body.starts_with('#') {
                 if let Some(done) = open.take() {
@@ -153,7 +164,15 @@ fn best_first(playlist: &str, floor: u32) -> String {
             continue;
         }
         if body.starts_with("#EXT-X-STREAM-INF:") {
-            open = Some((bandwidth(body), height(body), line.to_string()));
+            let takes = playable.is_none_or(|p| {
+                attribute(body, "CODECS").is_none_or(|codecs| p.takes(codecs, attribute(body, "VIDEO-RANGE")))
+            });
+            open = Some(Variant {
+                bandwidth: bandwidth(body),
+                height: height(body),
+                takes,
+                text: line.to_string(),
+            });
         } else if variants.is_empty() {
             head.push_str(line);
         } else {
@@ -161,21 +180,40 @@ fn best_first(playlist: &str, floor: u32) -> String {
         }
     }
     // A tag whose URI never arrived is a malformed playlist. Keep it rather than drop it.
-    if let Some((_, _, text)) = open {
-        tail.push_str(&text);
+    if let Some(variant) = open {
+        tail.push_str(&variant.text);
     }
-    let tall_enough: Vec<&(u64, u32, String)> =
-        variants.iter().filter(|(_, height, _)| *height == 0 || *height >= floor).collect();
-    let mut offered: Vec<&(u64, u32, String)> =
-        if tall_enough.is_empty() { variants.iter().collect() } else { tall_enough };
+    let playable: Vec<&Variant> = variants.iter().filter(|v| v.takes).collect();
+    let playable = if playable.is_empty() { variants.iter().collect() } else { playable };
+    let tall_enough: Vec<&Variant> =
+        playable.iter().copied().filter(|v| v.height == 0 || v.height >= floor).collect();
+    let mut offered = if tall_enough.is_empty() { playable } else { tall_enough };
     // Stable, so variants of equal bandwidth stay in the order YouTube chose for them.
-    offered.sort_by_key(|variant| std::cmp::Reverse(variant.0));
+    offered.sort_by_key(|variant| std::cmp::Reverse(variant.bandwidth));
     let mut out = head;
-    for (_, _, text) in offered {
-        out.push_str(text);
+    for variant in offered {
+        out.push_str(&variant.text);
     }
     out.push_str(&tail);
     out
+}
+
+/// One attribute of a tag line, quotes removed: `CODECS="avc1.640028,mp4a.40.2"` gives the two codecs. The name
+/// counts only where an attribute may start, as in `bandwidth`.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!("{name}=");
+    let mut rest = tag;
+    while let Some(at) = rest.find(&key) {
+        let starts = matches!(rest[..at].chars().next_back(), Some(':') | Some(','));
+        rest = &rest[at + key.len()..];
+        if starts {
+            return Some(match rest.strip_prefix('"') {
+                Some(quoted) => quoted.split('"').next().unwrap_or(""),
+                None => rest.split(',').next().unwrap_or(""),
+            });
+        }
+    }
+    None
 }
 
 /// The height of a `#EXT-X-STREAM-INF` line's `RESOLUTION`, or 0 where it names none.
@@ -266,12 +304,18 @@ fn join(base: &str, reference: &str) -> String {
     format!("{origin}{dir}/{reference}")
 }
 
-/// `/hls/<vid>.m3u8`: the trailer's master playlist, best variant first, and — unless `uris` says
-/// otherwise — with every URI in it rewritten to come back through `/seg`.
+/// `/hls/<vid>.m3u8`: the trailer's master playlist, best variant first, listing only what `playable` says the
+/// browser plays when it sent a report (`client`), and — unless `uris` says otherwise — with every URI in it
+/// rewritten to come back through `/seg`.
 ///
 /// Resolving goes through `/direct`'s own path, so a warm title costs a hash lookup and a title
 /// already resolving joins that resolve instead of starting a second one.
-pub async fn handle_master(state: Arc<AppState>, vid: String, uris: Uris) -> Response<Body> {
+pub async fn handle_master(
+    state: Arc<AppState>,
+    vid: String,
+    uris: Uris,
+    playable: Option<crate::client::Playable>,
+) -> Response<Body> {
     let (answer, spent) = crate::direct::answer(&state, &vid).await;
     let direct = match answer {
         Ok(d) => d,
@@ -289,7 +333,7 @@ pub async fn handle_master(state: Arc<AppState>, vid: String, uris: Uris) -> Res
         Some(d) => httputil::timing("resolve", d),
         None => "cache;desc=hit".to_string(),
     };
-    httputil::timed(through(&state, &master, &HeaderMap::new(), true, uris).await, &timing)
+    httputil::timed(through(&state, &master, &HeaderMap::new(), true, uris, playable).await, &timing)
 }
 
 /// `/hls/seg?u=…&s=…`: one upstream URL, checked and fetched. A playlist comes back rewritten like the
@@ -314,8 +358,9 @@ pub async fn handle_segment(state: Arc<AppState>, query: &str, headers: &HeaderM
             return refused();
         }
     }
-    // Always proxied: only a player that cannot fetch Google itself is ever asking through here.
-    through(&state, &url, headers, false, Uris::Proxy).await
+    // Always proxied: only a player that cannot fetch Google itself is ever asking through here. What comes back is
+    // a media playlist or a segment, which have no variants to choose between.
+    through(&state, &url, headers, false, Uris::Proxy, None).await
 }
 
 /// A URL nothing here will fetch. The same answer for a host we do not proxy and for a tag that does
@@ -345,6 +390,7 @@ async fn through(
     headers: &HeaderMap,
     expect_playlist: bool,
     uris: Uris,
+    playable: Option<crate::client::Playable>,
 ) -> Response<Body> {
     let res = match upstream(&state.http, url, headers).send().await {
         Ok(res) => res,
@@ -380,7 +426,7 @@ async fn through(
         .unwrap_or("")
         .to_ascii_lowercase();
     if expect_playlist || content_type.contains("mpegurl") {
-        return playlist(state, url, res, uris).await;
+        return playlist(state, url, res, uris, playable).await;
     }
     media(res, url, (state.clock)())
 }
@@ -425,7 +471,13 @@ fn media(res: reqwest::Response, url: &str, now: u64) -> Response<Body> {
 }
 
 /// Read a playlist (bounded) and answer with every URI in it pointing back here.
-async fn playlist(state: &AppState, url: &str, res: reqwest::Response, uris: Uris) -> Response<Body> {
+async fn playlist(
+    state: &AppState,
+    url: &str,
+    res: reqwest::Response,
+    uris: Uris,
+    playable: Option<crate::client::Playable>,
+) -> Response<Body> {
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -446,12 +498,19 @@ async fn playlist(state: &AppState, url: &str, res: reqwest::Response, uris: Uri
         buf.extend_from_slice(&chunk);
     }
     let text = String::from_utf8_lossy(&buf);
-    respond_playlist(&text, url, state.cfg.play_secret.as_deref(), uris, (state.clock)())
+    respond_playlist(&text, url, state.cfg.play_secret.as_deref(), uris, (state.clock)(), playable.as_ref())
 }
 
-/// The playlist response: every URI pointed where `uris` says, the rungs ordered and floored, and a
-/// lifetime that ends before the first URL in it does.
-fn respond_playlist(text: &str, url: &str, secret: Option<&str>, uris: Uris, now: u64) -> Response<Body> {
+/// The playlist response: every URI pointed where `uris` says, the rungs chosen for `playable`, ordered and
+/// floored, and a lifetime that ends before the first URL in it does.
+fn respond_playlist(
+    text: &str,
+    url: &str,
+    secret: Option<&str>,
+    uris: Uris,
+    now: u64,
+    playable: Option<&crate::client::Playable>,
+) -> Response<Body> {
     // The soonest expiry among the playlist's own URL and every URL it names.
     let earliest = std::cell::Cell::new(crate::direct::parse_expiry_ms(url));
     let note = |target: &str| {
@@ -473,12 +532,14 @@ fn respond_playlist(text: &str, url: &str, secret: Option<&str>, uris: Uris, now
     };
     // A native player is offered the taller rungs only, because it opens on one of its own choosing.
     // hls.js takes the whole ladder: it is told where to start, and can fall as far as the line needs.
-    let body = best_first(&body, if uris == Uris::Native { NATIVE_FLOOR } else { 0 });
+    let body = best_first(&body, if uris == Uris::Native { NATIVE_FLOOR } else { 0 }, playable);
     let max_age = playlist_max_age(earliest.get(), now);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/vnd.apple.mpegurl")
         .header("content-length", body.len())
+        // A report in the query is part of the URL already; one in the header has to be named here.
+        .header("vary", crate::client::HEADER)
         // Playlists name URLs that expire; a stale one is a trailer that stops mid-play.
         .header("cache-control", format!("private, max-age={max_age}"))
         .body(httputil::full(body))
@@ -568,7 +629,7 @@ mod tests {
              #EXT-X-STREAM-INF:RESOLUTION=256x144\n\
              unsized.m3u8\n";
         // Floor 0: the whole ladder, which is what the proxied path is served.
-        let out = best_first(playlist, 0);
+        let out = best_first(playlist, 0, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "#EXTM3U", "the header stays at the top");
         assert!(lines[1].starts_with("#EXT-X-MEDIA"), "and so do the renditions: {out}");
@@ -593,7 +654,8 @@ mod tests {
              https://manifest.googlevideo.com/v/144.m3u8\n\
              #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9999999,BANDWIDTH=1154419,RESOLUTION=1280x720\n\
              https://manifest.googlevideo.com/v/720.m3u8\n";
-        let resp = respond_playlist(playlist, MASTER, Some("s3cret"), Uris::Proxy, 0);
+        let resp = respond_playlist(playlist, MASTER, Some("s3cret"), Uris::Proxy, 0, None);
+        assert_eq!(resp.headers()["vary"], crate::client::HEADER, "a header report makes another playlist");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&body);
         let rungs: Vec<u64> =
@@ -617,7 +679,7 @@ mod tests {
              middle.m3u8\n\
              #EXT-X-STREAM-INF:BANDWIDTH=99\n\
              sizeless.m3u8\n";
-        let out = best_first(playlist, NATIVE_FLOOR);
+        let out = best_first(playlist, NATIVE_FLOOR, None);
         assert!(!out.contains("low.m3u8"), "240p is not offered: {out}");
         assert!(out.contains("high.m3u8") && out.contains("middle.m3u8"), "{out}");
         // Unknown is not the same as small, and it might be the only rung a phone can play.
@@ -629,8 +691,43 @@ mod tests {
              low.m3u8\n\
              #EXT-X-STREAM-INF:BANDWIDTH=154256,RESOLUTION=256x144\n\
              lower.m3u8\n";
-        let out = best_first(short, NATIVE_FLOOR);
+        let out = best_first(short, NATIVE_FLOOR, None);
         assert!(out.contains("low.m3u8") && out.contains("lower.m3u8"), "{out}");
+    }
+
+    /// With a browser's report, a variant it can't decode isn't listed at all: Safari's own player picks its
+    /// variant itself, so listing one last is no protection.
+    #[test]
+    fn a_report_lists_only_what_the_browser_plays() {
+        let playlist = "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=3848000,RESOLUTION=1920x1080,CODECS=\"vp09.00.40.08,mp4a.40.2\"\n\
+             vp9.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=3296000,RESOLUTION=1920x1080,CODECS=\"avc1.640028,mp4a.40.2\"\n\
+             avc.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=997000,RESOLUTION=1280x720,CODECS=\"avc1.4D401F,mp4a.40.2\"\n\
+             avc720.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=238000,RESOLUTION=426x240,CODECS=\"avc1.4D4015,mp4a.40.2\"\n\
+             low.m3u8\n";
+        let no_vp9 = crate::client::Playable { h264: 51, ..Default::default() };
+        let out = best_first(playlist, NATIVE_FLOOR, Some(&no_vp9));
+        assert!(!out.contains("vp9.m3u8"), "VP9 isn't listed to a browser without it: {out}");
+        assert!(out.lines().nth(1).unwrap().contains("avc1.640028"), "the best of the rest opens: {out}");
+        assert!(!out.contains("low.m3u8"), "the native floor still holds: {out}");
+
+        let vp9 = crate::client::Playable { vp9: true, ..no_vp9 };
+        assert!(
+            best_first(playlist, 0, Some(&vp9)).lines().nth(1).unwrap().contains("vp09"),
+            "it is to one with it"
+        );
+        assert_eq!(
+            best_first(playlist, 0, None),
+            best_first(playlist, 0, Some(&vp9)),
+            "no report lists everything"
+        );
+
+        // A browser that can play none of it gets the whole master rather than an empty one.
+        let out = best_first(playlist, 0, Some(&crate::client::Playable::default()));
+        assert_eq!(out.matches("#EXT-X-STREAM-INF").count(), 4, "{out}");
     }
 
     #[test]
@@ -730,10 +827,10 @@ mod tests {
              #EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1920x1080\n\
              https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1000360/file/index.m3u8\n";
         for uris in [Uris::Proxy, Uris::Native] {
-            let out = respond_playlist(playlist, master, Some("s3cret"), uris, now);
+            let out = respond_playlist(playlist, master, Some("s3cret"), uris, now, None);
             assert_eq!(out.headers()["cache-control"], "private, max-age=60");
         }
-        let out = respond_playlist("#EXTM3U\n", master, None, Uris::Proxy, now);
+        let out = respond_playlist("#EXTM3U\n", master, None, Uris::Proxy, now, None);
         assert_eq!(out.headers()["cache-control"], "private, max-age=300", "nothing soon: minutes");
         assert_eq!(playlist_max_age(Some(now + 1000), now), 0, "inside the margin: not kept at all");
         assert_eq!(playlist_max_age(None, now), 300);

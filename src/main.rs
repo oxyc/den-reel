@@ -19,6 +19,7 @@
 
 mod addon;
 mod backoff;
+mod client;
 mod config;
 mod crop;
 mod direct;
@@ -663,7 +664,9 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                 Some("1") => hls::Uris::Native,
                 _ => hls::Uris::Proxy,
             };
-            return hls::handle_master(state, id.to_string(), uris).await;
+            // What the browser plays, in `X-Den-Playable` or `?playable=`: the master then lists only that.
+            let playable = client::from_request(&parts.headers, query);
+            return hls::handle_master(state, id.to_string(), uris, playable).await;
         }
     }
 

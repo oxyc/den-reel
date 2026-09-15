@@ -99,6 +99,11 @@ GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabl
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
 GET /direct/<youtube_id>.json             →  YouTube's own URLs, for a client that can play them
                                              without this server in the middle (the web app)
+GET /hls/<youtube_id>.m3u8                →  YouTube's own HLS master, best variant first, every URI
+                                             through /hls/seg; ?native=1 keeps Google's URIs and no
+                                             rung under 540p; with X-Den-Playable or ?playable=,
+                                             only the variants that browser plays
+GET /hls/seg?u=…&s=…                      →  one googlevideo URL a master named, fetched here
      …/play requires ?s=<tag>&i=<iid>&e=<ep> when PLAY_SECRET is set (403 without,
        or for a revoked install, unless PLAY_SIGNING_GRACE_UNTIL is still ahead and
        the tag is missing); the same query opens /crop and /direct — /crop without it
@@ -143,6 +148,16 @@ following `/play` is warm. Two knobs:
 probe them, so yt-dlp stays off the `/meta` path and the response is fast. The client plays the
 first that works and advances past a dead or portrait one; playability is settled lazily on
 `/play`. `links: []` means no trailer was found (or `TMDB_KEY` is unset) — never an error.
+
+`/hls/<id>.m3u8` lists only what the asking browser plays when it sends Den Web's capability report
+(den-edge `web/src/lib/playable.ts`, the same JSON den-remux and den-scout take): in the `X-Den-Playable`
+header, which hls.js can set, or percent-encoded in `?playable=`, for Safari's own player, which fetches a
+bare URL. The header wins where both come. A variant is left out when a codec its `CODECS` names is past
+the report — H.264, HEVC or AV1 beyond its level or tier, High 10, HDR without `hdr`/`av1Hdr`, VP9 without
+`vp9`/`vp9Profile2`, Dolby Vision without `dolbyVision`, E-AC-3 without `eac3`. Anything the report has no
+field for (AAC) is kept, a master of which nothing plays is served whole, and with no report, or one that
+doesn't parse, every variant is listed as before. The report is not part of the signature: it only narrows
+what is listed. Playlists say `Vary: X-Den-Playable`.
 
 `/crop` lets the app trim baked-in **letterbox bars** with no re-encode: it runs ffmpeg
 `cropdetect` (keyframe-sampled, so cheap) over the cached MP4 and returns the non-black content
