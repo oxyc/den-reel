@@ -291,10 +291,15 @@ best first, and never the same URL twice:
 
 ```
 { "id":"…", "expires":1789521638,
-  "sources":[ {"kind":"mp4","url":"../m/s/<blob>?s=…","audio":false,"height":720},
-              {"kind":"hls","url":"../m/n/<blob>?s=…","audio":true,"height":null} ],
+  "sources":[ {"kind":"mp4","url":"../m/s/<blob>?s=…","audio":false,"width":1280,"height":720},
+              {"kind":"hls","url":"../m/n/<blob>?s=…","audio":true,"width":null,"height":null} ],
   "crop":{"letterboxed":true,"aspect":2.4,"rect":[0.0,0.1296,1.0,0.7407]} }
 ```
+
+`width` and `height` are the frame of the rendition that entry plays — so `width < height` is a portrait trailer,
+which a page cannot learn from the element on Safari (`videoWidth`/`videoHeight` are 0 at `loadedmetadata` on its
+native HLS path). Both are null until the resolve is in, which for an audible surface is after the answer, so treat
+unknown as landscape. A `hls` entry names none: its master carries a ladder of frames, not one.
 
 `crop` is the trailer's letterbox as fractions of the frame (`[x, y, width, height]`), so it holds at
 whatever height is played, or `null` until it has been measured. No answer waits for it: an unmeasured

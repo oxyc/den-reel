@@ -4156,6 +4156,12 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         "a Media Source player previews Google's own file"
     );
     assert_eq!((list[1]["kind"].as_str(), list[1]["audio"].as_bool()), (Some("mp4"), Some(false)));
+    assert_eq!(
+        (list[0]["width"].as_u64(), list[0]["height"].as_u64()),
+        (Some(1280), Some(720)),
+        "the frame the resolve picked, so a page can tell a portrait trailer without loading it"
+    );
+    assert!(list[2]["width"].is_null(), "a master names a ladder of frames, not one");
     assert!(
         list[1]["url"].as_str().unwrap().starts_with("../m/s/"),
         "carried by this server, and named relative to /sources/<id>.json: {}",

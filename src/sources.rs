@@ -297,22 +297,28 @@ pub async fn handle_sources(
     let mut sources = Vec::new();
     let mut soonest = expires * 1000;
     for form in forms {
-        let (kind, url, audio, height) = match form {
+        // The frame the resolve picked. Both are null until the resolve is in — which for an audible surface is
+        // after this answer — and they describe the rendition, not the letterbox inside it, which is `crop`.
+        let (kind, url, audio, (width, height)) = match form {
             Form::Google { .. } => {
                 // Only a silent surface lists it, and that always has its resolve.
                 let Some(d) = &direct else { continue };
                 soonest = soonest.min(d.expires);
-                ("mp4", d.video.clone(), false, d.height)
+                ("mp4", d.video.clone(), false, (d.width, d.height))
             }
             Form::Progressive { cap, audio } => {
-                let height = direct.as_ref().filter(|_| cap == first.cap()).and_then(|d| d.height);
-                ("mp4", media_url("p", cap, audio, false, None), audio, height)
+                let frame = direct.as_ref().filter(|_| cap == first.cap());
+                let frame = (frame.and_then(|d| d.width), frame.and_then(|d| d.height));
+                ("mp4", media_url("p", cap, audio, false, None), audio, frame)
             }
-            Form::Hls { native } => ("hls", media_url("h", None, false, native, report.clone()), true, None),
+            Form::Hls { native } => {
+                ("hls", media_url("h", None, false, native, report.clone()), true, (None, None))
+            }
         };
         // Never the same URL twice: a step to the URL already playing starts no load and fires no error.
         if seen.insert(url.clone()) {
-            sources.push(json!({ "kind": kind, "url": url, "audio": audio, "height": height }));
+            sources
+                .push(json!({ "kind": kind, "url": url, "audio": audio, "width": width, "height": height }));
         }
     }
 
