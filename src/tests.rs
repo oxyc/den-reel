@@ -194,6 +194,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         port: 8092,
         ytdlp_cache: cache_dir.join("yt-dlp"),
         resolve_cache: cache_dir.join("state").join("resolve.json"),
+        direct_cache: cache_dir.join("state").join("direct.json"),
         cache_dir,
         ytdlp: "yt-dlp".into(),
         ffmpeg: "ffmpeg".into(),
@@ -4231,6 +4232,43 @@ async fn a_built_index_is_known_to_be_ready_without_building_one() {
     // Each of these is a different index, and saying otherwise would offer a file that is not there.
     assert!(!ready(Some(720), false), "without sound is a different index");
     assert!(!ready(Some(480), true), "another rung is a different index");
+}
+
+/// The resolved URLs survive a redeploy, and only the ones still worth having.
+///
+/// Worth a test of its own because the failure is silent: a park that wrote nothing, or a load that filtered
+/// everything, would leave no error anywhere — just the first open of every title after every deploy paying
+/// for yt-dlp again, which is the cost this exists to remove.
+#[tokio::test]
+async fn resolved_urls_survive_a_redeploy_unless_they_have_expired() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let url = |itag: &str| format!("https://rr7.googlevideo.com/videoplayback?itag={itag}");
+    let resolved = |expires| crate::direct::Direct {
+        video: url("136"),
+        audio: Some(url("140")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires,
+    };
+    let now = (state.clock)();
+    {
+        let mut cache = state.direct_cache.lock().unwrap();
+        cache.insert("live".into(), (Ok(resolved(now + 3_600_000)), now + 3_600_000));
+        cache.insert("expired".into(), (Ok(resolved(now - 1)), now - 1));
+    }
+
+    crate::state::save_direct_cache(&state);
+    let back = crate::state::load_direct_cache(&state.cfg, now);
+
+    assert_eq!(back.len(), 1, "only what is still worth having came back: {back:?}");
+    let (answer, exp) = back.get("live").expect("the live entry");
+    assert_eq!(exp, &(now + 3_600_000));
+    let restored = answer.as_ref().expect("an answer, not a refusal");
+    assert_eq!(restored.video, url("136"), "the URL a player would have had to wait on yt-dlp for");
+    assert_eq!(restored.audio.as_deref(), Some(url("140").as_str()));
+    assert_eq!((restored.width, restored.height), (Some(1280), Some(720)));
 }
 
 /// A press builds the index the open after it will need, at the rung the billboard already resolved, so that

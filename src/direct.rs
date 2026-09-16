@@ -62,7 +62,11 @@ const UNKNOWN_EXPIRY_TTL_MS: u64 = 5 * 60 * 1000;
 pub const DIRECT_CACHE_MAX: usize = 512;
 
 /// A resolved set of direct URLs, and when they stop working.
-#[derive(Clone, Debug)]
+///
+/// Serializable so the answers survive a redeploy (`load_direct_cache` / `save_direct_cache`). Re-resolving
+/// one costs a yt-dlp run — 1.2–3.6 s measured — and a restart otherwise throws away every one of them, so
+/// the first open of every title after a deploy pays it again.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Direct {
     /// The video stream — video-only whenever YouTube answers adaptively, which is now always.
     pub video: String,

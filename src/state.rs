@@ -462,6 +462,98 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     parsed
 }
 
+/// Read back the parked googlevideo URLs, dropping whatever stopped working while the process was down.
+///
+/// Bounded before opening, for the reason the resolve cache's loader gives: this cap is the only limit on
+/// what boot materialises. A full map is `DIRECT_CACHE_MAX` entries, each holding a video URL, an audio URL
+/// and a master — roughly 5 KB apiece, so about 2.5 MB at capacity. Four megabytes clears that without
+/// inviting a file this process did not write to spend more.
+pub fn load_direct_cache(cfg: &Config, now: u64) -> HashMap<String, crate::direct::CachedDirect> {
+    const MAX_DIRECT_FILE: u64 = 4 * 1024 * 1024;
+    match std::fs::metadata(&cfg.direct_cache) {
+        Ok(md) if md.len() > MAX_DIRECT_FILE => {
+            eprintln!(
+                "direct cache at {} is {} bytes, over the {MAX_DIRECT_FILE} limit; starting empty",
+                cfg.direct_cache.display(),
+                md.len()
+            );
+            return HashMap::new();
+        }
+        Ok(_) => {}
+        Err(_) => return HashMap::new(), // no parked cache, which is the normal first boot
+    }
+    let Ok(file) = std::fs::File::open(&cfg.direct_cache) else { return HashMap::new() };
+    let parsed: HashMap<String, (crate::direct::Direct, u64)> =
+        match serde_json::from_reader(std::io::BufReader::new(file)) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!("direct cache at {} is not readable; starting empty", cfg.direct_cache.display());
+                return HashMap::new();
+            }
+        };
+    let mut kept: HashMap<String, crate::direct::CachedDirect> = HashMap::new();
+    for (k, (d, exp)) in parsed {
+        // Their own expiry, not ours: a URL parked near the end of its life simply misses on the way in.
+        if exp > now && kept.len() < crate::direct::DIRECT_CACHE_MAX {
+            kept.insert(k, (Ok(d), exp));
+        }
+    }
+    if !kept.is_empty() {
+        eprintln!("direct cache: {} trailer URL set(s) still good", kept.len());
+    }
+    kept
+}
+
+/// Park the resolved googlevideo URLs on the way out, so a redeploy does not make the first open of every
+/// title pay for yt-dlp again — 1.2–3.6 s apiece, measured 2026-09-16, and the largest single cost in a cold
+/// trailer. The resolve cache beside this one saves a TMDB call; this one saves a subprocess.
+///
+/// Only the answers, never the cooldowns. A refusal is a reason to wait a while, and a restart has already
+/// spent that while — parking it would carry a stale refusal into a process that could have just asked.
+///
+/// The file holds signed URLs. It sits in the cache dir, which is private to the addon and outside anything
+/// backed up, and everything in it stops working within hours.
+pub fn save_direct_cache(state: &AppState) {
+    let path = &state.cfg.direct_cache;
+    let Some(dir) = path.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("direct cache: {} is not writable ({e})", dir.display());
+        return;
+    }
+    let now = (state.clock)();
+    let cache = state.direct_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let live: HashMap<&String, (&crate::direct::Direct, u64)> = cache
+        .iter()
+        .filter_map(|(k, (answer, exp))| match answer {
+            Ok(d) if *exp > now => Some((k, (d, *exp))),
+            _ => None,
+        })
+        .collect();
+    let n = live.len();
+    // Write-then-rename, so a kill mid-write cannot leave a half-file for the next boot to parse.
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut w, &live).map_err(std::io::Error::other)?;
+        w.flush()
+    })();
+    drop(live);
+    drop(cache);
+    if let Err(e) = written {
+        eprintln!("direct cache: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => eprintln!("shutdown: parked {n} trailer URL set{}", if n == 1 { "" } else { "s" }),
+        Err(e) => {
+            eprintln!("direct cache: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 /// Park the resolve cache on the way out, so a redeploy does not make the next browse re-ask TMDB
 /// for every title on screen. Best-effort by design: this is a cache, and failing to write it is not
 /// worth delaying a shutdown over — but say so, because a volume that cannot be written is worth

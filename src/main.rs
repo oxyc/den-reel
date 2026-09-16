@@ -1006,6 +1006,16 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         }
     }
 
+    // And the resolved googlevideo URLs, which cost a yt-dlp run each rather than a TMDB call. Without
+    // this, every deploy made the first open of every title pay 1.2–3.6 s again — measured on the box,
+    // where it was the difference between a hero starting in 122 ms and starting in seconds.
+    {
+        let restored = state::load_direct_cache(&state.cfg, (state.clock)());
+        if !restored.is_empty() {
+            *state.direct_cache.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        }
+    }
+
     // Periodic cache sweep so the last-access TTL is enforced during idle stretches too — eviction
     // otherwise only runs after a download. Hourly is ample for a day-scale TTL, and interval's first
     // tick fires immediately so a cache left stale over a long downtime is trimmed on boot.
@@ -1087,6 +1097,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     state.worker.shutdown().await;
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     state::save_resolve_cache(&state);
+    state::save_direct_cache(&state);
     if drained {
         eprintln!("shut down cleanly");
     }

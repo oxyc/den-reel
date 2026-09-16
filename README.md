@@ -508,7 +508,7 @@ Every variable is optional; `.env.example` lists them all with their defaults.
 | `KINOCHECK_KEY` | — | migration fallback for the optional KinoCheck discovery source |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded — they follow the request's `Host` (and a proxy's `X-Forwarded-Host`/`-Proto`) |
 | `PORT` | `8092` | |
-| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: any top-level *file* that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. Subdirectories are left alone — den-reel keeps yt-dlp's player cache in `yt-dlp/` and parks its resolve cache in `state/` across restarts. |
+| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume. Must be **exclusively** den-reel's: any top-level *file* that is not a `<youtube_id>.mp4` is treated as abandoned scratch and deleted after 30 minutes. Subdirectories are left alone — den-reel keeps yt-dlp's player cache in `yt-dlp/` and parks two caches in `state/` across restarts: the titles it has resolved to YouTube ids (`resolve.json`, a TMDB round trip each) and the googlevideo URLs those resolved to (`direct.json`, a yt-dlp run each, 1.2–3.6 s). Losing the second is what made the first open of every title after a deploy slow. Both hold only what is still good, and `direct.json` holds signed URLs that stop working within hours. |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
 | `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |

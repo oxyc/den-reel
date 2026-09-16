@@ -39,6 +39,9 @@ pub struct Config {
     /// abandoned scratch and deletes it, so a `resolve.json` next to the trailers would be reaped
     /// within the hour. Both cleanup passes skip directories.
     pub resolve_cache: PathBuf,
+    /// Where the resolved googlevideo URLs are parked at shutdown. Beside `resolve_cache`, and holding
+    /// signed URLs that stop working within hours.
+    pub direct_cache: PathBuf,
     /// Legacy server-side discovery keys — a MIGRATION FALLBACK used only when a request carries no
     /// per-install config. New installs seal a BYOK TMDB (+ optional KinoCheck) key into the URL.
     pub tmdb_key: Option<String>,
@@ -279,6 +282,7 @@ impl Config {
         );
         let ytdlp_cache = cache_dir.join("yt-dlp");
         let resolve_cache = cache_dir.join("state").join("resolve.json");
+        let direct_cache = cache_dir.join("state").join("direct.json");
         // The PARSED cap everywhere, including the first rung. Interpolating the raw string put
         // `height<=abc` into the selector, and yt-dlp rejects a malformed filter while BUILDING it
         // — so the whole `/`-chain dies, terminal fallback included, and every trailer 502s until
@@ -320,6 +324,7 @@ impl Config {
             cache_ttl,
             ytdlp_cache,
             resolve_cache,
+            direct_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
