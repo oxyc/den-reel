@@ -4233,10 +4233,10 @@ async fn a_built_index_is_known_to_be_ready_without_building_one() {
     assert!(!ready(Some(480), true), "another rung is a different index");
 }
 
-/// A warm-up for a trailer a viewer might open starts its resolve and nothing more; the surface's own ask also
-/// builds the index its fallback plays from.
+/// A press builds the index the open after it will need, at the rung the billboard already resolved, so that
+/// open waits for nothing. It is the same index the open itself would ask for — the two cannot drift apart.
 #[tokio::test]
-async fn a_warm_ask_starts_the_resolve_and_builds_no_fallback_index() {
+async fn a_press_builds_the_index_the_open_after_it_will_need() {
     let dir = temp_dir();
     let mut state = direct_state(&dir, "yt-dlp-never-run".into());
     crate::crop::cache_report(
@@ -4261,13 +4261,13 @@ async fn a_warm_ask_starts_the_resolve_and_builds_no_fallback_index() {
     let taken = || warmed.lock().unwrap().drain(..).collect::<Vec<_>>();
 
     assert_eq!(ask("surface=audible&player=native&intent=warm").await.status(), 200);
-    assert_eq!(taken(), [(None, None)], "a warm-up built the fallback's index");
-    assert_eq!(ask("surface=audible&player=native").await.status(), 200);
     assert_eq!(
         taken(),
         [(Some(720), Some(true))],
-        "the hero's own ask builds it, at the rung the billboard already resolved rather than one of its own"
+        "a press builds the index the open after it will need, at the rung the billboard already resolved"
     );
+    assert_eq!(ask("surface=audible&player=native").await.status(), 200);
+    assert_eq!(taken(), [(Some(720), Some(true))], "and that open asks for the very same one");
 }
 
 /// Answering an audible surface ahead of its resolve must not hand out a list for a video already known to be

@@ -248,21 +248,22 @@ pub async fn handle_sources(
             )
         }
     };
-    // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it. The
-    // same question with the same answer, so the warm-up and the play cannot drift apart — only less work behind
-    // it: the resolve, which is what a player waits on, but no index for a fallback and no letterbox measured.
-    // Most such asks are a title glanced at and left, and those cost Google about 45 range requests each.
+    // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it.
+    // The same question with the same answer, so the warm-up and the play cannot drift apart — only less in
+    // front of the caller: it never waits, never leads with a file, and measures no letterbox.
+    //
+    // It DOES build the index the hero will need. That index costs Google about 45 range requests, and this ask
+    // is a press on a title — a finger already on it, not a title glanced at. Measured 2026-09-16, a first hero
+    // open with the resolve warm and this index missing costs 122 ms of waiting; built here, it costs nothing.
+    // The wasted case is a press that never becomes a view, and that is the trade being made deliberately.
     let speculative = query_param(query, "intent").as_deref() == Some("warm");
     let mut forms = plan(surface, player, crate::direct::height_cap(&state.cfg, Some(SILENT_HEIGHT)));
-    // The rung this surface's progressive-with-sound entry plays from, which an audible surface both warms and
-    // may lead with. `intent=warm` does neither: most such asks are a title glanced at and left.
-    let fallback = forms
-        .iter()
-        .find_map(|f| match f {
-            Form::Progressive { cap, audio: true } => Some(*cap),
-            _ => None,
-        })
-        .filter(|_| !speculative);
+    // The rung this surface's progressive-with-sound entry plays from: what an audible surface warms behind its
+    // answer, and — where it is not speculative — what it may lead with.
+    let fallback = forms.iter().find_map(|f| match f {
+        Form::Progressive { cap, audio: true } => Some(*cap),
+        _ => None,
+    });
 
     // An audible surface leads with the progressive file when that file is ready to play NOW, and with the
     // master otherwise.
@@ -285,8 +286,9 @@ pub async fn handle_sources(
     // So where the resolve is already warm, this waits a bounded `INDEX_LEAD_WAIT` for the build rather than
     // giving up on it. Only there: a cold resolve is seconds, and nothing waits seconds for a page that is
     // opening. A wait that runs out simply leads with the master, and loses only the wait.
+    // Never on a speculative ask: nobody is waiting on it, and the page asks again in earnest when it opens.
     let mut led = None;
-    if surface == Surface::Audible {
+    if surface == Surface::Audible && !speculative {
         if let Some(cap) = fallback {
             if let Some(Ok(d)) = crate::direct::peek(&state, &vid, cap) {
                 let built = crate::progressive::ready(&state, &vid, cap, &d, true)
