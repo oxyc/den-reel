@@ -164,8 +164,12 @@ response was: `cache;desc=hit` is warm, `index;dur=` means that caller just paid
 An answer that is a fallback says so in `X-Den-Degraded`, which is absent otherwise:
 `stale_answer` (`/meta` serving the last known trailers while the lookup fails),
 `upstream_unavailable` (an empty `/meta` because the lookup could not be made, not because there is
-no trailer), and `crop_unavailable` (`/crop`'s "play the full frame", when no rect could be measured
-or the call was unsigned). A `/meta` reordered around trailers `/play` found dead is not degraded.
+no trailer), `crop_unavailable` (`/crop`'s "play the full frame", when no rect could be measured
+or the call was unsigned), and `hls_drm` (a 404 from `/hls` or a minted `/m/n/<blob>`, whichever asked:
+YouTube protects some trailers' HLS with
+FairPlay, and a master nothing here can decrypt is refused at once rather than served to a player that
+would wait twenty seconds and then fail — the same trailer's `/progressive` is not protected and plays).
+A `/meta` reordered around trailers `/play` found dead is not degraded.
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
 following `/play` is warm. The warm-up is started, not awaited: `/meta` answers as soon as it has the

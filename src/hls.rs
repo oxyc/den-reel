@@ -198,6 +198,24 @@ fn best_first(playlist: &str, floor: u32, playable: Option<&crate::client::Playa
     out
 }
 
+/// Whether a playlist locks its media behind a key the player would have to fetch.
+///
+/// YouTube protects some trailers this way — the Movies-catalogue ones, as far as we have seen — with
+/// FairPlay: `#EXT-X-SESSION-KEY:KEYFORMAT="com.apple.streamingkeydelivery",METHOD=SAMPLE-AES` and an
+/// `skd://www.youtube.com/api/drm/fps` URI. Nothing here can answer a key request and nothing here should
+/// try, so a player handed such a master asks for a key, waits, and dies. Measured on an iPhone: no frame
+/// inside twenty seconds, then `MEDIA_ERR_DECODE` on the retry — while the playlist itself fetched
+/// perfectly well, which is what makes it look like a transport problem and not a refusal.
+///
+/// `METHOD=NONE` is how the spec says a key that applied earlier has stopped applying, so it is not one.
+fn protected(playlist: &str) -> bool {
+    playlist.lines().any(|line| {
+        let line = line.trim_end_matches('\r');
+        (line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:"))
+            && attribute(line, "METHOD").is_none_or(|method| method != "NONE")
+    })
+}
+
 /// One attribute of a tag line, quotes removed: `CODECS="avc1.640028,mp4a.40.2"` gives the two codecs. The name
 /// counts only where an attribute may start, as in `bandwidth`.
 fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -512,6 +530,21 @@ fn respond_playlist(
     now: u64,
     playable: Option<&crate::client::Playable>,
 ) -> Response<Body> {
+    // A playlist the player cannot decrypt is left off rather than offered to fail, the same way an
+    // unindexable file is (`sources.rs`). Answering at once matters as much as answering no: served, this
+    // costs the viewer twenty seconds of nothing and then a decode error, and a page that waited that long
+    // has no time left to try anything else. 404 like `no_hls`, because that is what this is — there is no
+    // HLS here we can play — and the page still has `/progressive`, which is not protected.
+    if protected(text) {
+        crate::log_limited("hls drm", || "refusing a DRM-protected playlist".to_string());
+        let mut resp = httputil::error(
+            StatusCode::NOT_FOUND,
+            "hls_drm",
+            "YouTube protects this trailer's HLS with DRM. Play the progressive file instead.",
+        );
+        resp.headers_mut().insert("x-den-degraded", hyper::header::HeaderValue::from_static("hls_drm"));
+        return resp;
+    }
     // The soonest expiry among the playlist's own URL and every URL it names.
     let earliest = std::cell::Cell::new(crate::direct::parse_expiry_ms(url));
     let note = |target: &str| {
@@ -559,6 +592,32 @@ mod tests {
 
     fn proxy(url: &str) -> String {
         proxied(Some("s3cret"), url)
+    }
+
+    /// A protected playlist is refused, and quickly: served, it costs a viewer twenty seconds of nothing
+    /// followed by a decode error. Measured on `9O1Iy9od7-A` (The Godfather Part II), whose master carries
+    /// FairPlay while its progressive file plays fine.
+    #[test]
+    fn a_drm_protected_playlist_is_refused_rather_than_served() {
+        let master = "#EXTM3U\n\
+             #EXT-X-SESSION-KEY:KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\",\
+             METHOD=SAMPLE-AES,URI=\"https://manifest.googlevideo.com/x/file/skd://www.youtube.com/api/drm/fps?ek=1\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=1\n\
+             https://r2.googlevideo.com/video.m3u8\n";
+        assert!(protected(master));
+        let resp = respond_playlist(master, MASTER, Some("s3cret"), Uris::Native, 0, None);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a master we cannot play is not a 200");
+        assert_eq!(resp.headers().get("x-den-degraded").unwrap(), "hls_drm");
+    }
+
+    /// The ordinary playlist is untouched, and the spec's own way of lifting a key is not a refusal.
+    #[test]
+    fn only_a_key_that_still_applies_refuses_a_playlist() {
+        assert!(!protected("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://r2.googlevideo.com/v.m3u8\n"));
+        assert!(!protected("#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n"), "a key that no longer applies is not one");
+        assert!(protected("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k.example/k\"\n"));
+        // A variant playlist is read through the same door, and one we cannot decrypt is equally useless.
+        assert!(protected("#EXTM3U\r\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\r\n"));
     }
 
     /// Every URI has to travel, whichever half of the playlist it is written in: a variant on its own
