@@ -94,12 +94,26 @@ pub(crate) fn plan(surface: Surface, player: Player, silent_cap: Option<u32>) ->
             Form::Progressive { cap: silent_cap, audio: false },
             Form::Hls { native: false },
         ],
-        // Safari's own HLS player reached metadata in 636 ms, against 934 ms for the progressive file.
+        // The master leads, and the fallback asks for the SILENT SURFACE'S RUNG rather than the whole ladder.
+        //
+        // A resolve is cached per (video, rung) and is the expensive half of a cold open: 1.2–3.6 s measured,
+        // against 90–133 ms to index an ordinary trailer. On a rung of its own this fallback paid that every
+        // time; on the rung the billboard already warms it pays neither. Measured 2026-09-16, resolve warm and
+        // index cold: 249 ms on macOS Safari, 412 ms on iOS, 475 ms in Chrome — against 2295–3383 ms for the
+        // same file at a rung nobody had asked for. It is also the rung this surface warms in the background
+        // below, so the warm-up and the fallback now agree instead of building two indexes.
+        //
+        // Whether the master should still lead is NOT settled by those numbers, though they argue against it:
+        // it loses every warm case on every browser and is sometimes unplayable on iOS (`hls_drm`). Moving the
+        // progressive file first would either block this answer on an index build while a page is opening —
+        // which is the one thing the audible path exists to avoid — or hand the page a URL that stalls at play
+        // time with no error to fall back from. Doing it properly needs a non-blocking look at the index cache,
+        // which `prepare`/`warm`/`indexed` do not offer: each of them builds or joins a build.
         (Surface::Audible, Player::Native) => {
-            vec![Form::Hls { native: true }, Form::Progressive { cap: None, audio: true }]
+            vec![Form::Hls { native: true }, Form::Progressive { cap: silent_cap, audio: true }]
         }
         (Surface::Audible, Player::HlsJs) => {
-            vec![Form::Hls { native: false }, Form::Progressive { cap: None, audio: true }]
+            vec![Form::Hls { native: false }, Form::Progressive { cap: silent_cap, audio: true }]
         }
     }
 }
@@ -293,6 +307,17 @@ pub async fn handle_sources(
         format!("../{}", seal(signer.as_ref(), &media))
     };
 
+    // The rung whose index this answer is building, for the letterbox below: the progressive form's, which is
+    // NOT `first.cap()` on an audible surface — there the first form is the master and names no rung. Read
+    // before the loop, which consumes `forms`.
+    let indexed = forms
+        .iter()
+        .find_map(|f| match f {
+            Form::Progressive { cap, .. } => Some(*cap),
+            _ => None,
+        })
+        .unwrap_or(first.cap());
+
     let mut seen = HashSet::new();
     let mut sources = Vec::new();
     let mut soonest = expires * 1000;
@@ -307,6 +332,10 @@ pub async fn handle_sources(
                 ("mp4", d.video.clone(), false, (d.width, d.height))
             }
             Form::Progressive { cap, audio } => {
+                // Only when this form plays from the resolve in hand. An audible surface's fallback asks for
+                // the silent rung while the resolve here is the master's, so its frame stays null even with a
+                // resolve cached — the full ladder's dimensions do not describe the 720 rendition, and a page
+                // that needs them has `requestVideoFrameCallback`.
                 let frame = direct.as_ref().filter(|_| cap == first.cap());
                 let frame = (frame.and_then(|d| d.width), frame.and_then(|d| d.height));
                 ("mp4", media_url("p", cap, audio, false, None), audio, frame)
@@ -327,8 +356,10 @@ pub async fn handle_sources(
     let crop =
         state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&vid).and_then(|r| r.fractions());
     if crop.is_none() && !speculative {
-        // From the index this surface is building anyway: the one with sound for an audible surface.
-        crate::crop::measure_in_background(&state, &vid, first.cap(), surface == Surface::Audible);
+        // From the index this surface is building anyway: the one with sound for an audible surface. Measuring
+        // from `first.cap()` instead would build a SECOND index, at a rung nothing in this list plays, for a
+        // letterbox the fallback's own index could have given.
+        crate::crop::measure_in_background(&state, &vid, indexed, surface == Surface::Audible);
     }
 
     let max_age = match &direct {
@@ -420,14 +451,31 @@ mod tests {
             plan(Surface::Silent, Player::HlsJs, cap),
             [Form::Google { cap }, Form::Progressive { cap, audio: false }, Form::Hls { native: false }]
         );
+        // The audible fallback asks for the SAME rung as the silent surface, and that is the point of it: a
+        // resolve is cached per (video, rung), so a fallback on a rung of its own pays a 1.2-3.6 s resolve
+        // that the billboard has already paid on 720. Measured warm-resolve/cold-index at this rung:
+        // 249 ms macOS Safari, 412 ms iOS, 475 ms Chrome.
         assert_eq!(
             plan(Surface::Audible, Player::Native, cap),
-            [Form::Hls { native: true }, Form::Progressive { cap: None, audio: true }]
+            [Form::Hls { native: true }, Form::Progressive { cap, audio: true }]
         );
         assert_eq!(
             plan(Surface::Audible, Player::HlsJs, cap),
-            [Form::Hls { native: false }, Form::Progressive { cap: None, audio: true }]
+            [Form::Hls { native: false }, Form::Progressive { cap, audio: true }]
         );
+        // Every progressive form in every plan names one rung, so one index serves all of them.
+        for (surface, player) in [
+            (Surface::Silent, Player::Native),
+            (Surface::Silent, Player::HlsJs),
+            (Surface::Audible, Player::Native),
+            (Surface::Audible, Player::HlsJs),
+        ] {
+            for form in plan(surface, player, cap) {
+                if let Form::Progressive { cap: asked, .. } = form {
+                    assert_eq!(asked, cap, "{surface:?}/{player:?} asks for a rung of its own");
+                }
+            }
+        }
     }
 
     fn media() -> Media {

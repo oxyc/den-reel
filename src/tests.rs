@@ -4230,7 +4230,11 @@ async fn a_warm_ask_starts_the_resolve_and_builds_no_fallback_index() {
     assert_eq!(ask("surface=audible&player=native&intent=warm").await.status(), 200);
     assert_eq!(taken(), [(None, None)], "a warm-up built the fallback's index");
     assert_eq!(ask("surface=audible&player=native").await.status(), 200);
-    assert_eq!(taken(), [(None, Some(true))], "the hero's own ask builds it");
+    assert_eq!(
+        taken(),
+        [(Some(720), Some(true))],
+        "the hero's own ask builds it, at the rung the billboard already resolved rather than one of its own"
+    );
 }
 
 /// Answering an audible surface ahead of its resolve must not hand out a list for a video already known to be
