@@ -362,12 +362,18 @@ to be unavailable is still refused at once. Behind the resolve the index of the 
 master ever fails.
 
 **Once that index exists, the same surface leads with the file instead** (`cache;desc=hit`, and the frame
-sizes filled in, since the answer now holds the resolve the entry plays from). The condition is that the
-index is *built*, not merely started, and it is asked without building anything: offering a file whose index
-is still building would be worse than the master either way — waiting here puts a build in front of a page
-that is opening, and not waiting hands the page a URL that stalls mid-load, which fires no `error` and so
-never advances its ladder. The numbers above are why it is worth the condition: the master wins nothing on
-any browser measured once the index it is compared against exists.
+sizes filled in, since the answer now holds the resolve the entry plays from). What it must never do is hand
+the page a file whose index is still building: that URL stalls mid-load, and a stall fires no `error`, so the
+page's ladder never advances past it — worse than the master it replaced.
+
+**Where the resolve is already warm, the answer waits up to 250 ms for that build** rather than giving up on
+it. Only there: a cold resolve is seconds, and nothing waits seconds for a page that is opening, while an
+index at this rung with a warm resolve is 93–241 ms. The wait is worth having because "already built" alone
+was too strict in practice — the billboard warms the 720 index *without* sound and a hero needs the one
+*with* it, so on a first open the build has only just started. Measured on the live site, three of four first
+opens led with the master and paid 1136–2704 ms, with the build finishing a fraction of a second after the
+answer went out. A wait that runs out leads with the master and loses only the wait: `layout_for` drives every
+build on a task of its own, so the index finishes anyway and the next ask has it.
 
 `intent=warm` marks an ask made because a viewer might open the trailer (a press on a title link) rather than
 because a surface is about to play it. The answer is the same; behind it only the resolve is started, with no

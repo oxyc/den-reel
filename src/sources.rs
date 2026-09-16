@@ -43,6 +43,17 @@ const UNRESOLVED_MAX_AGE_SECS: u64 = 300;
 /// The height a silent surface is capped at, before the ladder rounds it.
 const SILENT_HEIGHT: &str = "720";
 
+/// How long an audible answer waits for an index that is not built yet, before leading with the master.
+///
+/// Only ever waited where the resolve is already warm, which is exactly when the build is short: 93–241 ms
+/// measured at this rung on 2026-09-16, against 1007–2873 ms at the full ladder. Bounded because a page is
+/// opening while this runs.
+///
+/// A wait that runs out costs this one answer the wait and nothing else: `layout_for` drives every build on a
+/// task of its own, so the index still finishes and the next ask leads with it. Set against what the wait buys
+/// — a master measured in production at 1136–2704 ms, and 2850–4101 ms on iOS — a quarter second is cheap.
+const INDEX_LEAD_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// What a surface needs of its trailer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Surface {
@@ -261,15 +272,31 @@ pub async fn handle_sources(
     // DRM-protected trailer's master produces no frame at all. The master wins nothing once the index it is
     // compared against exists.
     //
-    // "Ready" is the whole condition, and it is asked without building anything. Offering the file when its
-    // index is merely STARTED would be worse than the master both ways: waiting here would put an index build
-    // in front of a page that is opening, and not waiting would hand the page a URL that stalls mid-load with
-    // no error to fall back from — a stall fires no `error` event, so the page's ladder never advances.
+    // Ready to play is the whole condition. What must never happen is handing the page a file whose index is
+    // still building: that URL stalls mid-load, and a stall fires no `error` event, so the page's ladder never
+    // advances past it — worse than the master it replaced.
+    //
+    // But "already built" alone was too strict, and production said so. The billboard warms the 720 index
+    // WITHOUT sound; a hero needs the one WITH sound, which is a different index, and its build only starts
+    // when the hero asks. Measured on d.oxy.fi 2026-09-16: three of four first opens led with the master and
+    // paid 1136–2704 ms for it, and only a return visit two minutes later led with the file. The build had
+    // finished a fraction of a second after the answer went out.
+    //
+    // So where the resolve is already warm, this waits a bounded `INDEX_LEAD_WAIT` for the build rather than
+    // giving up on it. Only there: a cold resolve is seconds, and nothing waits seconds for a page that is
+    // opening. A wait that runs out simply leads with the master, and loses only the wait.
     let mut led = None;
     if surface == Surface::Audible {
         if let Some(cap) = fallback {
             if let Some(Ok(d)) = crate::direct::peek(&state, &vid, cap) {
-                if crate::progressive::ready(&state, &vid, cap, &d, true) && lead_with_sound(&mut forms) {
+                let built = crate::progressive::ready(&state, &vid, cap, &d, true)
+                    || tokio::time::timeout(
+                        INDEX_LEAD_WAIT,
+                        crate::progressive::prepare(&state, &vid, cap, &d, true),
+                    )
+                    .await
+                    .is_ok_and(|built| built.is_ok());
+                if built && lead_with_sound(&mut forms) {
                     led = Some(d);
                 }
             }
