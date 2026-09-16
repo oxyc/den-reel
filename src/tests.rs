@@ -195,6 +195,8 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         ytdlp_cache: cache_dir.join("yt-dlp"),
         resolve_cache: cache_dir.join("state").join("resolve.json"),
         direct_cache: cache_dir.join("state").join("direct.json"),
+        crop_cache: cache_dir.join("state").join("crop.json"),
+        index_cache: cache_dir.join("state").join("index.json"),
         cache_dir,
         ytdlp: "yt-dlp".into(),
         ffmpeg: "ffmpeg".into(),
@@ -3693,12 +3695,47 @@ fn the_parked_resolve_cache_is_not_swept_away() {
         crate::state::YtEntry { ids: vec!["goodTrailer".into()], exp: now + 1000, confirmed: now },
     );
     crate::state::save_resolve_cache(&state);
-    assert!(state.cfg.resolve_cache.exists(), "nothing was written, so this proves nothing");
+    // The other two parked beside it. None of this is a trailer, and none of it may be evicted with them:
+    // the sweep walks files at the top of the cache dir and steps over subdirectories, which is the whole
+    // reason `state/` is where these live.
+    state.direct_cache.lock().unwrap().insert(
+        "dQw4w9WgXcQ".into(),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136".into(),
+                audio: None,
+                width: None,
+                height: None,
+                hls: None,
+                expires: now + 3_600_000,
+            }),
+            now + 3_600_000,
+        ),
+    );
+    crate::state::save_direct_cache(&state);
+    crate::crop::cache_report(
+        &state,
+        "dQw4w9WgXcQ",
+        crate::crop::report_from(
+            "dQw4w9WgXcQ",
+            Some((1920, 1080)),
+            crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+        ),
+    );
+    crate::state::save_crop_cache(&state);
+    crate::state::save_index_cache(&state);
+    let parked_files =
+        [&state.cfg.resolve_cache, &state.cfg.direct_cache, &state.cfg.crop_cache, &state.cfg.index_cache];
+    for parked in parked_files {
+        assert!(parked.exists(), "nothing was written to {}, so this proves nothing", parked.display());
+    }
 
     crate::play::sweep_partials(&state.cfg);
     crate::play::evict_if_needed(&state.cfg);
 
-    assert!(state.cfg.resolve_cache.exists(), "the sweep reaped the resolve cache it is meant to ignore");
+    for parked in parked_files {
+        assert!(parked.exists(), "the sweep reaped {}, which it is meant to step over", parked.display());
+    }
 }
 
 /// The size sweep drops entries by expiry. Keying it off any other field wipes the whole cache on
@@ -4199,6 +4236,77 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         crate::sign::Binding::Unbound,
     );
     assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
+}
+
+/// A built index survives a redeploy, so the first open after one does not pay to build it again.
+///
+/// Proved across two states sharing a cache directory rather than within one, because a park that never
+/// reached disk would pass the easier version. Silent if it breaks: every index would simply be rebuilt on
+/// the first request after each restart — 45 range requests to Google apiece — with nothing to show for it.
+#[tokio::test]
+async fn a_built_index_survives_a_redeploy() {
+    let dir = temp_dir();
+    let before = direct_state(&dir, "yt-dlp-never-run".into());
+    let video = crate::progressive::tests::fragmented(&[&[7, 3], &[7, 3]], 0);
+    let audio = crate::progressive::tests::fragmented(&[&[2, 2]], 1);
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+    crate::progressive::prepare(&before, "dQw4w9WgXcQ", Some(720), &direct, true).await.expect("an index");
+    crate::state::save_index_cache(&before);
+    let built = asked.swap(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(built > 0, "nothing was indexed, so this proves nothing");
+
+    // A second process, same volume.
+    let after = direct_state(&dir, "yt-dlp-never-run".into());
+    assert!(!crate::progressive::ready(&after, "dQw4w9WgXcQ", Some(720), &direct, true), "started warm");
+    let parked = crate::state::load_index_cache(&after.cfg);
+    let kept = crate::progressive::restore(&after, parked, (after.clock)());
+
+    assert_eq!(kept, 1, "the parked index did not come back");
+    assert!(crate::progressive::ready(&after, "dQw4w9WgXcQ", Some(720), &direct, true), "back but unusable");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "restoring it went back to Google, which is the cost it exists to avoid"
+    );
+}
+
+/// A measured letterbox survives a redeploy, and a report that left its optional fields out still reads back.
+///
+/// Silent if it breaks: nothing errors when a park writes nothing or a load rejects its own output. Every
+/// trailer would simply be cropdetected again after each restart — a second and up to 2.6 MB of Google's
+/// bandwidth apiece — with no sign of it anywhere.
+#[tokio::test]
+async fn a_measured_letterbox_survives_a_redeploy() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let measured = crate::crop::report_from(
+        "dQw4w9WgXcQ",
+        Some((1920, 1080)),
+        crate::crop::RawCrop { w: 1920, h: 800, x: 0, y: 140 },
+    );
+    crate::crop::cache_report(&state, "dQw4w9WgXcQ", measured);
+
+    crate::state::save_crop_cache(&state);
+    let back = crate::state::load_crop_cache(&state.cfg);
+
+    let report = back.get("dQw4w9WgXcQ").expect("the letterbox that was measured");
+    assert!(report.letterboxed, "a trailer with bars came back without them");
+    assert_eq!(report.content.as_ref().map(|r| (r.x, r.y, r.w, r.h)), Some((0, 140, 1920, 800)));
+    assert_eq!(report.source.as_ref().map(|d| (d.w, d.h)), Some((1920, 1080)));
+
+    // The fields that are skipped when empty must be optional coming back in, or this writes a file it
+    // cannot read: every restart would then discard the lot and quietly re-measure everything.
+    std::fs::write(&state.cfg.crop_cache, r#"{"x":{"id":"x","letterboxed":false}}"#).unwrap();
+    let sparse = crate::state::load_crop_cache(&state.cfg);
+    assert!(sparse.contains_key("x"), "a report with no rect was thrown away: {sparse:?}");
 }
 
 /// A built index is known to be built, and asked about without building one.

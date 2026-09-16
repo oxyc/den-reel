@@ -462,6 +462,147 @@ pub fn load_resolve_cache(cfg: &Config, now: u64) -> HashMap<String, YtEntry> {
     parsed
 }
 
+/// Read back the parked progressive indexes.
+///
+/// The largest of the four parked files by a long way: `PROGRESSIVE_MAX` is 64 and each index is tens of
+/// kilobytes, which base64 inflates by a third — so single-digit megabytes in practice, and sixteen is a
+/// ceiling on what a file this process did not write can make boot allocate.
+pub fn load_index_cache(cfg: &Config) -> HashMap<String, crate::progressive::ParkedIndex> {
+    const MAX_INDEX_FILE: u64 = 16 * 1024 * 1024;
+    match std::fs::metadata(&cfg.index_cache) {
+        Ok(md) if md.len() > MAX_INDEX_FILE => {
+            eprintln!(
+                "index cache at {} is {} bytes, over the {MAX_INDEX_FILE} limit; starting empty",
+                cfg.index_cache.display(),
+                md.len()
+            );
+            return HashMap::new();
+        }
+        Ok(_) => {}
+        Err(_) => return HashMap::new(), // no parked cache, which is the normal first boot
+    }
+    let Ok(file) = std::fs::File::open(&cfg.index_cache) else { return HashMap::new() };
+    match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(map) => map,
+        Err(_) => {
+            eprintln!("index cache at {} is not readable; starting empty", cfg.index_cache.display());
+            HashMap::new()
+        }
+    }
+}
+
+/// Park the built indexes on the way out.
+///
+/// Rebuilding one costs about 45 range requests to Google and 93–241 ms at the rung a hero plays, far more
+/// at the full ladder (measured 2026-09-16). They are only worth carrying because the resolve cache is
+/// carried too: an index maps byte ranges into Google's file, so it is useful again only if the URLs come
+/// back with it, which is exactly what `direct.json` restores.
+pub fn save_index_cache(state: &AppState) {
+    let path = &state.cfg.index_cache;
+    let Some(dir) = path.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("index cache: {} is not writable ({e})", dir.display());
+        return;
+    }
+    let parked = crate::progressive::park(state, (state.clock)());
+    let n = parked.len();
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut w, &parked).map_err(std::io::Error::other)?;
+        w.flush()
+    })();
+    if let Err(e) = written {
+        eprintln!("index cache: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => eprintln!("shutdown: parked {n} trailer index{}", if n == 1 { "" } else { "es" }),
+        Err(e) => {
+            eprintln!("index cache: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Read back the measured letterboxes. Nothing here expires: where a trailer's bars are is a fact about the
+/// video, so an entry parked a year ago is as good as one measured a minute ago.
+///
+/// Bounded before opening, as its neighbours are. A report is a handful of integers — about a hundred bytes —
+/// so a megabyte is room for thousands of trailers and still a cap on what a file this process did not write
+/// can make boot allocate.
+pub fn load_crop_cache(cfg: &Config) -> HashMap<String, crate::crop::CropReport> {
+    const MAX_CROP_FILE: u64 = 1024 * 1024;
+    match std::fs::metadata(&cfg.crop_cache) {
+        Ok(md) if md.len() > MAX_CROP_FILE => {
+            eprintln!(
+                "crop cache at {} is {} bytes, over the {MAX_CROP_FILE} limit; starting empty",
+                cfg.crop_cache.display(),
+                md.len()
+            );
+            return HashMap::new();
+        }
+        Ok(_) => {}
+        Err(_) => return HashMap::new(), // no parked cache, which is the normal first boot
+    }
+    let Ok(file) = std::fs::File::open(&cfg.crop_cache) else { return HashMap::new() };
+    match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(map) => {
+            let map: HashMap<String, crate::crop::CropReport> = map;
+            if !map.is_empty() {
+                eprintln!("crop cache: {} letterbox(es) remembered", map.len());
+            }
+            map
+        }
+        Err(_) => {
+            eprintln!("crop cache at {} is not readable; starting empty", cfg.crop_cache.display());
+            HashMap::new()
+        }
+    }
+}
+
+/// Park the measured letterboxes on the way out.
+///
+/// Measuring one costs about a second and up to 2.6 MB of Google's bandwidth — it reads up to 64 keyframes
+/// and runs cropdetect over them — and the answer never changes, so losing it to a redeploy is the purest
+/// waste of the three caches parked here.
+///
+/// Only what was actually measured. `CropReport::unknown` is "could not tell, play the full frame", which is
+/// not an answer and is never held in this map; the retry cooldowns beside it are deliberately left behind,
+/// for the reason the resolve cooldowns are.
+pub fn save_crop_cache(state: &AppState) {
+    let path = &state.cfg.crop_cache;
+    let Some(dir) = path.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("crop cache: {} is not writable ({e})", dir.display());
+        return;
+    }
+    let cache = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let n = cache.len();
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut w, &*cache).map_err(std::io::Error::other)?;
+        w.flush()
+    })();
+    drop(cache);
+    if let Err(e) = written {
+        eprintln!("crop cache: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => eprintln!("shutdown: parked {n} letterbox{}", if n == 1 { "" } else { "es" }),
+        Err(e) => {
+            eprintln!("crop cache: {e}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 /// Read back the parked googlevideo URLs, dropping whatever stopped working while the process was down.
 ///
 /// Bounded before opening, for the reason the resolve cache's loader gives: this cap is the only limit on

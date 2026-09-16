@@ -87,6 +87,100 @@ pub(crate) type Source<'a> = (&'a [u8], &'a [(u64, Bytes)]);
 /// One kept build: the URLs it indexes (one per line), when to stop using it (epoch ms), and the build.
 pub type Entry = (String, u64, SharedLayout);
 
+/// One index written to disk: what it was built for, when it stops being usable, and the built file.
+///
+/// Binary as base64 rather than a JSON array of bytes, which would be several times the size for the one
+/// field that is actually large.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ParkedIndex {
+    urls: String,
+    until: u64,
+    head: String,
+    pieces: Vec<Piece>,
+    total: u64,
+    etag: String,
+    keyframes: Vec<(u64, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avcc: Option<String>,
+}
+
+/// The indexes worth keeping: built, not merely started, and not yet expired.
+///
+/// A build that is still running is a future nobody can serialise, and one that failed is not worth carrying
+/// across a restart — the next request will find out faster than this file can tell it.
+pub(crate) fn park(state: &AppState, now: u64) -> std::collections::HashMap<String, ParkedIndex> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
+    map.iter()
+        .filter_map(|(key, (urls, until, shared))| {
+            if *until <= now {
+                return None;
+            }
+            let Some(Ok(layout)) = shared.peek() else { return None };
+            Some((
+                key.clone(),
+                ParkedIndex {
+                    urls: urls.clone(),
+                    until: *until,
+                    head: b64.encode(&layout.head),
+                    pieces: layout.pieces.clone(),
+                    total: layout.total,
+                    etag: layout.etag.clone(),
+                    keyframes: layout.keyframes.clone(),
+                    avcc: layout.avcc.as_ref().map(|a| b64.encode(a)),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Put parked indexes back, as futures that are already finished.
+///
+/// `layout_for` still checks each against the URLs it is asked about (`kept == source`), so one restored for
+/// a resolve that has since rotated is simply passed over — the check that makes this safe is the one that
+/// was already there.
+pub(crate) fn restore(
+    state: &Arc<AppState>,
+    parked: std::collections::HashMap<String, ParkedIndex>,
+    now: u64,
+) -> usize {
+    use base64::Engine;
+    use futures_util::FutureExt;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept = 0;
+    for (key, index) in parked {
+        if index.until <= now || map.len() >= PROGRESSIVE_MAX {
+            continue;
+        }
+        let Ok(head) = b64.decode(&index.head) else { continue };
+        let avcc = match index.avcc.as_ref().map(|a| b64.decode(a)) {
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(_)) => continue,
+            None => None,
+        };
+        let layout = Arc::new(Layout {
+            head: Bytes::from(head),
+            pieces: index.pieces,
+            total: index.total,
+            etag: index.etag,
+            keyframes: index.keyframes,
+            avcc,
+        });
+        let shared: SharedLayout = futures_util::future::ready(Ok(layout)).boxed().shared();
+        // Polled here, and that is not a formality: `peek` reports a future that has COMPLETED, not one that
+        // would complete on its first poll. Left unpolled, a restored index sits in the map fully built while
+        // `ready` goes on answering no — the audible surface keeps leading with the master, the file is never
+        // offered, and nothing anywhere looks wrong. It is the same reason `layout_for` drives its own builds
+        // on a task rather than leaving a future nobody polls.
+        let _ = shared.clone().now_or_never();
+        map.insert(key, (index.urls, index.until, shared));
+        kept += 1;
+    }
+    kept
+}
+
 /// The file this serves: `head` (ftyp, the built moov, the mdat header), then each piece of Google's
 /// file in order.
 #[derive(Debug)]
@@ -103,7 +197,7 @@ pub struct Layout {
 
 /// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's file `source`
 /// (the video, or its audio).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Piece {
     pub at: u64,
     pub source: usize,

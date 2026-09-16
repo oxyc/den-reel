@@ -42,6 +42,12 @@ pub struct Config {
     /// Where the resolved googlevideo URLs are parked at shutdown. Beside `resolve_cache`, and holding
     /// signed URLs that stop working within hours.
     pub direct_cache: PathBuf,
+    /// Where measured letterboxes are parked. A rectangle is a property of the video, not of a URL, so
+    /// unlike its neighbours nothing in this file ever expires.
+    pub crop_cache: PathBuf,
+    /// Where built progressive indexes are parked. Each is tens of kilobytes and stops being usable when the
+    /// URLs it maps into do.
+    pub index_cache: PathBuf,
     /// Legacy server-side discovery keys — a MIGRATION FALLBACK used only when a request carries no
     /// per-install config. New installs seal a BYOK TMDB (+ optional KinoCheck) key into the URL.
     pub tmdb_key: Option<String>,
@@ -283,6 +289,8 @@ impl Config {
         let ytdlp_cache = cache_dir.join("yt-dlp");
         let resolve_cache = cache_dir.join("state").join("resolve.json");
         let direct_cache = cache_dir.join("state").join("direct.json");
+        let crop_cache = cache_dir.join("state").join("crop.json");
+        let index_cache = cache_dir.join("state").join("index.json");
         // The PARSED cap everywhere, including the first rung. Interpolating the raw string put
         // `height<=abc` into the selector, and yt-dlp rejects a malformed filter while BUILDING it
         // — so the whole `/`-chain dies, terminal fallback included, and every trailer 502s until
@@ -325,6 +333,8 @@ impl Config {
             ytdlp_cache,
             resolve_cache,
             direct_cache,
+            crop_cache,
+            index_cache,
             tmdb_key: env_opt("TMDB_KEY"),
             kinocheck_key: env_opt("KINOCHECK_KEY"),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),

@@ -59,13 +59,13 @@ const MIN_CONTENT_FRAC: f64 = 0.6;
 const FULL_FRAME_MIN: usize = 2;
 const FULL_FRAME_PCT: usize = 3;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Dim {
     pub w: u32,
     pub h: u32,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -75,15 +75,17 @@ pub struct Rect {
 
 /// What `/crop/<id>.json` returns. `letterboxed=false` (with `content` == source, or absent) means
 /// "play normally". When `letterboxed=true`, the app should aspect-fill `content` within the frame.
-#[derive(Clone, Serialize)]
+/// `default` beside every `skip_serializing_if`, so a parked report can be read back: what is left out on
+/// the way to disk has to be optional on the way in, or the file this writes is one it cannot parse.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct CropReport {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Dim>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Rect>,
     pub letterboxed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aspect: Option<f64>,
 }
 

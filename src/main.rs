@@ -1016,6 +1016,26 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         }
     }
 
+    // And the letterboxes, which cost a second of cropdetect over up to 64 keyframes apiece and never change.
+    {
+        let restored = state::load_crop_cache(&state.cfg);
+        if !restored.is_empty() {
+            *state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        }
+    }
+
+    // And the built indexes, which are only worth restoring because the resolves above came back with them:
+    // an index maps ranges into Google's file, so it is useful again only alongside the URLs it was built for.
+    {
+        let parked = state::load_index_cache(&state.cfg);
+        if !parked.is_empty() {
+            let kept = progressive::restore(&state, parked, (state.clock)());
+            if kept > 0 {
+                eprintln!("index cache: {kept} trailer index(es) still good");
+            }
+        }
+    }
+
     // Periodic cache sweep so the last-access TTL is enforced during idle stretches too — eviction
     // otherwise only runs after a download. Hourly is ample for a day-scale TTL, and interval's first
     // tick fires immediately so a cache left stale over a long downtime is trimmed on boot.
@@ -1098,6 +1118,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     crate::play::sweep_own_temps(&cfg_for_shutdown);
     state::save_resolve_cache(&state);
     state::save_direct_cache(&state);
+    state::save_crop_cache(&state);
+    state::save_index_cache(&state);
     if drained {
         eprintln!("shut down cleanly");
     }
