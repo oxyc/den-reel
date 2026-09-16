@@ -4200,6 +4200,39 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
     assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
 }
 
+/// A built index is known to be built, and asked about without building one.
+///
+/// An audible surface's whole ordering decision rests on this answer, and the failure it guards against is
+/// silent: were `ready` to disagree with `prepare` about the key, it would simply always say no, the trailer
+/// file would never lead, nothing would error, and the only symptom would be that the hero stayed slow.
+#[tokio::test]
+async fn a_built_index_is_known_to_be_ready_without_building_one() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let video = crate::progressive::tests::fragmented(&[&[7, 3], &[7, 3]], 0);
+    let audio = crate::progressive::tests::fragmented(&[&[2, 2]], 1);
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+    let ready = |cap, audio| crate::progressive::ready(&state, "dQw4w9WgXcQ", cap, &direct, audio);
+
+    assert!(!ready(Some(720), true), "nothing is built yet");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 0, "asking cost Google nothing");
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, true).await.expect("an index");
+    assert!(ready(Some(720), true), "built, so ready");
+
+    // Each of these is a different index, and saying otherwise would offer a file that is not there.
+    assert!(!ready(Some(720), false), "without sound is a different index");
+    assert!(!ready(Some(480), true), "another rung is a different index");
+}
+
 /// A warm-up for a trailer a viewer might open starts its resolve and nothing more; the surface's own ask also
 /// builds the index its fallback plays from.
 #[tokio::test]

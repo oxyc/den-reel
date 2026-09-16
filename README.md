@@ -312,14 +312,42 @@ trailer is measured in the background from the keyframes of the stream the first
 is kept over it.
 
 `kind` says how to play it (`mp4` in the element, `hls` in the page's HLS player); the URL says nothing.
-The order follows what was measured on macOS:
+The order follows what was measured:
 
 | surface | player | forms, best first |
 |---|---|---|
 | silent | native | progressive 720p · HLS master, segments on googlevideo |
 | silent | hls.js | Google's own 720p file · progressive 720p · proxied HLS master |
-| audible | native | HLS master, segments on googlevideo · progressive with sound |
-| audible | hls.js | proxied HLS master · progressive with sound |
+| audible | native | progressive with sound *if its index is built*, else the HLS master first |
+| audible | hls.js | progressive with sound *if its index is built*, else the proxied master first |
+
+#### What the forms cost
+
+Milliseconds to the **first painted frame** — `requestVideoFrameCallback`, not `canplay` — from den-edge's
+`web/test/transport.html` on 2026-09-16: three browsers, four fresh trailers, each transport run back to back
+against the same video on one clock, reading this server's own `Server-Timing` per run.
+
+A form's cost is mostly a question of what is already built, so the two states a detail hero actually meets are
+worth separating. **Warm** is both the resolve and the index in hand. **Warm resolve, cold index** is what a hero
+meets when a billboard has already resolved the same rung — the case the shared rung exists to produce.
+
+| progressive 720 + sound vs. the master | warm | warm resolve, cold index |
+|---|---|---|
+| Chrome 151 (hls.js) | **99** vs 1083 | **475** vs 1088 |
+| macOS Safari 18.6 (native) | **98–179** vs 616–965 | **231–249** vs 1350–1462 |
+| iOS Safari 18.7 (native) | **66–166** vs 2850–4101 | **299–412** vs 2850–4634, or no frame at all |
+
+A master builds no index, which is its whole advantage, and on these numbers it is not enough on any browser
+once the index it is measured against exists. On iOS it is the worst entry by a wide margin, and for a
+DRM-protected trailer it produces no frame at all (`hls_drm` above). Google's own file is the silent surface's
+best entry in Chrome — 280–485 ms, and none of it crosses this box — and a trap in desktop Safari, which walks
+every `moof` before it plays (214–2490 ms, see `/progressive` below).
+
+**A rung nobody has asked for costs 1.5–3.5 s**, almost all of it the resolve: 1269 ms on one trailer and
+2740 ms on the next, minutes apart. That is why every surface here asks for the same rung — a resolve is cached
+per (video, rung), so the second surface to want 720 pays nothing for it. Quote these as ranges: across four
+fresh trailers one browser's cold figure ranged 1157–3530 ms, and a single number taken from one trailer is
+how the hero came to be pointed at the master in the first place.
 
 Asking is the warm-up. For a **silent** surface the answer waits for the resolve its first entry plays
 from, and for its index when that entry is a progressive file; a file that turns out not to be indexable is
@@ -333,13 +361,25 @@ to be unavailable is still refused at once. Behind the resolve the index of the 
 — the audible fallback — is built too, and the letterbox is read from it, so that fallback is warm if the
 master ever fails.
 
+**Once that index exists, the same surface leads with the file instead** (`cache;desc=hit`, and the frame
+sizes filled in, since the answer now holds the resolve the entry plays from). The condition is that the
+index is *built*, not merely started, and it is asked without building anything: offering a file whose index
+is still building would be worse than the master either way — waiting here puts a build in front of a page
+that is opening, and not waiting hands the page a URL that stalls mid-load, which fires no `error` and so
+never advances its ladder. The numbers above are why it is worth the condition: the master wins nothing on
+any browser measured once the index it is compared against exists.
+
 `intent=warm` marks an ask made because a viewer might open the trailer (a press on a title link) rather than
 because a surface is about to play it. The answer is the same; behind it only the resolve is started, with no
 fallback index and no letterbox measured, since most such asks are a title glanced at and left. The surface's
 own ask, without it, does the rest. The two are different URLs, so a browser cache never hands the play the
 warm-up's answer.
 
-A cold index costs 0.7–3.9 s, and measured from this box on 2026-09-15 almost all of that is Google's edge:
+A cold index costs 0.7–3.9 s at the full ladder with sound, but that is the worst case rather than the usual
+one: measured again on 2026-09-16 across four fresh trailers, an index at the **720 rung with sound cost
+93–241 ms**, against 1007–2873 ms for the same trailers' full ladder. It scales with the rendition, so the rung
+a surface asks for decides the index as well as the resolve. Almost all of the cost is Google's edge — measured
+from this box on 2026-09-15:
 on one reused connection, cold 16 KB ranges waited 522–773 ms for their first byte and 9–11 ms when asked
 again, while a new connection costs 40–180 ms. So no connection tuning moves it much — HTTP/2 does not apply
 (the media hosts speak HTTP/1.1), and more parallel ranges draw refusals — and the only lever is building the

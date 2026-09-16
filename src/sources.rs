@@ -118,6 +118,20 @@ pub(crate) fn plan(surface: Surface, player: Player, silent_cap: Option<u32>) ->
     }
 }
 
+/// Move the progressive-with-sound entry to the front of `forms`, saying whether there was one to move.
+///
+/// Apart from the condition that calls it, so the two can be read and tested separately: whether a file is
+/// ready to play is a question about caches, and which entry leads is a question about this list.
+fn lead_with_sound(forms: &mut [Form]) -> bool {
+    match forms.iter().position(|f| matches!(f, Form::Progressive { audio: true, .. })) {
+        Some(at) => {
+            forms[..=at].rotate_right(1);
+            true
+        }
+        None => false,
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -229,6 +243,38 @@ pub async fn handle_sources(
     // Most such asks are a title glanced at and left, and those cost Google about 45 range requests each.
     let speculative = query_param(query, "intent").as_deref() == Some("warm");
     let mut forms = plan(surface, player, crate::direct::height_cap(&state.cfg, Some(SILENT_HEIGHT)));
+    // The rung this surface's progressive-with-sound entry plays from, which an audible surface both warms and
+    // may lead with. `intent=warm` does neither: most such asks are a title glanced at and left.
+    let fallback = forms
+        .iter()
+        .find_map(|f| match f {
+            Form::Progressive { cap, audio: true } => Some(*cap),
+            _ => None,
+        })
+        .filter(|_| !speculative);
+
+    // An audible surface leads with the progressive file when that file is ready to play NOW, and with the
+    // master otherwise.
+    //
+    // Measured to a first painted frame on 2026-09-16, progressive-with-sound at this rung against the master:
+    // 99 ms vs 1083 in Chrome, 98–179 vs 616–965 on macOS Safari, 66–166 vs 2850–4101 on iOS — and on iOS a
+    // DRM-protected trailer's master produces no frame at all. The master wins nothing once the index it is
+    // compared against exists.
+    //
+    // "Ready" is the whole condition, and it is asked without building anything. Offering the file when its
+    // index is merely STARTED would be worse than the master both ways: waiting here would put an index build
+    // in front of a page that is opening, and not waiting would hand the page a URL that stalls mid-load with
+    // no error to fall back from — a stall fires no `error` event, so the page's ladder never advances.
+    let mut led = None;
+    if surface == Surface::Audible {
+        if let Some(cap) = fallback {
+            if let Some(Ok(d)) = crate::direct::peek(&state, &vid, cap) {
+                if crate::progressive::ready(&state, &vid, cap, &d, true) && lead_with_sound(&mut forms) {
+                    led = Some(d);
+                }
+            }
+        }
+    }
     let first = forms[0];
 
     // The resolve the first form plays from. A silent surface waits for it: Google's own URL is that resolve, a
@@ -238,17 +284,14 @@ pub async fn handle_sources(
     // instead, and the master's request joins it. A video already known to be gone is still said at once.
     //
     // Behind the resolve, the index for the progressive file with sound is built too, which is this surface's
-    // fallback. A cold index costs 0.7–3.9 s, almost all of it Google's edge fetching regions of the file it has
-    // not served lately (measured 2026-09-15), so the only way to spare a viewer that is to build it before they
-    // need it — and the build probably warms the edge for the playback that follows.
-    let (direct, mut timing) = if surface == Surface::Audible {
-        let fallback = forms
-            .iter()
-            .find_map(|f| match f {
-                Form::Progressive { cap, audio: true } => Some(*cap),
-                _ => None,
-            })
-            .filter(|_| !speculative);
+    // fallback. A cold index costs 0.7–3.9 s at the full ladder, 93–241 ms at this rung (measured 2026-09-16),
+    // almost all of it Google's edge fetching regions of the file it has not served lately, so the only way to
+    // spare a viewer that is to build it before they need it — and the build probably warms the edge for the
+    // playback that follows. Once it is built, the next ask leads with it rather than the master.
+    let (direct, mut timing) = if let Some(d) = led {
+        // Already resolved and already indexed: nothing to wait for and nothing to start.
+        (Some(d), "cache;desc=hit".to_string())
+    } else if surface == Surface::Audible {
         match crate::direct::peek(&state, &vid, first.cap()) {
             Some(Err(e)) => {
                 return httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")
@@ -476,6 +519,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Which entry leads, given that the file is ready — the other half of the decision, and the half that
+    /// does not depend on a cache.
+    #[test]
+    fn a_ready_file_is_moved_in_front_of_the_master() {
+        let cap = Some(720);
+        let mut forms = plan(Surface::Audible, Player::Native, cap);
+        assert!(lead_with_sound(&mut forms));
+        assert_eq!(forms, [Form::Progressive { cap, audio: true }, Form::Hls { native: true }]);
+
+        // Idempotent: an entry already leading stays where it is, and the list keeps every form.
+        assert!(lead_with_sound(&mut forms));
+        assert_eq!(forms, [Form::Progressive { cap, audio: true }, Form::Hls { native: true }]);
+
+        let mut forms = plan(Surface::Audible, Player::HlsJs, cap);
+        assert!(lead_with_sound(&mut forms));
+        assert_eq!(forms, [Form::Progressive { cap, audio: true }, Form::Hls { native: false }]);
+
+        // A silent plan has no entry with sound, so there is nothing to lead with and nothing moves.
+        let mut forms = plan(Surface::Silent, Player::HlsJs, cap);
+        let before = forms.clone();
+        assert!(!lead_with_sound(&mut forms));
+        assert_eq!(forms, before);
     }
 
     fn media() -> Media {

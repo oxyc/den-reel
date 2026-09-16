@@ -1014,6 +1014,30 @@ pub(crate) async fn warm(
     }
 }
 
+/// Whether this stream's index is built and still good — asked without building one or joining a build.
+///
+/// `prepare`, `warm` and `indexed` all await a build. This is the question to ask when the answer decides what
+/// to OFFER rather than what to serve, and where waiting would defeat the point of asking.
+///
+/// The shared future is peeked rather than awaited because an entry is inserted the moment a build STARTS:
+/// presence alone would answer "ready" while a viewer waits out the whole build, which is the opposite of what
+/// a caller wants to know.
+pub(crate) fn ready(
+    state: &Arc<AppState>,
+    vid: &str,
+    cap: Option<u32>,
+    direct: &crate::direct::Direct,
+    audio: bool,
+) -> bool {
+    let (key, urls) = streams(vid, cap, direct, audio);
+    let source = urls.join("\n");
+    let now = (state.clock)();
+    let map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&key).is_some_and(|(kept, kept_until, shared)| {
+        *kept == source && *kept_until > now && matches!(shared.peek(), Some(Ok(_)))
+    })
+}
+
 /// The index for `vid`'s video at `cap` — with its sound when `audio` says, which is the same video index plus
 /// one — and the Google URL of the video, built or joined as a request would.
 pub(crate) async fn indexed(
@@ -1116,7 +1140,7 @@ pub async fn handle_progressive(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn words(ws: &[u32]) -> Vec<u8> {
@@ -1136,7 +1160,7 @@ mod tests {
     /// then one moof+mdat per entry of `fragments` (each a list of sample sizes, each sample 1001 of 24000
     /// long), its samples filled by `mark`. Only the first sample of a fragment is a sync sample, as trex's
     /// default flags say.
-    fn fragmented(fragments: &[&[u32]], mark: usize) -> Vec<u8> {
+    pub(crate) fn fragmented(fragments: &[&[u32]], mark: usize) -> Vec<u8> {
         let stbl = make(
             b"stbl",
             &[
@@ -1290,7 +1314,7 @@ mod tests {
     /// Serve `files` over plain HTTP ranges on 127.0.0.1, as googlevideo does, counting every request — and
     /// refusing the first `refuse` of them with a 401, as googlevideo does to a burst, with the header lines
     /// `said` on each refusal.
-    async fn serve_ranges(
+    pub(crate) async fn serve_ranges(
         files: Vec<Vec<u8>>,
         refuse: usize,
         said: &'static str,
