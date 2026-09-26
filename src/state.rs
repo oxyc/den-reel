@@ -139,6 +139,8 @@ pub struct AppState {
     /// same stale count and all spawned.
     pub prewarm_sem: Arc<Semaphore>,
     pub probe_sem: Arc<Semaphore>,
+    /// One global response-lifetime gate for direct progressive and proxied-HLS media.
+    pub media_gate: Arc<crate::media_gate::MediaGate>,
     /// Consecutive resolves that had real trailer candidates but yt-dlp could extract **none** of them
     /// — the signature of a systemic extraction outage (YouTube BotGuard / a broken nsig-JS runtime),
     /// which is otherwise invisible to /health (upstream TMDB/KinoCheck still answer fine). Reset to 0
@@ -199,6 +201,11 @@ impl AppState {
                 None
             }
         };
+        let media_gate = Arc::new(crate::media_gate::MediaGate::new(
+            cfg.direct_media_concurrency,
+            cfg.direct_media_idle,
+            cfg.direct_media_lifetime,
+        ));
         Arc::new(AppState {
             cfg: cfg.clone(),
             config_keyring,
@@ -224,6 +231,7 @@ impl AppState {
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
             prewarm_sem,
             probe_sem,
+            media_gate,
             cache_trailer_bytes: AtomicU64::new(0),
             cache_trailer_count: AtomicU64::new(0),
             cache_scratch_bytes: AtomicU64::new(0),

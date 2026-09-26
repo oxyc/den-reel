@@ -36,6 +36,9 @@ use crate::state::AppState;
 /// How long a minted media URL is honoured. Far longer than a page holds a list (den-edge caches one for five
 /// minutes); the Google URLs behind it are resolved again whenever they expire.
 const MEDIA_TTL_SECS: u64 = 24 * 60 * 60;
+/// A media capability is a small JSON object. Bound it before MAC construction/base64 decoding so
+/// the validation endpoint stays cheap even when its path is hostile input.
+const MEDIA_BLOB_MAX: usize = 2048;
 
 /// How long an answer given before its resolve may be cached.
 const UNRESOLVED_MAX_AGE_SECS: u64 = 300;
@@ -210,6 +213,9 @@ pub(crate) fn unseal(
     blob: &str,
     presented: Option<&str>,
 ) -> Option<Media> {
+    if blob.len() > MEDIA_BLOB_MAX {
+        return None;
+    }
     if let Some(secret) = secret {
         if !crate::sign::verify_any(secret, prev, &message(blob), presented) {
             return None;
@@ -217,6 +223,98 @@ pub(crate) fn unseal(
     }
     let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(blob).ok()?;
     serde_json::from_slice(&json).ok()
+}
+
+fn refused() -> Response<Body> {
+    httputil::error(StatusCode::FORBIDDEN, "bad_signature", "This URL is not one this server serves.")
+}
+
+enum CapabilityError {
+    SigningUnavailable,
+    Refused,
+    NotFound,
+    Expired,
+}
+
+impl CapabilityError {
+    fn response(self) -> Response<Body> {
+        match self {
+            Self::SigningUnavailable => httputil::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "signing_unavailable",
+                "Direct media validation requires PLAY_SECRET.",
+            ),
+            Self::Refused => refused(),
+            Self::NotFound => httputil::not_found(),
+            Self::Expired => httputil::error(
+                StatusCode::GONE,
+                "expired",
+                "This trailer URL has expired; ask for its sources again.",
+            ),
+        }
+    }
+}
+
+/// Verify and decode a media capability, including every mutable claim it carries. `require_signed`
+/// is used by the direct-public validation contract: unlike the existing relay path, it never has an
+/// unsigned compatibility mode.
+fn checked_media(
+    state: &AppState,
+    filed: &str,
+    blob: &str,
+    presented: Option<&str>,
+    require_signed: bool,
+) -> Result<Media, CapabilityError> {
+    let cfg = &state.cfg;
+    let secret = match (require_signed, cfg.play_secret.as_deref()) {
+        (true, None) => return Err(CapabilityError::SigningUnavailable),
+        (_, secret) => secret,
+    };
+    let Some(media) = unseal(secret, &cfg.play_secrets_prev, blob, presented) else {
+        return Err(CapabilityError::Refused);
+    };
+    if !crate::is_valid_vid(&media.v) || segment(&media) != filed {
+        return Err(if require_signed { CapabilityError::Refused } else { CapabilityError::NotFound });
+    }
+    if media.x.saturating_mul(1000) <= (state.clock)() {
+        return Err(CapabilityError::Expired);
+    }
+    if let Some(ep) = media.e {
+        if let Err(why) = cfg.revocation.check_install(media.i.as_deref(), ep) {
+            crate::log_limited("media_install_refused", || {
+                format!("bad_signature: media for {} refused — {why}", media.v)
+            });
+            return Err(CapabilityError::Refused);
+        }
+    } else if media.i.is_some() {
+        // Never minted: an install id always travels with the epoch its parent URL carried.
+        return Err(CapabilityError::Refused);
+    }
+    Ok(media)
+}
+
+/// `GET|HEAD /_internal/validate/m/s/<blob>?s=<tag>`: validate a direct-transport capability
+/// without resolving its video, building an index, or opening any media body. A 204 names the form
+/// and expiry in fixed headers; all answers are no-store. This endpoint intentionally requires a
+/// MAC even while the legacy `/m/s` handler is in unsigned compatibility mode.
+pub fn validate_direct_capability(state: &AppState, blob: &str, query: &str) -> Response<Body> {
+    let presented = query_param(query, "s");
+    let media = match checked_media(state, "s", blob, presented.as_deref(), true) {
+        Ok(media) => media,
+        Err(error) => return error.response(),
+    };
+    let form = match media.f.as_str() {
+        "p" if !media.n && media.p.is_none() => "progressive",
+        "h" if !media.n && media.h.is_none() && !media.a => "hls-proxy",
+        _ => return refused(),
+    };
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("cache-control", "no-store")
+        .header("x-den-media-form", form)
+        .header("x-den-media-expires", media.x)
+        .body(httputil::full(""))
+        .unwrap()
 }
 
 /// `/sources/<vid>.json?surface=silent|audible&player=native|hls.js`: the forms to try, in order.
@@ -463,40 +561,22 @@ pub async fn handle_media(
     query: &str,
 ) -> Response<Body> {
     let presented = query_param(query, "s");
-    let cfg = &state.cfg;
-    let Some(media) = unseal(cfg.play_secret.as_deref(), &cfg.play_secrets_prev, blob, presented.as_deref())
-    else {
-        return httputil::error(
-            StatusCode::FORBIDDEN,
-            "bad_signature",
-            "This URL is not one this server serves.",
-        );
+    let media = match checked_media(&state, filed, blob, presented.as_deref(), false) {
+        Ok(media) => media,
+        Err(error) => return error.response(),
     };
-    // Filed under the other segment, a URL would be accounted for as something it is not.
-    if !crate::is_valid_vid(&media.v) || segment(&media) != filed {
-        return httputil::not_found();
-    }
-    if media.x.saturating_mul(1000) <= (state.clock)() {
-        return httputil::error(
-            StatusCode::GONE,
-            "expired",
-            "This trailer URL has expired; ask for its sources again.",
-        );
-    }
-    if let Some(ep) = media.e {
-        if let Err(why) = cfg.revocation.check_install(media.i.as_deref(), ep) {
-            crate::log_limited("media_install_refused", || {
-                format!("bad_signature: media for {} refused — {why}", media.v)
-            });
-            return httputil::error(
-                StatusCode::FORBIDDEN,
-                "bad_signature",
-                "This URL is not one this server serves.",
-            );
-        }
-    }
+    let cfg = &state.cfg;
     let cap = crate::direct::height_cap(cfg, media.h.map(|h| h.to_string()).as_deref());
-    match media.f.as_str() {
+    let lease = if filed == "s" {
+        match state.media_gate.try_enter() {
+            Some(lease) => Some(lease),
+            None => return crate::media_gate::overloaded(),
+        }
+    } else {
+        None
+    };
+    let gate = state.media_gate.clone();
+    let response = match media.f.as_str() {
         "p" => crate::progressive::handle_progressive(state, headers, media.v, cap, media.a).await,
         "h" => {
             let uris = if media.n { crate::hls::Uris::Native } else { crate::hls::Uris::Proxy };
@@ -504,6 +584,10 @@ pub async fn handle_media(
             crate::hls::handle_master(state, media.v, uris, playable).await
         }
         _ => httputil::not_found(),
+    };
+    match lease {
+        Some(lease) => gate.guard(response, lease),
+        None => response,
     }
 }
 

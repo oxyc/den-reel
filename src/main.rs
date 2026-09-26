@@ -25,6 +25,7 @@ mod crop;
 mod direct;
 mod hls;
 mod httputil;
+mod media_gate;
 mod play;
 mod progressive;
 mod seal;
@@ -320,6 +321,21 @@ fn metrics_body(state: &AppState) -> String {
     );
     gauge("reel_downloads_max", "Downloads that may run at once.", &[("", DOWNLOAD_CONCURRENCY as u64)]);
     gauge(
+        "reel_direct_media_active",
+        "Direct media responses currently holding a streaming permit.",
+        &[("", state.media_gate.active())],
+    );
+    gauge(
+        "reel_direct_media_high_water",
+        "Largest number of simultaneous direct media responses since process start.",
+        &[("", state.media_gate.high_water())],
+    );
+    gauge(
+        "reel_direct_media_max",
+        "Direct media responses allowed at once.",
+        &[("", state.media_gate.limit() as u64)],
+    );
+    gauge(
         "reel_prewarm_permits_available",
         "Speculative downloads that could start now.",
         &[("", state.prewarm_sem.available_permits() as u64)],
@@ -395,6 +411,11 @@ fn metrics_body(state: &AppState) -> String {
         "reel_index_ranges_retried_total",
         "Ranges googlevideo refused for the moment (401, 429, 5xx) and an index build asked for again.",
         &[("", crate::progressive::RANGES_RETRIED.load(Relaxed))],
+    );
+    counter(
+        "reel_direct_media_refused_total",
+        "Direct media requests refused because every streaming permit was held.",
+        &[("", state.media_gate.refused())],
     );
     counter(
         "reel_index_requests_total",
@@ -556,6 +577,14 @@ fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
 /// `/<config>/manifest.json` and `/<config>/meta/…`, and also a client probing `/<config>/configure`
 /// or pasting the bare segment, which would otherwise put the key in the log through a 404.
 fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix("/m/") {
+        if let Some((filed @ ("n" | "s"), _)) = rest.split_once('/') {
+            return format!("/m/{filed}/<cap>").into();
+        }
+    }
+    if path.starts_with("/_internal/validate/m/s/") {
+        return "/_internal/validate/m/s/<cap>".into();
+    }
     const ROUTES: [&str; 15] = [
         "",
         "health",
@@ -624,6 +653,12 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             .header("cache-control", "no-store")
             .body(httputil::full(body))
             .unwrap();
+    }
+    // Cheap capability validation for the LAN relay. It proves that an `/m/s` URL is a currently
+    // valid signed bearer capability without resolving a video or opening an upstream media body.
+    // The capability itself is the authority: there is deliberately no member/session check here.
+    if let Some(blob) = path.strip_prefix("/_internal/validate/m/s/") {
+        return sources::validate_direct_capability(&state, blob, query);
     }
     if path == "/manifest.json" {
         return httputil::json(
@@ -777,7 +812,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     // beside the master rather than at the root so the rewritten URIs can be relative to it: a proxied
     // master served from /m/s/<blob> names `seg?u=…`, which lands on /m/s/seg.
     if path == "/hls/seg" || path == "/m/s/seg" {
-        return hls::handle_segment(state, query, &parts.headers).await;
+        let direct = path == "/m/s/seg";
+        return hls::handle_segment(state, query, &parts.headers, direct).await;
     }
 
     // media: /m/<n|s>/<blob> → a form /sources minted. The blob carries its own tag, expiry and install;
@@ -1088,7 +1124,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on = |b: bool| if b { "on" } else { "off" };
     eprintln!(
         "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
-         require_iid={} play_signing={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
+         require_iid={} play_signing={} direct_media_max={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
         env!("CARGO_PKG_VERSION"),
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
@@ -1097,6 +1133,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.revocation.epoch(),
         on(state.cfg.revocation.requires_install_id()),
         play_signing_state(&state.cfg, (state.clock)()),
+        state.cfg.direct_media_concurrency,
         on(state.cfg.tmdb_key.is_some()),
     );
 

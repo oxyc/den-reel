@@ -6,6 +6,7 @@
 //!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
 //!      PLAY_SIGNING_GRACE_UNTIL (still serve unsigned URLs until then, while turning signing on);
 //!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response).
+//!      DIRECT_MEDIA_CONCURRENCY / DIRECT_MEDIA_IDLE_SECS / DIRECT_MEDIA_LIFETIME_SECS bound direct streaming.
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
 //!      sealed in the URL (den-scout/docs/SEALED-CONFIG.md). Drop the env keys once installs migrate.
@@ -80,6 +81,12 @@ pub struct Config {
     /// `METRICS_TOKEN` — the bearer token `/metrics` requires. `None` turns the endpoint off: it
     /// answers 404, the same as a path that does not exist.
     pub metrics_token: Option<String>,
+    /// Response-lifetime cap and time bounds for publicly direct-served `/m/s` media. The cap is
+    /// deliberately global across progressive files and HLS segments: both consume an upstream
+    /// body/socket, and a limit split by route would not bound the process's descriptors.
+    pub direct_media_concurrency: usize,
+    pub direct_media_idle: Duration,
+    pub direct_media_lifetime: Duration,
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`). Off by
     /// default: a request log is an event stream, and the rest of the log is state changes.
     pub log_requests: bool,
@@ -313,6 +320,18 @@ impl Config {
         let play_secret = env_opt("PLAY_SECRET");
         let play_signing_grace =
             play_grace(play_secret.is_some(), env_opt("PLAY_SIGNING_GRACE_UNTIL").as_deref());
+        let direct_media_concurrency = env_opt("DIRECT_MEDIA_CONCURRENCY")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=64).contains(n))
+            .unwrap_or(16);
+        let seconds = |name: &str, default, max| {
+            Duration::from_secs(
+                env_opt(name)
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| (1..=max).contains(n))
+                    .unwrap_or(default),
+            )
+        };
         Config {
             port,
             cache_dir,
@@ -350,6 +369,9 @@ impl Config {
                 .unwrap_or_default(),
             play_signing_grace,
             metrics_token: env_opt("METRICS_TOKEN"),
+            direct_media_concurrency,
+            direct_media_idle: seconds("DIRECT_MEDIA_IDLE_SECS", 30, 300),
+            direct_media_lifetime: seconds("DIRECT_MEDIA_LIFETIME_SECS", 15 * 60, 2 * 60 * 60),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,

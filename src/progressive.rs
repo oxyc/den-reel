@@ -25,12 +25,14 @@
 
 use std::io;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::Shared;
-use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::header::{HeaderMap, HeaderValue, IF_RANGE, RANGE};
@@ -1010,8 +1012,8 @@ async fn relay(
 /// fetched before the body is first read, so a HEAD or a 304, whose body never is, asks Google for nothing.
 fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
     let started = futures_util::stream::once(async move {
-        let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let task = tokio::spawn(async move {
             for part in parts {
                 let going = match part {
                     Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
@@ -1022,9 +1024,30 @@ fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
                 }
             }
         });
-        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+        ProducerStream { rx, task }
     });
     BodyExt::boxed(StreamBody::new(started.flatten().map_ok(Frame::data)))
+}
+
+/// Own the producer task so dropping a client body aborts an upstream range fetch immediately.
+/// A bare `JoinHandle` drop detaches; that used to leave the task alive until reqwest's timeout.
+struct ProducerStream {
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Stream for ProducerStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl Drop for ProducerStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 fn serve(
@@ -1236,6 +1259,32 @@ pub async fn handle_progressive(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_the_body_stream_aborts_its_range_producer() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(done) = self.0.take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+
+        let (stopped, did_stop) = tokio::sync::oneshot::channel();
+        let note = Dropped(Some(stopped));
+        let task = tokio::spawn(async move {
+            let _note = note;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let (_tx, rx) = mpsc::channel(1);
+        drop(ProducerStream { rx, task });
+        tokio::time::timeout(Duration::from_secs(1), did_stop)
+            .await
+            .expect("the producer detached from its response")
+            .expect("the producer dropped its cancellation notice");
+    }
 
     fn words(ws: &[u32]) -> Vec<u8> {
         ws.iter().flat_map(|w| w.to_be_bytes()).collect()
