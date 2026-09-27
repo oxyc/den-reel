@@ -93,6 +93,21 @@ pub type SharedLayout = Shared<BoxFuture<Result<Arc<Layout>, Unbuilt>>>;
 /// One file `layout` reads: its `moov` box, and its `moof`s with their offsets in that file.
 pub(crate) type Source<'a> = (&'a [u8], &'a [(u64, Bytes)]);
 
+/// One source after its fragmented index was fetched. Kept with a live layout so an audible layout can
+/// reuse the video half instead of fetching every video `moof` again. The byte buffers are compact copies:
+/// keeping slices of the 64 KiB head and 16 KiB probes would make this small index surprisingly large.
+#[derive(Clone, Debug)]
+struct IndexedSource {
+    moov: Bytes,
+    moofs: Vec<(u64, Bytes)>,
+}
+
+impl IndexedSource {
+    fn borrowed(&self) -> Source<'_> {
+        (&self.moov, &self.moofs)
+    }
+}
+
 /// One kept build: the URLs it indexes (one per line), when to stop using it (epoch ms), and the build.
 pub type Entry = (String, u64, SharedLayout);
 
@@ -176,6 +191,9 @@ pub(crate) fn restore(
             etag: index.etag,
             keyframes: index.keyframes,
             avcc,
+            // Parked layouts predate (and do not need) the fetched source boxes. They remain fully usable;
+            // only the first audible upgrade after a restart has to fetch the video index again.
+            indexed_sources: Vec::new(),
         });
         let shared: SharedLayout = futures_util::future::ready(Ok(layout)).boxed().shared();
         // Polled here, and that is not a formality: `peek` reports a future that has COMPLETED, not one that
@@ -202,6 +220,8 @@ pub struct Layout {
     pub keyframes: Vec<(u64, u32)>,
     /// The video's H.264 decoder configuration (`avcC`'s payload), when it is H.264.
     pub avcc: Option<Vec<u8>>,
+    /// Fetched source boxes used to build this layout, retained only in memory for composing a later layout.
+    indexed_sources: Vec<IndexedSource>,
 }
 
 /// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's file `source`
@@ -759,6 +779,7 @@ pub(crate) fn layout(sources: &[Source]) -> Result<Layout, Unbuilt> {
         etag,
         keyframes: first.keyframes(),
         avcc: first.avcc(),
+        indexed_sources: Vec::new(),
     })
 }
 
@@ -868,7 +889,7 @@ async fn moof(http: &reqwest::Client, url: &str, at: u64, size: u64) -> Result<(
     let first = fetch(http, url, at, at + size.min(MOOF_PROBE) - 1).await?;
     let len = be32(&first, 0)? as u64;
     if len <= first.len() as u64 {
-        return Ok((at, first));
+        return Ok((at, Bytes::copy_from_slice(&first[..len as usize])));
     }
     if len > size {
         return Err(unreadable("a moof longer than its fragment"));
@@ -880,7 +901,7 @@ async fn moof(http: &reqwest::Client, url: &str, at: u64, size: u64) -> Result<(
 async fn read_source(
     http: &reqwest::Client,
     url: String,
-) -> Result<(Bytes, Range<usize>, Vec<(u64, Bytes)>), Unbuilt> {
+) -> Result<IndexedSource, Unbuilt> {
     let head = fetch(http, &url, 0, HEAD_BYTES - 1).await?;
     let index = index(&head)?;
     // Owned pairs: a closure over borrowed ones is not general enough for a future that must be Send.
@@ -889,17 +910,29 @@ async fn read_source(
             .buffered(MOOF_FETCHES)
             .try_collect()
             .await?;
-    Ok((head, index.moov, moofs))
+    Ok(IndexedSource { moov: Bytes::copy_from_slice(&head[index.moov]), moofs })
 }
 
 /// The layout for `urls`: the video stream, and its audio where that was asked for. Both files are read
 /// at once.
-async fn build(http: &reqwest::Client, urls: &[String]) -> Result<Layout, Unbuilt> {
-    let read =
-        futures_util::future::try_join_all(urls.iter().cloned().map(|url| read_source(http, url))).await?;
-    let sources: Vec<Source> =
-        read.iter().map(|(head, moov, moofs)| (&head[moov.clone()], moofs.as_slice())).collect();
-    layout(&sources)
+async fn build(
+    http: &reqwest::Client,
+    urls: &[String],
+    reused_video: Option<IndexedSource>,
+) -> Result<Layout, Unbuilt> {
+    let mut read = match reused_video {
+        Some(video) => vec![video],
+        None => Vec::new(),
+    };
+    let first_unread = read.len();
+    read.extend(
+        futures_util::future::try_join_all(urls[first_unread..].iter().cloned().map(|url| read_source(http, url)))
+            .await?,
+    );
+    let sources: Vec<Source> = read.iter().map(IndexedSource::borrowed).collect();
+    let mut built = layout(&sources)?;
+    built.indexed_sources = read;
+    Ok(built)
 }
 
 /// The index for `urls`, kept under `key` until `until`, built once however many ask. The timing is
@@ -921,6 +954,15 @@ async fn layout_for(
                     state.index_build_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return (Err(Unbuilt { why: "index builders busy".to_string(), retry: true }), None);
                 };
+                // An audible layout has exactly the same first source as its video-only sibling. Join even
+                // an in-flight build: that preserves request sharing when a detail page is opened while a
+                // muted surface is still warming the video index.
+                let video = (urls.len() > 1)
+                    .then(|| key.strip_suffix("+audio"))
+                    .flatten()
+                    .and_then(|video_key| map.get(video_key))
+                    .filter(|(kept, kept_until, _)| *kept == urls[0] && *kept_until > now)
+                    .map(|(_, _, shared)| shared.clone());
                 let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {
                     // The self-driving shared future owns admission, not any request awaiting it. A
@@ -928,7 +970,14 @@ async fn layout_for(
                     // queued outside the bound.
                     let _build_permit = build_permit;
                     let started = Instant::now();
-                    let built = build(&st.http, &urls).await.map(Arc::new);
+                    let reused_video = match video {
+                        Some(shared) => shared
+                            .await
+                            .ok()
+                            .and_then(|layout| layout.indexed_sources.first().cloned()),
+                        None => None,
+                    };
+                    let built = build(&st.http, &urls, reused_video).await.map(Arc::new);
                     let took = started.elapsed();
                     match (&built, urls.len()) {
                         (Ok(_), 1) => st.index_video.record(took),
@@ -1382,7 +1431,7 @@ pub(crate) mod tests {
     }
 
     /// The layout for whole files held in memory, their moofs read as `build` would fetch them.
-    fn layout_of(files: &[&[u8]]) -> Result<Layout, Unbuilt> {
+    pub(crate) fn layout_of(files: &[&[u8]]) -> Result<Layout, Unbuilt> {
         let mut read = Vec::new();
         for file in files {
             let index = index(file)?;
@@ -1451,7 +1500,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for (id, url) in list.lines().filter_map(|l| l.split_once(' ')) {
             let started = Instant::now();
-            let l = build(&http, &[url.to_string()]).await.expect("a layout");
+            let l = build(&http, &[url.to_string()], None).await.expect("a layout");
             let stream = keyframe_stream(&http, url, &l, 64).await.expect("keyframes");
             let fetched = started.elapsed();
             let path = dir.join(format!("{id}.h264"));
@@ -1551,9 +1600,11 @@ pub(crate) mod tests {
         let http = reqwest::Client::new();
         let count = || requests.swap(0, std::sync::atomic::Ordering::Relaxed);
 
-        build(&http, &[format!("{base}/0")]).await.expect("a video index");
+        build(&http, &[format!("{base}/0")], None).await.expect("a video index");
         assert_eq!(count(), 1 + 40, "the first bytes, then each fragment's moof");
-        build(&http, &[format!("{base}/0"), format!("{base}/1")]).await.expect("an index with sound");
+        build(&http, &[format!("{base}/0"), format!("{base}/1")], None)
+            .await
+            .expect("an index with sound");
         assert_eq!(count(), (1 + 40) + (1 + 15), "and the same again for the audio file");
     }
 
@@ -1566,7 +1617,7 @@ pub(crate) mod tests {
         let (base, requests) = serve_ranges(vec![video], 1, "").await;
         let http = reqwest::Client::new();
         let retried = RANGES_RETRIED.load(std::sync::atomic::Ordering::Relaxed);
-        build(&http, &[format!("{base}/0")]).await.expect("an index despite the refusal");
+        build(&http, &[format!("{base}/0")], None).await.expect("an index despite the refusal");
         // At least: other tests in this process may retry at the same time.
         assert!(
             RANGES_RETRIED.load(std::sync::atomic::Ordering::Relaxed) > retried,
@@ -1586,7 +1637,7 @@ pub(crate) mod tests {
         let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
         let (base, requests) = serve_ranges(vec![video], usize::MAX, "Retry-After: 120\r\n").await;
         let started = Instant::now();
-        assert!(build(&reqwest::Client::new(), &[format!("{base}/0")]).await.is_err());
+        assert!(build(&reqwest::Client::new(), &[format!("{base}/0")], None).await.is_err());
         assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "asked again into a stated pause");
         assert!(started.elapsed() < Duration::from_millis(250), "slept before giving up");
     }
@@ -1732,7 +1783,7 @@ pub(crate) mod tests {
         let out = std::env::var("REEL_PROGRESSIVE_OUT").expect("REEL_PROGRESSIVE_OUT");
         let http = reqwest::Client::new();
         let started = Instant::now();
-        let l = build(&http, &urls).await.expect("a layout");
+        let l = build(&http, &urls, None).await.expect("a layout");
         eprintln!("indexed {} pieces in {:?}; {} bytes", l.pieces.len(), started.elapsed(), l.total);
         let bytes = body(http, urls, parts(&l, 0, l.total - 1)).collect().await.expect("the body").to_bytes();
         assert_eq!(bytes.len() as u64, l.total);
