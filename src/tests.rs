@@ -316,6 +316,7 @@ fn build_state_full(
         index_video: Default::default(),
         index_audio: Default::default(),
         index_failures: std::sync::atomic::AtomicU64::new(0),
+        index_build_refused: std::sync::atomic::AtomicU64::new(0),
         index_hits: std::sync::atomic::AtomicU64::new(0),
         index_waits: std::sync::atomic::AtomicU64::new(0),
         resolves: Default::default(),
@@ -877,6 +878,11 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
     assert!(has(&body, "reel_direct_media_high_water 0"));
     assert!(has(&body, "reel_direct_media_max 16"));
     assert!(has(&body, "reel_direct_media_refused_total 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"idle\"} 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"lifetime\"} 0"));
+    assert!(has(&body, "reel_direct_media_cancellations_total 0"));
+    assert!(has(&body, "reel_index_build_active 0"));
+    assert!(has(&body, "reel_index_build_refused_total 0"));
     assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
 
     // What the web's trailers cost, as they are recorded.
@@ -4413,13 +4419,15 @@ async fn cancelled_index_waiters_cannot_leave_unbounded_detached_builders() {
     assert_eq!(state.index_build_sem.available_permits(), 0, "caller cancellation released build admission");
 
     for n in 0..128 {
-        let error = crate::progressive::prepare(&state, &format!("churnBuild{n:03}"), Some(720), &direct, false)
-            .await
-            .expect_err("a detached build was admitted past the strict cap");
+        let error =
+            crate::progressive::prepare(&state, &format!("churnBuild{n:03}"), Some(720), &direct, false)
+                .await
+                .expect_err("a detached build was admitted past the strict cap");
         assert!(error.retry && error.why.contains("busy"));
     }
     assert_eq!(accepted.load(Ordering::Relaxed), 1, "refused churn still opened upstream connections");
     assert_eq!(state.progressive.lock().unwrap().len(), 1, "refused churn left shared futures behind");
+    assert_eq!(state.index_build_refused.load(Ordering::Relaxed), 128);
 
     release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

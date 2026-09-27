@@ -162,6 +162,8 @@ pub struct AppState {
     pub index_audio: Timings,
     /// Index builds that failed.
     pub index_failures: AtomicU64,
+    /// Index builds refused because every build permit was held.
+    pub index_build_refused: AtomicU64,
     /// Requests that found their index built already, and requests that had to wait for one.
     pub index_hits: AtomicU64,
     pub index_waits: AtomicU64,
@@ -243,6 +245,7 @@ impl AppState {
             index_video: Timings::default(),
             index_audio: Timings::default(),
             index_failures: AtomicU64::new(0),
+            index_build_refused: AtomicU64::new(0),
             index_hits: AtomicU64::new(0),
             index_waits: AtomicU64::new(0),
             resolves: Timings::default(),

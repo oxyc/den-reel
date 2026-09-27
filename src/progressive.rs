@@ -918,10 +918,8 @@ async fn layout_for(
             Some((kept, kept_until, shared)) if *kept == source && *kept_until > now => shared.clone(),
             _ => {
                 let Ok(build_permit) = state.index_build_sem.clone().try_acquire_owned() else {
-                    return (
-                        Err(Unbuilt { why: "index builders busy".to_string(), retry: true }),
-                        None,
-                    );
+                    state.index_build_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Unbuilt { why: "index builders busy".to_string(), retry: true }), None);
                 };
                 let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {

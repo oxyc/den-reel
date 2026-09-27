@@ -5,9 +5,10 @@
 //! the permit immediately. Idle and absolute deadlines also drop the inner body, cancelling an HLS
 //! upstream response and the progressive producer that owns its range fetches.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -29,6 +30,9 @@ pub struct MediaGate {
     active: AtomicU64,
     high_water: AtomicU64,
     refused: AtomicU64,
+    idle_timeouts: AtomicU64,
+    lifetime_timeouts: AtomicU64,
+    cancellations: Arc<AtomicU64>,
 }
 
 pub struct Lease {
@@ -52,6 +56,9 @@ impl MediaGate {
             active: AtomicU64::new(0),
             high_water: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            idle_timeouts: AtomicU64::new(0),
+            lifetime_timeouts: AtomicU64::new(0),
+            cancellations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -82,13 +89,34 @@ impl MediaGate {
         // buffer. Crucially, the task owns both `inner` and `lease`: its clocks keep advancing when
         // Hyper never polls the returned body at all.
         let (tx, rx) = mpsc::channel(1);
+        let (terminal_tx, terminal) = oneshot::channel();
         let (start, started_body) = oneshot::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
         let (idle, lifetime) = (self.idle, self.lifetime);
         let started = Instant::now();
         let task = tokio::spawn(async move {
-            pump(inner, tx, lease, started_body, started + idle, started + lifetime, idle).await
+            let control = PumpControl {
+                terminal_tx,
+                lease,
+                start: started_body,
+                idle_at: started + idle,
+                lifetime_at: started + lifetime,
+                idle,
+                completed: task_completed,
+            };
+            pump(inner, tx, control).await
         });
-        let body = PumpBody { rx, task, hint, start: Some(start) };
+        let body = PumpBody {
+            rx,
+            terminal,
+            task,
+            hint,
+            start: Some(start),
+            finished: false,
+            completed,
+            cancellations: self.cancellations.clone(),
+        };
         Response::from_parts(parts, body.boxed())
     }
 
@@ -101,94 +129,130 @@ impl MediaGate {
     pub fn refused(&self) -> u64 {
         self.refused.load(Relaxed)
     }
+    pub fn idle_timeouts(&self) -> u64 {
+        self.idle_timeouts.load(Relaxed)
+    }
+    pub fn lifetime_timeouts(&self) -> u64 {
+        self.lifetime_timeouts.load(Relaxed)
+    }
+    pub fn cancellations(&self) -> u64 {
+        self.cancellations.load(Relaxed)
+    }
     pub fn limit(&self) -> usize {
         self.limit
     }
 }
 
-async fn pump(
-    mut inner: Body,
-    tx: mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+struct PumpControl {
+    terminal_tx: oneshot::Sender<Option<io::Error>>,
     lease: Lease,
-    mut start: oneshot::Receiver<()>,
+    start: oneshot::Receiver<()>,
     idle_at: Instant,
     lifetime_at: Instant,
     idle: Duration,
-) {
+    completed: Arc<AtomicBool>,
+}
+
+async fn pump(mut inner: Body, tx: mpsc::Sender<Frame<Bytes>>, control: PumpControl) {
+    let PumpControl { terminal_tx, lease, mut start, idle_at, lifetime_at, idle, completed } = control;
     // Preserve the old lazy-body contract: HEAD/304, or a response dropped before Hyper asks for its
     // first frame, opens no upstream range. The task still owns and times the lease while it waits.
-    let began = tokio::select! {
+    let end = tokio::select! {
         _ = tokio::time::sleep_until(lifetime_at) => {
-            timed_out(&tx, "direct media response lifetime exceeded");
-            false
+            End::Lifetime
         }
         _ = tokio::time::sleep_until(idle_at) => {
-            timed_out(&tx, "direct media response idle timeout");
-            false
+            End::Idle
         }
-        began = &mut start => began.is_ok(),
+        began = &mut start => {
+            if began.is_ok() {
+                pump_inner(&mut inner, &tx, idle_at, lifetime_at, idle).await
+            } else {
+                End::Clean
+            }
+        },
     };
-    if began {
-        pump_inner(&mut inner, &tx, idle_at, lifetime_at, idle).await;
+    match &end {
+        End::Idle => {
+            lease.gate.idle_timeouts.fetch_add(1, Relaxed);
+        }
+        End::Lifetime => {
+            lease.gate.lifetime_timeouts.fetch_add(1, Relaxed);
+        }
+        End::Clean | End::Error(_) | End::ConsumerGone => {}
     }
     // Close/release in this order. A consumer observing EOF has then already stopped the upstream
     // body and returned the scarce permit, rather than racing the task's local-destructor order.
     drop(inner);
     drop(lease);
     drop(tx);
+    completed.store(true, std::sync::atomic::Ordering::Release);
+    let error = match end {
+        End::Idle => Some(io::Error::new(io::ErrorKind::TimedOut, "direct media response idle timeout")),
+        End::Lifetime => {
+            Some(io::Error::new(io::ErrorKind::TimedOut, "direct media response lifetime exceeded"))
+        }
+        End::Error(error) => Some(error),
+        End::Clean | End::ConsumerGone => None,
+    };
+    let _ = terminal_tx.send(error);
+}
+
+enum End {
+    Clean,
+    Error(io::Error),
+    ConsumerGone,
+    Idle,
+    Lifetime,
 }
 
 async fn pump_inner(
     inner: &mut Body,
-    tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
+    tx: &mpsc::Sender<Frame<Bytes>>,
     mut idle_at: Instant,
     lifetime_at: Instant,
     idle: Duration,
-) {
+) -> End {
     loop {
         let frame = tokio::select! {
             _ = tokio::time::sleep_until(lifetime_at) => {
-                timed_out(tx, "direct media response lifetime exceeded");
-                return;
+                return End::Lifetime;
             }
             _ = tokio::time::sleep_until(idle_at) => {
-                timed_out(tx, "direct media response idle timeout");
-                return;
+                return End::Idle;
             }
             frame = inner.frame() => frame,
         };
-        let Some(frame) = frame else { return };
-        let item = frame;
+        let Some(frame) = frame else { return End::Clean };
+        let item = match frame {
+            Ok(frame) => frame,
+            Err(error) => return End::Error(error),
+        };
         let sent = tokio::select! {
             _ = tokio::time::sleep_until(lifetime_at) => {
-                timed_out(tx, "direct media response lifetime exceeded");
-                return;
+                return End::Lifetime;
             }
             _ = tokio::time::sleep_until(idle_at) => {
-                timed_out(tx, "direct media response idle timeout");
-                return;
+                return End::Idle;
             }
             sent = tx.send(item) => sent,
         };
         if sent.is_err() {
-            return;
+            return End::ConsumerGone;
         }
         idle_at = Instant::now() + idle;
     }
 }
 
-fn timed_out(tx: &mpsc::Sender<Result<Frame<Bytes>, io::Error>>, why: &'static str) {
-    // If backpressure has filled the one-frame queue there is nowhere to put the error, but closing
-    // it still cuts the response short and, more importantly, dropping the task releases the lease
-    // and upstream body. A reader that is keeping up receives the useful timeout error.
-    let _ = tx.try_send(Err(io::Error::new(io::ErrorKind::TimedOut, why)));
-}
-
 struct PumpBody {
-    rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
+    rx: mpsc::Receiver<Frame<Bytes>>,
+    terminal: oneshot::Receiver<Option<io::Error>>,
     task: tokio::task::JoinHandle<()>,
     hint: hyper::body::SizeHint,
     start: Option<oneshot::Sender<()>>,
+    finished: bool,
+    completed: Arc<AtomicBool>,
+    cancellations: Arc<AtomicU64>,
 }
 
 impl hyper::body::Body for PumpBody {
@@ -202,11 +266,28 @@ impl hyper::body::Body for PumpBody {
         if let Some(start) = self.start.take() {
             let _ = start.send(());
         }
-        self.rx.poll_recv(cx)
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(frame)) => Poll::Ready(Some(Ok(frame))),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => match Pin::new(&mut self.terminal).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(Some(error))) => {
+                    self.finished = true;
+                    Poll::Ready(Some(Err(error)))
+                }
+                Poll::Ready(Ok(None) | Err(_)) => {
+                    self.finished = true;
+                    Poll::Ready(None)
+                }
+            },
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.rx.is_closed() && self.rx.is_empty()
+        self.finished && self.rx.is_empty()
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
@@ -218,6 +299,9 @@ impl Drop for PumpBody {
     fn drop(&mut self) {
         // Dropping a JoinHandle detaches it. Abort instead so dropping the client response immediately
         // drops the task-owned upstream body and lease rather than waiting for either deadline.
+        if !self.finished && !self.completed.load(std::sync::atomic::Ordering::Acquire) {
+            self.cancellations.fetch_add(1, Relaxed);
+        }
         self.task.abort();
     }
 }
@@ -251,12 +335,14 @@ mod tests {
         drop(guarded);
         tokio::task::yield_now().await;
         assert_eq!(gate.active(), 0);
+        assert_eq!(gate.cancellations(), 1);
 
         let guarded = gate.guard(response("two"), gate.try_enter().unwrap());
         let _ = guarded.into_body().collect().await.unwrap();
         tokio::task::yield_now().await;
         assert_eq!(gate.active(), 0);
         assert_eq!(gate.high_water(), 1);
+        assert_eq!(gate.cancellations(), 1, "a fully drained response was not cancelled");
     }
 
     #[tokio::test(start_paused = true)]
@@ -269,6 +355,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         assert_eq!(read.await.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(gate.active(), 0);
+        assert_eq!(gate.idle_timeouts(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -306,6 +393,54 @@ mod tests {
         let read = tokio::spawn(async move { body.collect().await });
         tokio::time::advance(Duration::from_secs(6)).await;
         assert_eq!(read.await.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(gate.active(), 0);
+        assert_eq!(gate.lifetime_timeouts(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backpressured_timeout_follows_queued_data_with_exactly_one_error() {
+        let gate = Arc::new(MediaGate::new(1, Duration::from_secs(5), Duration::from_secs(60)));
+        let frames = futures_util::StreamExt::chain(
+            futures_util::stream::iter([
+                Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"one"))),
+                Ok(Frame::data(Bytes::from_static(b"two"))),
+            ]),
+            futures_util::stream::pending(),
+        );
+        let response = Response::new(StreamBody::new(frames).boxed());
+        let mut body = Box::pin(gate.guard(response, gate.try_enter().unwrap()).into_body());
+
+        // Signal the task to start without consuming its first frame. It fills the one-frame queue,
+        // holds the second frame at send, and is therefore genuinely downstream-backpressured.
+        {
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(hyper::body::Body::poll_frame(body.as_mut(), &mut cx).is_pending());
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.active(), 0, "timeout must release the permit before the reader resumes");
+
+        let first = body.as_mut().frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, "one");
+        let error = body.as_mut().frame().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(body.as_mut().frame().await.is_none(), "terminal timeout must be emitted exactly once");
+        assert_eq!(gate.idle_timeouts(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_inner_body_error_is_terminal() {
+        let gate = Arc::new(MediaGate::new(1, Duration::from_secs(30), Duration::from_secs(60)));
+        let frames = futures_util::stream::iter([
+            Err::<Frame<Bytes>, _>(io::Error::other("upstream broke")),
+            Ok(Frame::data(Bytes::from_static(b"must not follow"))),
+        ]);
+        let response = Response::new(StreamBody::new(frames).boxed());
+        let mut body = gate.guard(response, gate.try_enter().unwrap()).into_body();
+        assert_eq!(body.frame().await.unwrap().unwrap_err().kind(), io::ErrorKind::Other);
+        assert!(body.frame().await.is_none());
         assert_eq!(gate.active(), 0);
     }
 

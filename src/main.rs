@@ -322,7 +322,7 @@ fn metrics_body(state: &AppState) -> String {
     gauge("reel_downloads_max", "Downloads that may run at once.", &[("", DOWNLOAD_CONCURRENCY as u64)]);
     gauge(
         "reel_direct_media_active",
-        "Direct media responses currently holding a streaming permit.",
+        "Direct media requests currently holding a streaming permit.",
         &[("", state.media_gate.active())],
     );
     gauge(
@@ -334,6 +334,15 @@ fn metrics_body(state: &AppState) -> String {
         "reel_direct_media_max",
         "Direct media responses allowed at once.",
         &[("", state.media_gate.limit() as u64)],
+    );
+    gauge(
+        "reel_index_build_active",
+        "Progressive index builds currently holding build admission.",
+        &[(
+            "",
+            crate::progressive::INDEX_BUILD_CONCURRENCY
+                .saturating_sub(state.index_build_sem.available_permits()) as u64,
+        )],
     );
     gauge(
         "reel_prewarm_permits_available",
@@ -408,6 +417,11 @@ fn metrics_body(state: &AppState) -> String {
         &[("", state.index_failures.load(Relaxed))],
     );
     counter(
+        "reel_index_build_refused_total",
+        "Progressive index builds refused because build admission was full.",
+        &[("", state.index_build_refused.load(Relaxed))],
+    );
+    counter(
         "reel_index_ranges_retried_total",
         "Ranges googlevideo refused for the moment (401, 429, 5xx) and an index build asked for again.",
         &[("", crate::progressive::RANGES_RETRIED.load(Relaxed))],
@@ -416,6 +430,19 @@ fn metrics_body(state: &AppState) -> String {
         "reel_direct_media_refused_total",
         "Direct media requests refused because every streaming permit was held.",
         &[("", state.media_gate.refused())],
+    );
+    counter(
+        "reel_direct_media_timeouts_total",
+        "Direct media bodies stopped by the configured deadline.",
+        &[
+            ("kind=\"idle\"", state.media_gate.idle_timeouts()),
+            ("kind=\"lifetime\"", state.media_gate.lifetime_timeouts()),
+        ],
+    );
+    counter(
+        "reel_direct_media_cancellations_total",
+        "Direct media bodies dropped by the downstream before completion.",
+        &[("", state.media_gate.cancellations())],
     );
     counter(
         "reel_index_requests_total",
