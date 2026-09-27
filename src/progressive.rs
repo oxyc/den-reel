@@ -898,10 +898,7 @@ async fn moof(http: &reqwest::Client, url: &str, at: u64, size: u64) -> Result<(
 }
 
 /// One file's first bytes, where its `moov` sits in them, and its `moof`s with their offsets.
-async fn read_source(
-    http: &reqwest::Client,
-    url: String,
-) -> Result<IndexedSource, Unbuilt> {
+async fn read_source(http: &reqwest::Client, url: String) -> Result<IndexedSource, Unbuilt> {
     let head = fetch(http, &url, 0, HEAD_BYTES - 1).await?;
     let index = index(&head)?;
     // Owned pairs: a closure over borrowed ones is not general enough for a future that must be Send.
@@ -930,8 +927,10 @@ async fn build(
     };
     let first_unread = read.len();
     read.extend(
-        futures_util::future::try_join_all(urls[first_unread..].iter().cloned().map(|url| read_source(http, url)))
-            .await?,
+        futures_util::future::try_join_all(
+            urls[first_unread..].iter().cloned().map(|url| read_source(http, url)),
+        )
+        .await?,
     );
     let sources: Vec<Source> = read.iter().map(IndexedSource::borrowed).collect();
     let mut built = layout(&sources)?;
@@ -975,10 +974,9 @@ async fn layout_for(
                     let _build_permit = build_permit;
                     let started = Instant::now();
                     let reused_video = match video {
-                        Some(shared) => shared
-                            .await
-                            .ok()
-                            .and_then(|layout| layout.indexed_sources.first().cloned()),
+                        Some(shared) => {
+                            shared.await.ok().and_then(|layout| layout.indexed_sources.first().cloned())
+                        }
                         None => None,
                     };
                     let built = build(&st.http, &urls, reused_video).await.map(Arc::new);
@@ -1656,9 +1654,7 @@ pub(crate) mod tests {
 
         build(&http, &[format!("{base}/0")], None).await.expect("a video index");
         assert_eq!(count(), 1 + 40, "the first bytes, then each fragment's moof");
-        build(&http, &[format!("{base}/0"), format!("{base}/1")], None)
-            .await
-            .expect("an index with sound");
+        build(&http, &[format!("{base}/0"), format!("{base}/1")], None).await.expect("an index with sound");
         assert_eq!(count(), (1 + 40) + (1 + 15), "and the same again for the audio file");
     }
 
