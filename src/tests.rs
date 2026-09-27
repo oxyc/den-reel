@@ -4440,6 +4440,64 @@ async fn cancelled_index_waiters_cannot_leave_unbounded_detached_builders() {
     server.abort();
 }
 
+/// Opening an audible detail after a muted surface has warmed the same video must fetch only the audio
+/// index. This is the common upgrade path: refetching all 40 video fragments made it 57 requests instead of
+/// 16, even though their parsed boxes were already resident. The composed file must remain byte-for-byte the
+/// same layout as a fresh two-source build, not merely save requests.
+#[tokio::test]
+async fn an_audible_index_reuses_the_video_index_already_in_memory() {
+    let dir = temp_dir();
+    let state = direct_state(&dir, "yt-dlp-never-run".into());
+    let video_fragments: Vec<Vec<u32>> = (0..40).map(|_| vec![7, 3, 3, 3]).collect();
+    let audio_fragments: Vec<Vec<u32>> = (0..15).map(|_| vec![2, 2, 2]).collect();
+    let video = crate::progressive::tests::fragmented(
+        &video_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        0,
+    );
+    let audio = crate::progressive::tests::fragmented(
+        &audio_fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        1,
+    );
+    let expected = crate::progressive::tests::layout_of(&[&video, &audio]).expect("a reference layout");
+    let (base, asked) = crate::progressive::tests::serve_ranges(vec![video, audio], 0, "").await;
+    let direct = crate::direct::Direct {
+        video: format!("{base}/0"),
+        audio: Some(format!("{base}/1")),
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: 4_000_000_000_000,
+    };
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, false)
+        .await
+        .expect("a video index");
+    assert_eq!(
+        asked.swap(0, std::sync::atomic::Ordering::Relaxed),
+        1 + 40,
+        "the video head and each video fragment"
+    );
+
+    crate::progressive::prepare(&state, "dQw4w9WgXcQ", Some(720), &direct, true)
+        .await
+        .expect("an audible index");
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Relaxed),
+        1 + 15,
+        "only the audio head and audio fragments"
+    );
+
+    let key = format!("{}+audio", crate::direct::key("dQw4w9WgXcQ", Some(720)));
+    let shared = state.progressive.lock().unwrap().get(&key).expect("the audible entry").2.clone();
+    let actual = shared.await.expect("the audible layout");
+    assert_eq!(actual.head, expected.head, "the rebuilt MP4 header");
+    assert_eq!(actual.pieces, expected.pieces, "the interleaved source ranges");
+    assert_eq!(actual.total, expected.total, "the served file length");
+    assert_eq!(actual.etag, expected.etag, "the file identity");
+    assert_eq!(actual.keyframes, expected.keyframes, "the crop-detection index");
+    assert_eq!(actual.avcc, expected.avcc, "the video decoder configuration");
+}
+
 /// The resolved URLs survive a redeploy, and only the ones still worth having.
 ///
 /// Worth a test of its own because the failure is silent: a park that wrote nothing, or a load that filtered
