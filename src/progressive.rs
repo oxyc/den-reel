@@ -1774,6 +1774,34 @@ pub(crate) mod tests {
         assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "one source span, not 40 fragments");
     }
 
+    /// A production-sized envelope arrives from reqwest in many body chunks. Keep ranges can begin or
+    /// end in any one of them, so exercise the relay's state across those boundaries rather than only the
+    /// small synthetic MP4 above, which commonly fits in one socket read.
+    #[tokio::test]
+    async fn a_coalesced_envelope_is_filtered_across_body_chunks() {
+        let size = RELAY_SPAN_BYTES as usize;
+        let file: Vec<u8> = (0..size).map(|at| (at.wrapping_mul(131) >> 7) as u8).collect();
+        let ranges = vec![(3, 100_003), (130_007, 130_011), (200_019, RELAY_SPAN_BYTES - 17)];
+        let expected: Vec<u8> = ranges
+            .iter()
+            .flat_map(|&(from, to)| file[from as usize..=to as usize].iter().copied())
+            .collect();
+        let (base, requests) = serve_ranges(vec![file], 0, "").await;
+
+        let actual = body(
+            reqwest::Client::new(),
+            vec![format!("{base}/0")],
+            vec![Part::Remote { source: 0, ranges }],
+        )
+        .collect()
+        .await
+        .expect("the filtered body")
+        .to_bytes();
+
+        assert_eq!(actual.as_ref(), expected, "metadata gaps leaked or sample bytes were lost across chunks");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "one coalesced envelope");
+    }
+
     #[test]
     fn playback_spans_stay_bounded() {
         let layout = Layout {
