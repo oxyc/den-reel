@@ -35,7 +35,7 @@ use futures_util::future::Shared;
 use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::{HeaderMap, HeaderValue, IF_RANGE, RANGE};
+use hyper::header::{HeaderMap, HeaderValue, CONTENT_RANGE, IF_RANGE, RANGE};
 use hyper::{Response, StatusCode};
 use tokio::sync::mpsc;
 
@@ -1059,34 +1059,65 @@ async fn relay(
 ) -> bool {
     let Some(&(from, _)) = ranges.first() else { return true };
     let to = ranges.last().map_or(from, |&(_, to)| to);
-    let fault = match http
-        .get(url)
-        .header(RANGE.as_str(), format!("bytes={from}-{to}"))
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await
-    {
-        Err(e) => crate::upstream::body_fault_why(e),
-        Ok(res) if res.status() != reqwest::StatusCode::PARTIAL_CONTENT => {
+    let Some(end) = to.checked_add(1) else {
+        let fault = "invalid upstream range".to_string();
+        let _ = tx.send(Err(io::Error::other(fault))).await;
+        return false;
+    };
+    if ranges.iter().any(|&(keep_from, keep_to)| keep_from > keep_to || keep_to == u64::MAX) {
+        let fault = "invalid upstream keep range".to_string();
+        let _ = tx.send(Err(io::Error::other(fault))).await;
+        return false;
+    }
+    // The timeout measures an idle upstream operation, not time spent waiting for a slow player to
+    // consume the bounded response channel. A RequestBuilder timeout would keep ticking during
+    // `tx.send` below and turn ordinary downstream backpressure into a false upstream failure.
+    let sent = tokio::time::timeout(
+        FETCH_TIMEOUT,
+        http.get(url).header(RANGE.as_str(), format!("bytes={from}-{to}")).send(),
+    )
+    .await;
+    let fault = match sent {
+        Err(_) => "googlevideo did not answer in time".to_string(),
+        Ok(Err(e)) => crate::upstream::body_fault_why(e),
+        Ok(Ok(res)) if res.status() != reqwest::StatusCode::PARTIAL_CONTENT => {
             format!("googlevideo answered {}", res.status())
         }
-        Ok(res) => {
+        Ok(Ok(res)) => {
+            let expected = format!("bytes {from}-{to}/");
+            let content_range = res.headers().get(CONTENT_RANGE).and_then(|value| value.to_str().ok());
+            if !content_range.is_some_and(|value| value.starts_with(&expected)) {
+                let got = content_range.unwrap_or("missing");
+                let fault = format!("googlevideo answered a mismatched content-range ({got})");
+                crate::log_limited("progressive upstream", || {
+                    format!("progressive: bytes {from}-{to} of a stream: {fault}")
+                });
+                let _ = tx.send(Err(io::Error::other(fault))).await;
+                return false;
+            }
             let mut stream = res.bytes_stream();
             let (mut at, mut range) = (from, 0);
             loop {
-                match stream.next().await {
-                    None => return true,
-                    Some(Ok(chunk)) => {
-                        let chunk_end = at + chunk.len() as u64;
+                match tokio::time::timeout(FETCH_TIMEOUT, stream.next()).await {
+                    Err(_) => break "googlevideo body stopped arriving".to_string(),
+                    Ok(None) if at == end && range == ranges.len() => return true,
+                    Ok(None) => break format!("googlevideo body ended early at byte {at}"),
+                    Ok(Some(Ok(chunk))) => {
+                        let Some(chunk_end) = at.checked_add(chunk.len() as u64) else {
+                            break "googlevideo body exceeded its byte range".to_string();
+                        };
+                        if chunk_end > end {
+                            break format!("googlevideo body exceeded byte {to}");
+                        }
                         while let Some(&(keep_from, keep_to)) = ranges.get(range) {
                             if keep_from >= chunk_end {
                                 break;
                             }
                             let first = keep_from.max(at);
-                            let end = (keep_to + 1).min(chunk_end);
-                            if first < end
+                            let keep_end = (keep_to + 1).min(chunk_end);
+                            if first < keep_end
                                 && tx
-                                    .send(Ok(chunk.slice((first - at) as usize..(end - at) as usize)))
+                                    .send(Ok(chunk.slice((first - at) as usize..(keep_end - at) as usize)))
                                     .await
                                     .is_err()
                             {
@@ -1099,7 +1130,7 @@ async fn relay(
                         }
                         at = chunk_end;
                     }
-                    Some(Err(e)) => break crate::upstream::body_fault_why(e),
+                    Ok(Some(Err(e))) => break crate::upstream::body_fault_why(e),
                 }
             }
         }
@@ -1748,6 +1779,53 @@ pub(crate) mod tests {
         let read = make().collect().await.expect("the body").to_bytes();
         assert_eq!(read.len(), 10);
         assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    async fn serve_one_reply(reply: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = conn.read(&mut request).await;
+            conn.write_all(reply.as_bytes()).await.unwrap();
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_upstream_content_range_is_an_error() {
+        let base = serve_one_reply(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 1-10/20\r\n\r\n0123456789"
+                .to_string(),
+        )
+        .await;
+        let result = body(
+            reqwest::Client::new(),
+            vec![base],
+            vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }],
+        )
+        .collect()
+        .await;
+        assert!(result.is_err(), "bytes from the wrong offset must not reach the player");
+    }
+
+    #[tokio::test]
+    async fn a_short_upstream_body_is_an_error() {
+        let base = serve_one_reply(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-9/20\r\n\r\n01234"
+                .to_string(),
+        )
+        .await;
+        let result = body(
+            reqwest::Client::new(),
+            vec![base],
+            vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }],
+        )
+        .collect()
+        .await;
+        assert!(result.is_err(), "a clean but short 206 must not silently truncate playback");
     }
 
     /// Prototype evidence: adjacent chunks share an upstream request, while the metadata fetched
