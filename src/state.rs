@@ -139,6 +139,9 @@ pub struct AppState {
     /// same stale count and all spawned.
     pub prewarm_sem: Arc<Semaphore>,
     pub probe_sem: Arc<Semaphore>,
+    /// Strict admission for self-driven progressive-index builds. Unlike a semaphore acquired inside
+    /// a spawned task, this bounds queued/detached tasks as well as builds currently doing I/O.
+    pub index_build_sem: Arc<Semaphore>,
     /// One global response-lifetime gate for direct progressive and proxied-HLS media.
     pub media_gate: Arc<crate::media_gate::MediaGate>,
     /// Consecutive resolves that had real trailer candidates but yt-dlp could extract **none** of them
@@ -231,6 +234,7 @@ impl AppState {
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
             prewarm_sem,
             probe_sem,
+            index_build_sem: Arc::new(Semaphore::new(crate::progressive::INDEX_BUILD_CONCURRENCY)),
             media_gate,
             cache_trailer_bytes: AtomicU64::new(0),
             cache_trailer_count: AtomicU64::new(0),

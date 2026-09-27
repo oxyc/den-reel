@@ -68,6 +68,13 @@ const SLOW_INDEX: Duration = Duration::from_secs(3);
 /// Bound on the kept indexes. Each is tens of kilobytes and expires with its URL.
 pub const PROGRESSIVE_MAX: usize = 64;
 
+/// Distinct indexes allowed to be fetching fragments at once. A build is deliberately self-driven
+/// after its first caller leaves so the next request finds useful work rather than starting over;
+/// admission therefore cannot be a queue in those caller-independent tasks. A permit is obtained
+/// before one is spawned, and is owned by it through completion, bounding both running and detached
+/// builds under cancellation/churn.
+pub const INDEX_BUILD_CONCURRENCY: usize = 2;
+
 /// Why no index was built. `retry` is a fetch that may work next time; otherwise the file itself is
 /// not one this can index, and asking again before its URL changes would find the same thing.
 #[derive(Clone, Debug)]
@@ -910,8 +917,18 @@ async fn layout_for(
         match map.get(key) {
             Some((kept, kept_until, shared)) if *kept == source && *kept_until > now => shared.clone(),
             _ => {
+                let Ok(build_permit) = state.index_build_sem.clone().try_acquire_owned() else {
+                    return (
+                        Err(Unbuilt { why: "index builders busy".to_string(), retry: true }),
+                        None,
+                    );
+                };
                 let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {
+                    // The self-driving shared future owns admission, not any request awaiting it. A
+                    // cancelled request can neither release this early nor leave an admitted build
+                    // queued outside the bound.
+                    let _build_permit = build_permit;
                     let started = Instant::now();
                     let built = build(&st.http, &urls).await.map(Arc::new);
                     let took = started.elapsed();

@@ -45,10 +45,6 @@ const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 /// direct segment route cannot turn an oversized query into unbounded hashing/allocation work.
 const MAX_SEGMENT_URL_BYTES: usize = 16 * 1024;
 
-/// Long enough for a segment on a slow line, short enough that a wedged fetch cannot pin a task.
-/// Per-request, because the shared client's 15s is sized for JSON lookups.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// The longest a segment is kept. googlevideo's URLs live about six hours, so this only bounds one
 /// whose expiry reads further out than that.
 const SEGMENT_MAX_AGE_SECS: u64 = 6 * 60 * 60;
@@ -413,8 +409,17 @@ fn refused() -> Response<Body> {
 
 /// The upstream request for one URL, carrying what a player sends to seek and to revalidate. A
 /// segment is the same bytes for as long as its URL lives, so Google's own validators answer both.
-fn upstream(http: &reqwest::Client, url: &str, headers: &HeaderMap) -> reqwest::RequestBuilder {
-    let mut req = http.get(url).timeout(FETCH_TIMEOUT);
+fn upstream(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    lifetime: Duration,
+) -> reqwest::RequestBuilder {
+    // The client-wide 15s timeout is for JSON lookups, and the former 60s override killed valid
+    // segments that take roughly 160s on a slow viewer. The direct-media policy is the authority for
+    // bulk transfer lifetime; once headers arrive, MediaGate's task-owned pump also enforces its idle
+    // deadline even while Hyper is backpressured or never polls the response body.
+    let mut req = http.get(url).timeout(lifetime);
     for name in [RANGE, IF_RANGE, IF_NONE_MATCH, IF_MODIFIED_SINCE] {
         if let Some(v) = headers.get(&name).and_then(|v| v.to_str().ok()) {
             req = req.header(name.as_str(), v);
@@ -434,7 +439,7 @@ async fn through(
     uris: Uris,
     playable: Option<crate::client::Playable>,
 ) -> Response<Body> {
-    let res = match upstream(&state.http, url, headers).send().await {
+    let res = match upstream(&state.http, url, headers, state.cfg.direct_media_lifetime).send().await {
         Ok(res) => res,
         Err(e) => {
             crate::log_limited("hls transport", || {
@@ -908,7 +913,10 @@ mod tests {
             headers.insert(name, value.parse().unwrap());
         }
         let url = "https://r1.googlevideo.com/videoplayback";
-        let req = upstream(&reqwest::Client::new(), url, &headers).build().unwrap();
+        let lifetime = Duration::from_secs(15 * 60);
+        let req = upstream(&reqwest::Client::new(), url, &headers, lifetime).build().unwrap();
+        assert_eq!(req.timeout(), Some(&lifetime));
+        assert!(lifetime > Duration::from_secs(160), "host policy cannot carry a valid slow segment");
         for name in ["range", "if-range", "if-none-match", "if-modified-since"] {
             assert_eq!(req.headers()[name], headers[name], "{name}");
         }

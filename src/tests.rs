@@ -305,6 +305,9 @@ fn build_state_full(
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
+        index_build_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::progressive::INDEX_BUILD_CONCURRENCY,
+        )),
         media_gate,
         cache_trailer_bytes: std::sync::atomic::AtomicU64::new(0),
         cache_trailer_count: std::sync::atomic::AtomicU64::new(0),
@@ -4355,6 +4358,78 @@ async fn a_built_index_is_known_to_be_ready_without_building_one() {
     // Each of these is a different index, and saying otherwise would offer a file that is not there.
     assert!(!ready(Some(720), false), "without sound is a different index");
     assert!(!ready(Some(480), true), "another rung is a different index");
+}
+
+/// The first caller deliberately leaves an index build self-driven, so cancelling it must not free
+/// admission for an arbitrary number of new detached builds. New keys are refused before a task or
+/// upstream connection is created; when the one admitted build ends, its permit comes back.
+#[tokio::test]
+async fn cancelled_index_waiters_cannot_leave_unbounded_detached_builders() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let counted = accepted.clone();
+    let held = release.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let held = held.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = held.acquire().await;
+            });
+        }
+    });
+
+    let mut state = direct_state(&temp_dir(), "yt-dlp-never-run".into());
+    Arc::get_mut(&mut state).unwrap().index_build_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let direct = crate::direct::Direct {
+        video: format!("{base}/video"),
+        audio: None,
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: u64::MAX,
+    };
+
+    let first_state = state.clone();
+    let first_direct = direct.clone();
+    let first = tokio::spawn(async move {
+        crate::progressive::prepare(&first_state, "firstBuild01", Some(720), &first_direct, false).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while accepted.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted build never opened its first range");
+    first.abort();
+    let _ = first.await;
+    assert_eq!(state.index_build_sem.available_permits(), 0, "caller cancellation released build admission");
+
+    for n in 0..128 {
+        let error = crate::progressive::prepare(&state, &format!("churnBuild{n:03}"), Some(720), &direct, false)
+            .await
+            .expect_err("a detached build was admitted past the strict cap");
+        assert!(error.retry && error.why.contains("busy"));
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1, "refused churn still opened upstream connections");
+    assert_eq!(state.progressive.lock().unwrap().len(), 1, "refused churn left shared futures behind");
+
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.index_build_sem.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the self-driven build did not return its permit after upstream ended");
+    server.abort();
 }
 
 /// The resolved URLs survive a redeploy, and only the ones still worth having.
