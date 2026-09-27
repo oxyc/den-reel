@@ -998,10 +998,8 @@ async fn validate_rotation(http: &reqwest::Client, urls: &[String], layout: &Lay
     if !same_representation(layout, urls) {
         return false;
     }
-    let heads = futures_util::future::try_join_all(
-        urls.iter().map(|url| fetch(http, url, 0, HEAD_BYTES - 1)),
-    )
-    .await;
+    let heads =
+        futures_util::future::try_join_all(urls.iter().map(|url| fetch(http, url, 0, HEAD_BYTES - 1))).await;
     let Ok(heads) = heads else { return false };
     layout.fingerprints.iter().zip(urls).zip(heads).all(|((old, url), head)| {
         old.as_ref().is_some_and(|old| source_fingerprint(url, &head).as_ref() == Some(old))
@@ -1916,9 +1914,7 @@ pub(crate) mod tests {
         let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
         let (base, requests) = serve_ranges(vec![video], 0, "").await;
         let direct = |clen: u64, sig: &str| crate::direct::Direct {
-            video: format!(
-                "{base}/0?itag=136&clen={clen}&lmt=98765&expire=4000000000&sig={sig}"
-            ),
+            video: format!("{base}/0?itag=136&clen={clen}&lmt=98765&expire=4000000000&sig={sig}"),
             audio: None,
             width: Some(1280),
             height: Some(720),
@@ -1926,13 +1922,9 @@ pub(crate) mod tests {
             expires: 4_000_000_000_000,
         };
 
-        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_345, "old"), false)
-            .await
-            .expect("first index");
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_345, "old"), false).await.expect("first index");
         requests.store(0, std::sync::atomic::Ordering::Relaxed);
-        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_346, "new"), false)
-            .await
-            .expect("replacement");
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_346, "new"), false).await.expect("replacement");
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::Relaxed),
             1 + 4,
