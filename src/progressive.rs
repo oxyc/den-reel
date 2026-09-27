@@ -828,7 +828,10 @@ pub(crate) enum Part {
     Inline(Bytes),
     /// Ordered inclusive ranges from one source, fetched as one enclosing range. Bytes between the
     /// ranges are fragmented-container metadata and are discarded rather than sent to the player.
-    Remote { source: usize, ranges: Vec<(u64, u64)> },
+    Remote {
+        source: usize,
+        ranges: Vec<(u64, u64)>,
+    },
 }
 
 pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
@@ -1801,13 +1804,10 @@ pub(crate) mod tests {
                 .to_string(),
         )
         .await;
-        let result = body(
-            reqwest::Client::new(),
-            vec![base],
-            vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }],
-        )
-        .collect()
-        .await;
+        let result =
+            body(reqwest::Client::new(), vec![base], vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }])
+                .collect()
+                .await;
         assert!(result.is_err(), "bytes from the wrong offset must not reach the player");
     }
 
@@ -1818,13 +1818,10 @@ pub(crate) mod tests {
                 .to_string(),
         )
         .await;
-        let result = body(
-            reqwest::Client::new(),
-            vec![base],
-            vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }],
-        )
-        .collect()
-        .await;
+        let result =
+            body(reqwest::Client::new(), vec![base], vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }])
+                .collect()
+                .await;
         assert!(result.is_err(), "a clean but short 206 must not silently truncate playback");
     }
 
@@ -1838,18 +1835,19 @@ pub(crate) mod tests {
         let expected = served(&[&file], &layout, 0, layout.total - 1);
         let (base, requests) = serve_ranges(vec![file], 0, "").await;
 
-        let actual = body(
-            reqwest::Client::new(),
-            vec![format!("{base}/0")],
-            parts(&layout, 0, layout.total - 1),
-        )
-        .collect()
-        .await
-        .expect("the coalesced body")
-        .to_bytes();
+        let actual =
+            body(reqwest::Client::new(), vec![format!("{base}/0")], parts(&layout, 0, layout.total - 1))
+                .collect()
+                .await
+                .expect("the coalesced body")
+                .to_bytes();
 
         assert_eq!(actual.as_ref(), expected, "coalescing changed the served MP4");
-        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "one source span, not 40 fragments");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one source span, not 40 fragments"
+        );
     }
 
     /// A production-sized envelope arrives from reqwest in many body chunks. Keep ranges can begin or
@@ -1860,21 +1858,16 @@ pub(crate) mod tests {
         let size = RELAY_SPAN_BYTES as usize;
         let file: Vec<u8> = (0..size).map(|at| (at.wrapping_mul(131) >> 7) as u8).collect();
         let ranges = vec![(3, 100_003), (130_007, 130_011), (200_019, RELAY_SPAN_BYTES - 17)];
-        let expected: Vec<u8> = ranges
-            .iter()
-            .flat_map(|&(from, to)| file[from as usize..=to as usize].iter().copied())
-            .collect();
+        let expected: Vec<u8> =
+            ranges.iter().flat_map(|&(from, to)| file[from as usize..=to as usize].iter().copied()).collect();
         let (base, requests) = serve_ranges(vec![file], 0, "").await;
 
-        let actual = body(
-            reqwest::Client::new(),
-            vec![format!("{base}/0")],
-            vec![Part::Remote { source: 0, ranges }],
-        )
-        .collect()
-        .await
-        .expect("the filtered body")
-        .to_bytes();
+        let actual =
+            body(reqwest::Client::new(), vec![format!("{base}/0")], vec![Part::Remote { source: 0, ranges }])
+                .collect()
+                .await
+                .expect("the filtered body")
+                .to_bytes();
 
         assert_eq!(actual.as_ref(), expected, "metadata gaps leaked or sample bytes were lost across chunks");
         assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "one coalesced envelope");
