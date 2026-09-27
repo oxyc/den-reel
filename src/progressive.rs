@@ -61,6 +61,11 @@ const INDEX_TIMEOUT: Duration = Duration::from_secs(15);
 /// One fragment's bytes on their way to a player: long enough for a slow line.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Prototype bound for one coalesced playback request. Fetching across the tiny `moof`/`mdat` gaps
+/// saves a round trip per fragment, while the cap avoids making a whole trailer one timeout and one
+/// failure domain. This needs validation against real googlevideo responses before production use.
+const RELAY_SPAN_BYTES: u64 = 2 * 1024 * 1024;
+
 /// An index build this slow is logged: its first caller waited all of it (2.9 s was measured for a trailer
 /// with sound, cold, against well under a second video-only).
 const SLOW_INDEX: Duration = Duration::from_secs(3);
@@ -821,7 +826,9 @@ pub(crate) fn annexb(avcc: &[u8], frames: &[Bytes]) -> Option<Vec<u8>> {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Part {
     Inline(Bytes),
-    Remote { source: usize, from: u64, to: u64 },
+    /// Ordered inclusive ranges from one source, fetched as one enclosing range. Bytes between the
+    /// ranges are fragmented-container metadata and are discarded rather than sent to the player.
+    Remote { source: usize, ranges: Vec<(u64, u64)> },
 }
 
 pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
@@ -836,7 +843,17 @@ pub(crate) fn parts(layout: &Layout, start: u64, end: u64) -> Vec<Part> {
             break;
         }
         let (s, e) = (start.max(p.at), end.min(p.at + p.len - 1));
-        out.push(Part::Remote { source: p.source, from: p.from + (s - p.at), to: p.from + (e - p.at) });
+        let (from, to) = (p.from + (s - p.at), p.from + (e - p.at));
+        match out.last_mut() {
+            Some(Part::Remote { source, ranges })
+                if *source == p.source
+                    && ranges.last().is_some_and(|&(_, previous_to)| previous_to < from)
+                    && to - ranges[0].0 < RELAY_SPAN_BYTES =>
+            {
+                ranges.push((from, to));
+            }
+            _ => out.push(Part::Remote { source: p.source, ranges: vec![(from, to)] }),
+        }
     }
     out
 }
@@ -1037,10 +1054,11 @@ async fn layout_for(
 async fn relay(
     http: &reqwest::Client,
     url: &str,
-    from: u64,
-    to: u64,
+    ranges: &[(u64, u64)],
     tx: &mpsc::Sender<io::Result<Bytes>>,
 ) -> bool {
+    let Some(&(from, _)) = ranges.first() else { return true };
+    let to = ranges.last().map_or(from, |&(_, to)| to);
     let fault = match http
         .get(url)
         .header(RANGE.as_str(), format!("bytes={from}-{to}"))
@@ -1054,13 +1072,32 @@ async fn relay(
         }
         Ok(res) => {
             let mut stream = res.bytes_stream();
+            let (mut at, mut range) = (from, 0);
             loop {
                 match stream.next().await {
                     None => return true,
                     Some(Ok(chunk)) => {
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            return false;
+                        let chunk_end = at + chunk.len() as u64;
+                        while let Some(&(keep_from, keep_to)) = ranges.get(range) {
+                            if keep_from >= chunk_end {
+                                break;
+                            }
+                            let first = keep_from.max(at);
+                            let end = (keep_to + 1).min(chunk_end);
+                            if first < end
+                                && tx
+                                    .send(Ok(chunk.slice((first - at) as usize..(end - at) as usize)))
+                                    .await
+                                    .is_err()
+                            {
+                                return false;
+                            }
+                            if keep_to + 1 > chunk_end {
+                                break;
+                            }
+                            range += 1;
                         }
+                        at = chunk_end;
                     }
                     Some(Err(e)) => break crate::upstream::body_fault_why(e),
                 }
@@ -1083,7 +1120,7 @@ fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
             for part in parts {
                 let going = match part {
                     Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
-                    Part::Remote { source, from, to } => relay(&http, &urls[source], from, to, &tx).await,
+                    Part::Remote { source, ranges } => relay(&http, &urls[source], &ranges, &tx).await,
                 };
                 if !going {
                     return;
@@ -1454,8 +1491,10 @@ pub(crate) mod tests {
         for part in parts(l, start, end) {
             match part {
                 Part::Inline(bytes) => out.extend_from_slice(&bytes),
-                Part::Remote { source, from, to } => {
-                    out.extend_from_slice(&files[source][from as usize..=to as usize])
+                Part::Remote { source, ranges } => {
+                    for (from, to) in ranges {
+                        out.extend_from_slice(&files[source][from as usize..=to as usize]);
+                    }
                 }
             }
         }
@@ -1700,7 +1739,7 @@ pub(crate) mod tests {
             body(
                 reqwest::Client::new(),
                 vec![format!("{base}/0")],
-                vec![Part::Remote { source: 0, from: 0, to: 9 }],
+                vec![Part::Remote { source: 0, ranges: vec![(0, 9)] }],
             )
         };
         drop(make());
@@ -1709,6 +1748,47 @@ pub(crate) mod tests {
         let read = make().collect().await.expect("the body").to_bytes();
         assert_eq!(read.len(), 10);
         assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Prototype evidence: adjacent chunks share an upstream request, while the metadata fetched
+    /// between them never leaks into the ordinary MP4 presented to the player.
+    #[tokio::test]
+    async fn playback_coalesces_fragment_ranges_without_changing_a_byte() {
+        let fragments: Vec<Vec<u32>> = (0..40).map(|_| vec![37, 19, 11]).collect();
+        let file = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let layout = layout_of(&[&file]).unwrap();
+        let expected = served(&[&file], &layout, 0, layout.total - 1);
+        let (base, requests) = serve_ranges(vec![file], 0, "").await;
+
+        let actual = body(
+            reqwest::Client::new(),
+            vec![format!("{base}/0")],
+            parts(&layout, 0, layout.total - 1),
+        )
+        .collect()
+        .await
+        .expect("the coalesced body")
+        .to_bytes();
+
+        assert_eq!(actual.as_ref(), expected, "coalescing changed the served MP4");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1, "one source span, not 40 fragments");
+    }
+
+    #[test]
+    fn playback_spans_stay_bounded() {
+        let layout = Layout {
+            head: Bytes::new(),
+            pieces: vec![
+                Piece { at: 0, source: 0, from: 100, len: 10 },
+                Piece { at: 10, source: 0, from: 100 + RELAY_SPAN_BYTES, len: 10 },
+            ],
+            total: 20,
+            etag: String::new(),
+            keyframes: Vec::new(),
+            avcc: None,
+            indexed_sources: Vec::new(),
+        };
+        assert_eq!(parts(&layout, 0, 19).len(), 2, "one upstream request grew beyond the prototype bound");
     }
 
     /// The payload of the box at `path` under the top level of `b`.
@@ -1769,8 +1849,10 @@ pub(crate) mod tests {
             parts(&l, start, end),
             [
                 Part::Inline(l.head.slice(l.head.len() - 2..)),
-                Part::Remote { source: 0, from: first.from, to: first.from + first.len - 1 },
-                Part::Remote { source: 0, from: second.from, to: second.from },
+                Part::Remote {
+                    source: 0,
+                    ranges: vec![(first.from, first.from + first.len - 1), (second.from, second.from)],
+                },
             ]
         );
         for (start, end) in
