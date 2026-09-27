@@ -25,12 +25,14 @@
 
 use std::io;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::Shared;
-use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::header::{HeaderMap, HeaderValue, IF_RANGE, RANGE};
@@ -65,6 +67,13 @@ const SLOW_INDEX: Duration = Duration::from_secs(3);
 
 /// Bound on the kept indexes. Each is tens of kilobytes and expires with its URL.
 pub const PROGRESSIVE_MAX: usize = 64;
+
+/// Distinct indexes allowed to be fetching fragments at once. A build is deliberately self-driven
+/// after its first caller leaves so the next request finds useful work rather than starting over;
+/// admission therefore cannot be a queue in those caller-independent tasks. A permit is obtained
+/// before one is spawned, and is owned by it through completion, bounding both running and detached
+/// builds under cancellation/churn.
+pub const INDEX_BUILD_CONCURRENCY: usize = 2;
 
 /// Why no index was built. `retry` is a fetch that may work next time; otherwise the file itself is
 /// not one this can index, and asking again before its URL changes would find the same thing.
@@ -908,8 +917,16 @@ async fn layout_for(
         match map.get(key) {
             Some((kept, kept_until, shared)) if *kept == source && *kept_until > now => shared.clone(),
             _ => {
+                let Ok(build_permit) = state.index_build_sem.clone().try_acquire_owned() else {
+                    state.index_build_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Unbuilt { why: "index builders busy".to_string(), retry: true }), None);
+                };
                 let (st, urls, k, s) = (state.clone(), urls.to_vec(), key.to_string(), source.clone());
                 let fut: BoxFuture<Result<Arc<Layout>, Unbuilt>> = Box::pin(async move {
+                    // The self-driving shared future owns admission, not any request awaiting it. A
+                    // cancelled request can neither release this early nor leave an admitted build
+                    // queued outside the bound.
+                    let _build_permit = build_permit;
                     let started = Instant::now();
                     let built = build(&st.http, &urls).await.map(Arc::new);
                     let took = started.elapsed();
@@ -1010,8 +1027,8 @@ async fn relay(
 /// fetched before the body is first read, so a HEAD or a 304, whose body never is, asks Google for nothing.
 fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
     let started = futures_util::stream::once(async move {
-        let (tx, mut rx) = mpsc::channel::<io::Result<Bytes>>(4);
-        tokio::spawn(async move {
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let task = tokio::spawn(async move {
             for part in parts {
                 let going = match part {
                     Part::Inline(bytes) => tx.send(Ok(bytes)).await.is_ok(),
@@ -1022,9 +1039,30 @@ fn body(http: reqwest::Client, urls: Vec<String>, parts: Vec<Part>) -> Body {
                 }
             }
         });
-        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+        ProducerStream { rx, task }
     });
     BodyExt::boxed(StreamBody::new(started.flatten().map_ok(Frame::data)))
+}
+
+/// Own the producer task so dropping a client body aborts an upstream range fetch immediately.
+/// A bare `JoinHandle` drop detaches; that used to leave the task alive until reqwest's timeout.
+struct ProducerStream {
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Stream for ProducerStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+impl Drop for ProducerStream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 fn serve(
@@ -1236,6 +1274,32 @@ pub async fn handle_progressive(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_the_body_stream_aborts_its_range_producer() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(done) = self.0.take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+
+        let (stopped, did_stop) = tokio::sync::oneshot::channel();
+        let note = Dropped(Some(stopped));
+        let task = tokio::spawn(async move {
+            let _note = note;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let (_tx, rx) = mpsc::channel(1);
+        drop(ProducerStream { rx, task });
+        tokio::time::timeout(Duration::from_secs(1), did_stop)
+            .await
+            .expect("the producer detached from its response")
+            .expect("the producer dropped its cancellation notice");
+    }
 
     fn words(ws: &[u32]) -> Vec<u8> {
         ws.iter().flat_map(|w| w.to_be_bytes()).collect()

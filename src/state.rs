@@ -139,6 +139,11 @@ pub struct AppState {
     /// same stale count and all spawned.
     pub prewarm_sem: Arc<Semaphore>,
     pub probe_sem: Arc<Semaphore>,
+    /// Strict admission for self-driven progressive-index builds. Unlike a semaphore acquired inside
+    /// a spawned task, this bounds queued/detached tasks as well as builds currently doing I/O.
+    pub index_build_sem: Arc<Semaphore>,
+    /// One global response-lifetime gate for direct progressive and proxied-HLS media.
+    pub media_gate: Arc<crate::media_gate::MediaGate>,
     /// Consecutive resolves that had real trailer candidates but yt-dlp could extract **none** of them
     /// — the signature of a systemic extraction outage (YouTube BotGuard / a broken nsig-JS runtime),
     /// which is otherwise invisible to /health (upstream TMDB/KinoCheck still answer fine). Reset to 0
@@ -157,6 +162,8 @@ pub struct AppState {
     pub index_audio: Timings,
     /// Index builds that failed.
     pub index_failures: AtomicU64,
+    /// Index builds refused because every build permit was held.
+    pub index_build_refused: AtomicU64,
     /// Requests that found their index built already, and requests that had to wait for one.
     pub index_hits: AtomicU64,
     pub index_waits: AtomicU64,
@@ -199,6 +206,11 @@ impl AppState {
                 None
             }
         };
+        let media_gate = Arc::new(crate::media_gate::MediaGate::new(
+            cfg.direct_media_concurrency,
+            cfg.direct_media_idle,
+            cfg.direct_media_lifetime,
+        ));
         Arc::new(AppState {
             cfg: cfg.clone(),
             config_keyring,
@@ -224,6 +236,8 @@ impl AppState {
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
             prewarm_sem,
             probe_sem,
+            index_build_sem: Arc::new(Semaphore::new(crate::progressive::INDEX_BUILD_CONCURRENCY)),
+            media_gate,
             cache_trailer_bytes: AtomicU64::new(0),
             cache_trailer_count: AtomicU64::new(0),
             cache_scratch_bytes: AtomicU64::new(0),
@@ -231,6 +245,7 @@ impl AppState {
             index_video: Timings::default(),
             index_audio: Timings::default(),
             index_failures: AtomicU64::new(0),
+            index_build_refused: AtomicU64::new(0),
             index_hits: AtomicU64::new(0),
             index_waits: AtomicU64::new(0),
             resolves: Timings::default(),

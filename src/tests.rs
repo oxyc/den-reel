@@ -214,6 +214,9 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         play_secrets_prev: Vec::new(),
         play_signing_grace: None,
         metrics_token: None,
+        direct_media_concurrency: 16,
+        direct_media_idle: std::time::Duration::from_secs(30),
+        direct_media_lifetime: std::time::Duration::from_secs(15 * 60),
         log_requests: false,
         public_base_url: None,
         ytdlp_format: "fmt".into(),
@@ -269,6 +272,11 @@ fn build_state_full(
     searcher: crate::state::SearchFn,
 ) -> Arc<AppState> {
     let config_keyring = crate::seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
+    let media_gate = std::sync::Arc::new(crate::media_gate::MediaGate::new(
+        cfg.direct_media_concurrency,
+        cfg.direct_media_idle,
+        cfg.direct_media_lifetime,
+    ));
     Arc::new(AppState {
         cfg: Arc::new(cfg),
         config_keyring,
@@ -297,6 +305,10 @@ fn build_state_full(
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         prewarm_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PREWARM_MAX)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
+        index_build_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::progressive::INDEX_BUILD_CONCURRENCY,
+        )),
+        media_gate,
         cache_trailer_bytes: std::sync::atomic::AtomicU64::new(0),
         cache_trailer_count: std::sync::atomic::AtomicU64::new(0),
         cache_scratch_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -304,6 +316,7 @@ fn build_state_full(
         index_video: Default::default(),
         index_audio: Default::default(),
         index_failures: std::sync::atomic::AtomicU64::new(0),
+        index_build_refused: std::sync::atomic::AtomicU64::new(0),
         index_hits: std::sync::atomic::AtomicU64::new(0),
         index_waits: std::sync::atomic::AtomicU64::new(0),
         resolves: Default::default(),
@@ -861,6 +874,15 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
         "free space must account for what trailers already hold"
     );
     assert!(has(&body, &format!("reel_downloads_max {}", crate::DOWNLOAD_CONCURRENCY)));
+    assert!(has(&body, "reel_direct_media_active 0"));
+    assert!(has(&body, "reel_direct_media_high_water 0"));
+    assert!(has(&body, "reel_direct_media_max 16"));
+    assert!(has(&body, "reel_direct_media_refused_total 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"idle\"} 0"));
+    assert!(has(&body, "reel_direct_media_timeouts_total{kind=\"lifetime\"} 0"));
+    assert!(has(&body, "reel_direct_media_cancellations_total 0"));
+    assert!(has(&body, "reel_index_build_active 0"));
+    assert!(has(&body, "reel_index_build_refused_total 0"));
     assert!(has(&body, "reel_consecutive_failures{kind=\"extract\"} 0"));
 
     // What the web's trailers cost, as they are recorded.
@@ -1018,6 +1040,8 @@ fn the_request_log_redacts_the_config_segment() {
     assert_eq!(r("/sealed.AbC-_9/meta/movie/tt0111161.json"), "/<config>/meta/movie/tt0111161.json");
     assert_eq!(r("/sealed.AbC-_9/configure"), "/<config>/configure");
     assert_eq!(r("/sealed.AbC-_9"), "/<config>");
+    assert_eq!(r("/m/s/eyJpIjoiY2FwIn0"), "/m/s/<cap>");
+    assert_eq!(r("/_internal/validate/m/s/eyJpIjoiY2FwIn0"), "/_internal/validate/m/s/<cap>");
     for own in ["/", "/health", "/manifest.json", "/meta/movie/tt0111161.json", "/play/abc123DEF01.mp4"] {
         assert_eq!(r(own), own);
     }
@@ -4342,6 +4366,80 @@ async fn a_built_index_is_known_to_be_ready_without_building_one() {
     assert!(!ready(Some(480), true), "another rung is a different index");
 }
 
+/// The first caller deliberately leaves an index build self-driven, so cancelling it must not free
+/// admission for an arbitrary number of new detached builds. New keys are refused before a task or
+/// upstream connection is created; when the one admitted build ends, its permit comes back.
+#[tokio::test]
+async fn cancelled_index_waiters_cannot_leave_unbounded_detached_builders() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let counted = accepted.clone();
+    let held = release.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let held = held.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = held.acquire().await;
+            });
+        }
+    });
+
+    let mut state = direct_state(&temp_dir(), "yt-dlp-never-run".into());
+    Arc::get_mut(&mut state).unwrap().index_build_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let direct = crate::direct::Direct {
+        video: format!("{base}/video"),
+        audio: None,
+        width: Some(1280),
+        height: Some(720),
+        hls: None,
+        expires: u64::MAX,
+    };
+
+    let first_state = state.clone();
+    let first_direct = direct.clone();
+    let first = tokio::spawn(async move {
+        crate::progressive::prepare(&first_state, "firstBuild01", Some(720), &first_direct, false).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while accepted.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted build never opened its first range");
+    first.abort();
+    let _ = first.await;
+    assert_eq!(state.index_build_sem.available_permits(), 0, "caller cancellation released build admission");
+
+    for n in 0..128 {
+        let error =
+            crate::progressive::prepare(&state, &format!("churnBuild{n:03}"), Some(720), &direct, false)
+                .await
+                .expect_err("a detached build was admitted past the strict cap");
+        assert!(error.retry && error.why.contains("busy"));
+    }
+    assert_eq!(accepted.load(Ordering::Relaxed), 1, "refused churn still opened upstream connections");
+    assert_eq!(state.progressive.lock().unwrap().len(), 1, "refused churn left shared futures behind");
+    assert_eq!(state.index_build_refused.load(Ordering::Relaxed), 128);
+
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.index_build_sem.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the self-driven build did not return its permit after upstream ended");
+    server.abort();
+}
+
 /// The resolved URLs survive a redeploy, and only the ones still worth having.
 ///
 /// Worth a test of its own because the failure is silent: a park that wrote nothing, or a load that filtered
@@ -4475,6 +4573,85 @@ async fn a_media_url_opens_only_as_minted_and_until_it_expires() {
     assert_eq!(open(crate::sources::seal(Some(&signer), &media(1))).await, 410, "expired");
     let forged = crate::sources::seal(Some(&crate::sign::Signer::new("other")), &media(4_000_000_000));
     assert_eq!(open(forged).await, 403, "another secret's tag");
+}
+
+/// The direct listener asks this before it redirects a client away from den-edge. Validation is
+/// only the signed bearer capability: no member credential and, critically, no resolve/media fetch.
+#[test]
+fn direct_media_validation_is_signed_expiring_and_revocable() {
+    let make = |state: &AppState, media: crate::sources::Media, signer: Option<&crate::sign::Signer>| {
+        let sealed = crate::sources::seal(signer, &media);
+        let (_, rest) = sealed.split_once("m/s/").expect("a carried media path");
+        let (blob, query) = rest.split_once('?').unwrap_or((rest, ""));
+        crate::sources::validate_direct_capability(state, blob, query)
+    };
+    let progressive = |x| crate::sources::Media {
+        v: "dQw4w9WgXcQ".into(),
+        f: "p".into(),
+        h: Some(720),
+        a: false,
+        n: false,
+        p: None,
+        i: None,
+        e: None,
+        x,
+    };
+    let signer = crate::sign::Signer::new("s3cret");
+    let state = signed_state(temp_dir(), "", "0", false);
+    let good = make(&state, progressive(4_000_000_000), Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "progressive");
+    assert_eq!(good.headers()["x-den-media-expires"], "4000000000");
+
+    let hls = crate::sources::Media {
+        f: "h".into(),
+        h: None,
+        p: Some("report".into()),
+        ..progressive(4_000_000_000)
+    };
+    let good = make(&state, hls, Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "hls-proxy");
+    assert_eq!(make(&state, progressive(1), Some(&signer)).status(), 410, "expired");
+    assert_eq!(make(&state, progressive(4_000_000_000), None).status(), 403, "unsigned");
+    let forged = crate::sign::Signer::new("not-the-secret");
+    assert_eq!(make(&state, progressive(4_000_000_000), Some(&forged)).status(), 403, "invalid tag");
+
+    let revoked = signed_state(temp_dir(), IID, "0", false);
+    let bound = crate::sources::Media { i: Some(IID.into()), e: Some(0), ..progressive(4_000_000_000) };
+    assert_eq!(make(&revoked, bound, Some(&signer)).status(), 403, "revoked install");
+    let old_epoch = signed_state(temp_dir(), "", "1", false);
+    let bound = crate::sources::Media { i: Some(IID.into()), e: Some(0), ..progressive(4_000_000_000) };
+    assert_eq!(make(&old_epoch, bound, Some(&signer)).status(), 403, "old install epoch");
+
+    let unsigned =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    assert_eq!(
+        make(&unsigned, progressive(4_000_000_000), None).status(),
+        503,
+        "the direct-validation feature stays off without PLAY_SECRET"
+    );
+}
+
+/// Proxied HLS segments share the same direct-media permits as progressive bodies. Refusal happens
+/// after host + MAC validation but before opening Google, so overload is cheap and deterministic.
+#[tokio::test]
+async fn a_direct_hls_segment_is_refused_at_the_global_media_cap() {
+    let mut cfg = test_cfg(temp_dir());
+    cfg.play_secret = Some("s3cret".into());
+    cfg.direct_media_concurrency = 1;
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let held = state.media_gate.try_enter().unwrap();
+    let url = "https://r1.googlevideo.com/videoplayback";
+    let tag = crate::sign::tag("s3cret", &crate::hls::message(url));
+    let query = format!("u=https%3A%2F%2Fr1.googlevideo.com%2Fvideoplayback&s={tag}");
+    let response = crate::hls::handle_segment(state.clone(), &query, &hyper::HeaderMap::new(), true).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(state.media_gate.refused(), 1);
+    drop(held);
+    assert_eq!(state.media_gate.active(), 0);
 }
 
 /// The download path learned this lesson the expensive way: without a remembered verdict, every
