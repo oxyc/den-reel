@@ -884,11 +884,15 @@ async fn read_source(
     let head = fetch(http, &url, 0, HEAD_BYTES - 1).await?;
     let index = index(&head)?;
     // Owned pairs: a closure over borrowed ones is not general enough for a future that must be Send.
-    let moofs: Vec<(u64, Bytes)> =
+    let mut moofs: Vec<(u64, Bytes)> =
         futures_util::stream::iter(index.fragments.into_iter().map(|(at, size)| moof(http, &url, at, size)))
-            .buffered(MOOF_FETCHES)
+            // Do not let one refused/slow fragment hold the concurrency window behind it. The order
+            // in which these finish is irrelevant to the network work; restore file order before the
+            // parser sees them below.
+            .buffer_unordered(MOOF_FETCHES)
             .try_collect()
             .await?;
+    moofs.sort_unstable_by_key(|(at, _)| *at);
     Ok((head, index.moov, moofs))
 }
 
@@ -1477,6 +1481,23 @@ pub(crate) mod tests {
         refuse: usize,
         said: &'static str,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        serve_ranges_gated(files, refuse, said, None).await
+    }
+
+    #[derive(Clone)]
+    struct RangeGate {
+        hold_from: usize,
+        observed_from: usize,
+        release: Arc<tokio::sync::Semaphore>,
+        observed: Arc<tokio::sync::Semaphore>,
+    }
+
+    async fn serve_ranges_gated(
+        files: Vec<Vec<u8>>,
+        refuse: usize,
+        said: &'static str,
+        gate: Option<RangeGate>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1484,7 +1505,7 @@ pub(crate) mod tests {
         let counted = count.clone();
         tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
-                let (count, files) = (counted.clone(), files.clone());
+                let (count, files, gate) = (counted.clone(), files.clone(), gate.clone());
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1522,6 +1543,14 @@ pub(crate) mod tests {
                         let data = &files[file];
                         let from: usize = from.parse().unwrap();
                         let to = to.parse::<usize>().unwrap().min(data.len() - 1);
+                        if let Some(gate) = &gate {
+                            if from == gate.observed_from {
+                                gate.observed.add_permits(1);
+                            }
+                            if from == gate.hold_from {
+                                let _ = gate.release.acquire().await;
+                            }
+                        }
                         let reply = format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{to}/{}\r\n\r\n",
                             to + 1 - from,
@@ -1537,6 +1566,30 @@ pub(crate) mod tests {
             }
         });
         (base, count)
+    }
+
+    /// A slow first request must not keep a completed later request occupying the ordered concurrency
+    /// window. The ninth fragment can start as soon as any of the other first eight finishes.
+    #[tokio::test]
+    async fn a_slow_moof_does_not_block_later_moof_fetches() {
+        let fragments: Vec<Vec<u32>> = (0..9).map(|_| vec![7, 3]).collect();
+        let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let indexed = index(&video).unwrap();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let observed = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = RangeGate {
+            hold_from: indexed.fragments[0].0 as usize,
+            observed_from: indexed.fragments[8].0 as usize,
+            release: release.clone(),
+            observed: observed.clone(),
+        };
+        let (base, _) = serve_ranges_gated(vec![video], 0, "", Some(gate)).await;
+        let build = tokio::spawn(async move { build(&reqwest::Client::new(), &[format!("{base}/0")]).await });
+
+        let ninth_started = tokio::time::timeout(Duration::from_secs(1), observed.acquire()).await.is_ok();
+        release.add_permits(1);
+        build.await.unwrap().expect("the index after releasing the first fragment");
+        assert!(ninth_started, "the slow first fragment held the ninth behind the ordered buffer");
     }
 
     /// What an index costs Google in requests — the one thing about its speed a viewer would feel and a test
