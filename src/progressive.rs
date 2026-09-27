@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use blake2::{Blake2b512, Digest};
 use bytes::Bytes;
 use futures_util::future::Shared;
 use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt};
@@ -105,6 +106,7 @@ pub(crate) type Source<'a> = (&'a [u8], &'a [(u64, Bytes)]);
 struct IndexedSource {
     moov: Bytes,
     moofs: Vec<(u64, Bytes)>,
+    fingerprint: Option<SourceFingerprint>,
 }
 
 impl IndexedSource {
@@ -131,21 +133,33 @@ pub(crate) struct ParkedIndex {
     keyframes: Vec<(u64, u32)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     avcc: Option<String>,
+    /// Stable representation fields plus the exact source heads, used only to validate a newly
+    /// signed URL. Old cache files deserialize without these and simply rebuild on rotation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fingerprints: Vec<Option<SourceFingerprint>>,
 }
 
-/// The indexes worth keeping: built, not merely started, and not yet expired.
+/// Enough evidence to try an index against a newly signed URL. The query fields are only an
+/// admission filter; reuse happens only after the new URL returns a byte-for-byte identical head.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SourceFingerprint {
+    itag: String,
+    clen: String,
+    lmt: String,
+    head_blake2b: String,
+}
+
+/// The indexes worth keeping: built, not merely started. An expired URL's finished index is inert,
+/// but remains useful as a validation candidate when the next resolve returns a fresh signature.
 ///
 /// A build that is still running is a future nobody can serialise, and one that failed is not worth carrying
 /// across a restart — the next request will find out faster than this file can tell it.
-pub(crate) fn park(state: &AppState, now: u64) -> std::collections::HashMap<String, ParkedIndex> {
+pub(crate) fn park(state: &AppState, _now: u64) -> std::collections::HashMap<String, ParkedIndex> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
     map.iter()
         .filter_map(|(key, (urls, until, shared))| {
-            if *until <= now {
-                return None;
-            }
             let Some(Ok(layout)) = shared.peek() else { return None };
             Some((
                 key.clone(),
@@ -158,6 +172,7 @@ pub(crate) fn park(state: &AppState, now: u64) -> std::collections::HashMap<Stri
                     etag: layout.etag.clone(),
                     keyframes: layout.keyframes.clone(),
                     avcc: layout.avcc.as_ref().map(|a| b64.encode(a)),
+                    fingerprints: layout.fingerprints.clone(),
                 },
             ))
         })
@@ -166,13 +181,12 @@ pub(crate) fn park(state: &AppState, now: u64) -> std::collections::HashMap<Stri
 
 /// Put parked indexes back, as futures that are already finished.
 ///
-/// `layout_for` still checks each against the URLs it is asked about (`kept == source`), so one restored for
-/// a resolve that has since rotated is simply passed over — the check that makes this safe is the one that
-/// was already there.
+/// `layout_for` still accepts the exact old URLs only while their deadline stands. A rotated URL can use
+/// one only after its representation fields and freshly fetched source-head digest match.
 pub(crate) fn restore(
     state: &Arc<AppState>,
     parked: std::collections::HashMap<String, ParkedIndex>,
-    now: u64,
+    _now: u64,
 ) -> usize {
     use base64::Engine;
     use futures_util::FutureExt;
@@ -180,7 +194,7 @@ pub(crate) fn restore(
     let mut map = state.progressive.lock().unwrap_or_else(|e| e.into_inner());
     let mut kept = 0;
     for (key, index) in parked {
-        if index.until <= now || map.len() >= PROGRESSIVE_MAX {
+        if map.len() >= PROGRESSIVE_MAX {
             continue;
         }
         let Ok(head) = b64.decode(&index.head) else { continue };
@@ -199,6 +213,7 @@ pub(crate) fn restore(
             // Parked layouts predate (and do not need) the fetched source boxes. They remain fully usable;
             // only the first audible upgrade after a restart has to fetch the video index again.
             indexed_sources: Vec::new(),
+            fingerprints: index.fingerprints,
         });
         let shared: SharedLayout = futures_util::future::ready(Ok(layout)).boxed().shared();
         // Polled here, and that is not a formality: `peek` reports a future that has COMPLETED, not one that
@@ -227,6 +242,8 @@ pub struct Layout {
     pub avcc: Option<Vec<u8>>,
     /// Fetched source boxes used to build this layout, retained only in memory for composing a later layout.
     indexed_sources: Vec<IndexedSource>,
+    /// Stable source identity evidence retained across process restarts.
+    fingerprints: Vec<Option<SourceFingerprint>>,
 }
 
 /// `len` bytes at `at` in the served file, which are `len` bytes at `from` in Google's file `source`
@@ -785,6 +802,7 @@ pub(crate) fn layout(sources: &[Source]) -> Result<Layout, Unbuilt> {
         keyframes: first.keyframes(),
         avcc: first.avcc(),
         indexed_sources: Vec::new(),
+        fingerprints: Vec::new(),
     })
 }
 
@@ -920,6 +938,7 @@ async fn moof(http: &reqwest::Client, url: &str, at: u64, size: u64) -> Result<(
 /// One file's first bytes, where its `moov` sits in them, and its `moof`s with their offsets.
 async fn read_source(http: &reqwest::Client, url: String) -> Result<IndexedSource, Unbuilt> {
     let head = fetch(http, &url, 0, HEAD_BYTES - 1).await?;
+    let fingerprint = source_fingerprint(&url, &head);
     let index = index(&head)?;
     // Owned pairs: a closure over borrowed ones is not general enough for a future that must be Send.
     let mut moofs: Vec<(u64, Bytes)> =
@@ -931,7 +950,62 @@ async fn read_source(http: &reqwest::Client, url: String) -> Result<IndexedSourc
             .try_collect()
             .await?;
     moofs.sort_unstable_by_key(|(at, _)| *at);
-    Ok(IndexedSource { moov: Bytes::copy_from_slice(&head[index.moov]), moofs })
+    Ok(IndexedSource { moov: Bytes::copy_from_slice(&head[index.moov]), moofs, fingerprint })
+}
+
+/// One unescaped decimal query value, rejecting duplicates. These three fields are emitted by
+/// googlevideo for adaptive files. Being deliberately strict makes an unfamiliar URL shape miss
+/// this optimisation rather than weakening the identity check.
+fn media_param(url: &str, wanted: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split('#').next()?;
+    let mut found = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else { continue };
+        if key == wanted {
+            if found.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            found = Some(value.to_string());
+        }
+    }
+    found
+}
+
+fn source_fingerprint(url: &str, head: &[u8]) -> Option<SourceFingerprint> {
+    let digest = Blake2b512::digest(head);
+    let head_blake2b = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Some(SourceFingerprint {
+        itag: media_param(url, "itag")?,
+        clen: media_param(url, "clen")?,
+        lmt: media_param(url, "lmt")?,
+        head_blake2b,
+    })
+}
+
+fn same_representation(layout: &Layout, urls: &[String]) -> bool {
+    layout.fingerprints.len() == urls.len()
+        && layout.fingerprints.iter().zip(urls).all(|(old, url)| {
+            let Some(old) = old else { return false };
+            media_param(url, "itag").as_deref() == Some(old.itag.as_str())
+                && media_param(url, "clen").as_deref() == Some(old.clen.as_str())
+                && media_param(url, "lmt").as_deref() == Some(old.lmt.as_str())
+        })
+}
+
+/// A stable-looking URL is still not trusted: fetch each new source's head and require its
+/// cryptographic digest to match the bytes from which the cached offsets were built.
+async fn validate_rotation(http: &reqwest::Client, urls: &[String], layout: &Layout) -> bool {
+    if !same_representation(layout, urls) {
+        return false;
+    }
+    let heads = futures_util::future::try_join_all(
+        urls.iter().map(|url| fetch(http, url, 0, HEAD_BYTES - 1)),
+    )
+    .await;
+    let Ok(heads) = heads else { return false };
+    layout.fingerprints.iter().zip(urls).zip(heads).all(|((old, url), head)| {
+        old.as_ref().is_some_and(|old| source_fingerprint(url, &head).as_ref() == Some(old))
+    })
 }
 
 /// The layout for `urls`: the video stream, and its audio where that was asked for. Both files are read
@@ -954,6 +1028,7 @@ async fn build(
     );
     let sources: Vec<Source> = read.iter().map(IndexedSource::borrowed).collect();
     let mut built = layout(&sources)?;
+    built.fingerprints = read.iter().map(|source| source.fingerprint.clone()).collect();
     built.indexed_sources = read;
     Ok(built)
 }
@@ -973,6 +1048,18 @@ async fn layout_for(
         match map.get(key) {
             Some((kept, kept_until, shared)) if *kept == source && *kept_until > now => shared.clone(),
             _ => {
+                // An expired signature does not necessarily mean different media. Keep the old
+                // layout only as a validation candidate; it is never served under a new URL until
+                // the stable fields and a freshly fetched source-head digest both match.
+                let rotated = map.get(key).and_then(|(kept, _, shared)| {
+                    if *kept == source {
+                        return None;
+                    }
+                    match shared.peek() {
+                        Some(Ok(layout)) if same_representation(layout, urls) => Some(layout.clone()),
+                        _ => None,
+                    }
+                });
                 let Ok(build_permit) = state.index_build_sem.clone().try_acquire_owned() else {
                     state.index_build_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return (Err(Unbuilt { why: "index builders busy".to_string(), retry: true }), None);
@@ -993,13 +1080,19 @@ async fn layout_for(
                     // queued outside the bound.
                     let _build_permit = build_permit;
                     let started = Instant::now();
-                    let reused_video = match video {
-                        Some(shared) => {
-                            shared.await.ok().and_then(|layout| layout.indexed_sources.first().cloned())
+                    let built = match rotated {
+                        Some(layout) if validate_rotation(&st.http, &urls, &layout).await => Ok(layout),
+                        _ => {
+                            let reused_video = match video {
+                                Some(shared) => shared
+                                    .await
+                                    .ok()
+                                    .and_then(|layout| layout.indexed_sources.first().cloned()),
+                                None => None,
+                            };
+                            build(&st.http, &urls, reused_video).await.map(Arc::new)
                         }
-                        None => None,
                     };
-                    let built = build(&st.http, &urls, reused_video).await.map(Arc::new);
                     let took = started.elapsed();
                     match (&built, urls.len()) {
                         (Ok(_), 1) => st.index_video.record(took),
@@ -1651,7 +1744,7 @@ pub(crate) mod tests {
                         let file: usize = head
                             .split(' ')
                             .nth(1)
-                            .and_then(|p| p.trim_start_matches('/').parse().ok())
+                            .and_then(|p| p.trim_start_matches('/').split('?').next()?.parse().ok())
                             .unwrap();
                         let range = head
                             .lines()
@@ -1729,6 +1822,122 @@ pub(crate) mod tests {
         assert_eq!(count(), 1 + 40, "the first bytes, then each fragment's moof");
         build(&http, &[format!("{base}/0"), format!("{base}/1")], None).await.expect("an index with sound");
         assert_eq!(count(), (1 + 40) + (1 + 15), "and the same again for the audio file");
+    }
+
+    #[test]
+    fn only_complete_unambiguous_representation_fields_admit_rotation() {
+        let head = b"source head";
+        let url = "https://r1.googlevideo.com/videoplayback?itag=136&clen=12345&lmt=98765&expire=1&sig=old";
+        let fp = source_fingerprint(url, head).expect("the normal adaptive URL shape");
+        assert_eq!(fp.itag, "136");
+        assert_eq!(fp.clen, "12345");
+        assert_eq!(fp.lmt, "98765");
+
+        for refused in [
+            "https://r1.googlevideo.com/videoplayback?clen=12345&lmt=98765",
+            "https://r1.googlevideo.com/videoplayback?itag=136&lmt=98765",
+            "https://r1.googlevideo.com/videoplayback?itag=136&clen=12345",
+            "https://r1.googlevideo.com/videoplayback?itag=136&itag=136&clen=12345&lmt=98765",
+            "https://r1.googlevideo.com/videoplayback?itag=136&clen=12x&lmt=98765",
+        ] {
+            assert!(source_fingerprint(refused, head).is_none(), "accepted {refused}");
+        }
+    }
+
+    /// A signature/host/expiry rotation for the exact same representation costs one validating
+    /// head request, not another request for every fragment.
+    #[tokio::test]
+    async fn a_rotated_url_reuses_an_index_only_after_its_source_head_matches() {
+        let dir = crate::tests::temp_dir();
+        let state = crate::tests::direct_state(&dir, "yt-dlp-never-run".into());
+        let fragments: Vec<Vec<u32>> = (0..12).map(|_| vec![7, 3]).collect();
+        let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let (base, requests) = serve_ranges(vec![video], 0, "").await;
+        let direct = |sig: &str| crate::direct::Direct {
+            video: format!("{base}/0?itag=136&clen=12345&lmt=98765&expire=4000000000&sig={sig}"),
+            audio: None,
+            width: Some(1280),
+            height: Some(720),
+            hls: None,
+            expires: 4_000_000_000_000,
+        };
+
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct("old"), false).await.expect("first index");
+        assert_eq!(requests.swap(0, std::sync::atomic::Ordering::Relaxed), 13);
+
+        // Even after the old URL's deadline and a process boundary, the index remains only a
+        // candidate. Restoring it does not make it ready under the new URL.
+        let parked = park(&state, u64::MAX);
+        assert_eq!(parked.len(), 1, "the expired candidate was discarded");
+        let after = crate::tests::direct_state(&dir, "yt-dlp-never-run".into());
+        assert_eq!(restore(&after, parked, u64::MAX), 1);
+        assert!(!ready(&after, "dQw4w9WgXcQ", Some(720), &direct("new"), false));
+
+        prepare(&after, "dQw4w9WgXcQ", Some(720), &direct("new"), false).await.expect("rotated index");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "rotation rebuilt every moof instead of validating one head"
+        );
+    }
+
+    /// Stable query fields do not override the byte evidence. A same-looking URL whose source head
+    /// differs is validated once and then fully rebuilt from the new representation.
+    #[tokio::test]
+    async fn a_rotated_url_with_a_different_head_is_rebuilt() {
+        let dir = crate::tests::temp_dir();
+        let state = crate::tests::direct_state(&dir, "yt-dlp-never-run".into());
+        let fragments: Vec<Vec<u32>> = (0..4).map(|_| vec![7, 3]).collect();
+        let old = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let new = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 9);
+        let (base, requests) = serve_ranges(vec![old, new], 0, "").await;
+        let direct = |file: usize, sig: &str| crate::direct::Direct {
+            video: format!("{base}/{file}?itag=136&clen=12345&lmt=98765&expire=4000000000&sig={sig}"),
+            audio: None,
+            width: Some(1280),
+            height: Some(720),
+            hls: None,
+            expires: 4_000_000_000_000,
+        };
+
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(0, "old"), false).await.expect("first index");
+        requests.store(0, std::sync::atomic::Ordering::Relaxed);
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(1, "new"), false).await.expect("replacement");
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1 + (1 + 4));
+    }
+
+    /// A changed stable field rejects the candidate before doing a validation fetch. It is rebuilt
+    /// normally, even when the bytes behind this synthetic URL happen to be unchanged.
+    #[tokio::test]
+    async fn a_rotated_url_with_different_identity_fields_is_rebuilt_without_validation() {
+        let dir = crate::tests::temp_dir();
+        let state = crate::tests::direct_state(&dir, "yt-dlp-never-run".into());
+        let fragments: Vec<Vec<u32>> = (0..4).map(|_| vec![7, 3]).collect();
+        let video = fragmented(&fragments.iter().map(Vec::as_slice).collect::<Vec<_>>(), 0);
+        let (base, requests) = serve_ranges(vec![video], 0, "").await;
+        let direct = |clen: u64, sig: &str| crate::direct::Direct {
+            video: format!(
+                "{base}/0?itag=136&clen={clen}&lmt=98765&expire=4000000000&sig={sig}"
+            ),
+            audio: None,
+            width: Some(1280),
+            height: Some(720),
+            hls: None,
+            expires: 4_000_000_000_000,
+        };
+
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_345, "old"), false)
+            .await
+            .expect("first index");
+        requests.store(0, std::sync::atomic::Ordering::Relaxed);
+        prepare(&state, "dQw4w9WgXcQ", Some(720), &direct(12_346, "new"), false)
+            .await
+            .expect("replacement");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::Relaxed),
+            1 + 4,
+            "a mismatched candidate was fetched once for validation before being rebuilt"
+        );
     }
 
     /// googlevideo refuses a burst of ranges with 401 for a moment (17 of 29 in one measured build) and answers
@@ -1886,6 +2095,7 @@ pub(crate) mod tests {
             keyframes: Vec::new(),
             avcc: None,
             indexed_sources: Vec::new(),
+            fingerprints: Vec::new(),
         };
         assert_eq!(parts(&layout, 0, 19).len(), 2, "one upstream request grew beyond the prototype bound");
     }

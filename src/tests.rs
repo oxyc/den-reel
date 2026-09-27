@@ -158,7 +158,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 static TMP_CNT: AtomicUsize = AtomicUsize::new(0);
-fn temp_dir() -> PathBuf {
+pub(crate) fn temp_dir() -> PathBuf {
     // Sweep what DEAD runs left. Nothing removes its own directory — a test that fails mid-way
     // should leave its files to look at — but a suite run creates ~100 and they had accumulated
     // into tens of thousands.
@@ -3959,7 +3959,7 @@ fn fake_resolver(dir: &std::path::Path, name: &str, prints: &str) -> (String, Pa
     (script.to_string_lossy().into_owned(), runs)
 }
 
-fn direct_state(dir: &std::path::Path, ytdlp: String) -> Arc<AppState> {
+pub(crate) fn direct_state(dir: &std::path::Path, ytdlp: String) -> Arc<AppState> {
     let mut cfg = test_cfg(dir.to_path_buf());
     cfg.ytdlp = ytdlp;
     build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm())

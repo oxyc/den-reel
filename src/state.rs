@@ -113,7 +113,8 @@ pub struct AppState {
     /// request chasing it never queued behind one another — they simply both ran.
     pub direct_inflight: Mutex<HashMap<String, SharedResolve>>,
     /// vid (and height step) -> the `/progressive` index built for that stream's URL, finished or
-    /// still building, kept until the URL is close to expiring.
+    /// still building. A finished stale one is retained only as a candidate to validate against the
+    /// next signed URL; it is never served merely because the cache key agrees.
     pub progressive: Mutex<HashMap<String, crate::progressive::Entry>>,
     /// The resident yt-dlp, when one is configured and running (`worker.rs`). Every failure of it
     /// falls back to spawning the binary, so this is only ever an optimisation.
@@ -509,9 +510,8 @@ pub fn load_index_cache(cfg: &Config) -> HashMap<String, crate::progressive::Par
 /// Park the built indexes on the way out.
 ///
 /// Rebuilding one costs about 45 range requests to Google and 93–241 ms at the rung a hero plays, far more
-/// at the full ladder (measured 2026-09-16). They are only worth carrying because the resolve cache is
-/// carried too: an index maps byte ranges into Google's file, so it is useful again only if the URLs come
-/// back with it, which is exactly what `direct.json` restores.
+/// at the full ladder (measured 2026-09-16). A live URL can use its index directly; a newly signed URL can
+/// use one only after the stable representation fields and a fresh source-head digest match it.
 pub fn save_index_cache(state: &AppState) {
     let path = &state.cfg.index_cache;
     let Some(dir) = path.parent() else { return };
