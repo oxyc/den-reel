@@ -13,6 +13,11 @@ updates:
       # Patch/minor together: they are the ones that should be boring to review.
       rust-minor:
         update-types: [minor, patch]
+    ignore:
+      # blake2 is a direct edge onto the copy crypto_box 0.9 already compiles (see Cargo.toml). 0.11 would be
+      # a second copy of the crate; move both together once a stable crypto_box on blake2 0.11 ships.
+      - dependency-name: blake2
+        update-types: [version-update:semver-major, version-update:semver-minor]
     labels: [dependencies]
 
   - package-ecosystem: docker
