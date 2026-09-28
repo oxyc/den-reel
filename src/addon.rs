@@ -520,13 +520,19 @@ pub async fn handle_meta(
         // deliberately applied per response rather than baked into the 24h resolve entry, on the
         // grounds that a block can lift; a week in the client's cache defeats exactly that.
         format!("{scope}, max-age=3600")
+    } else if has_link && cfg.is_none() {
+        // Fresh for a day at a shared cache, because that is how long this server trusts a resolve
+        // (`YT_TTL_MS`) — never longer, or a removed trailer outlives the resolve that would drop it. A
+        // browser holds it for five minutes, so a reel release (after which den purges the `reel` tag
+        // from Cloudflare) shows at once. After that either may keep showing the answer for the rest of
+        // the week while it asks again, and through an outage or restart here for the whole week: a
+        // trailer it already holds should not blank. Only on this branch — the stale and demoted answers
+        // above must not outlive their hour.
+        "public, max-age=300, s-maxage=86400, stale-while-revalidate=518400, stale-if-error=604800"
+            .to_string()
     } else if has_link {
-        // Fresh for a day, because that is how long this server trusts a resolve (`YT_TTL_MS`).
-        // After that a client may keep showing the answer for the rest of the week while it asks
-        // again, and through an outage or restart here for the whole week: a trailer it already
-        // holds should not blank. Only on this branch — the stale and demoted answers above must not
-        // outlive their hour.
-        format!("{scope}, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800")
+        // A configured install's own answer, which only its client keeps: a day, as above.
+        "private, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800".to_string()
     } else {
         "no-store".to_string()
     };

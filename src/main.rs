@@ -525,6 +525,17 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         ),
     );
     resp.headers_mut().insert("timing-allow-origin", hyper::header::HeaderValue::from_static("*"));
+    // What a shared cache may keep is named, so the deploy that changes it can drop it by name: den's
+    // `den-cloudflare-purge reel` runs after every reel release. Cloudflare removes the header before a
+    // browser sees the answer.
+    let shared = resp
+        .headers()
+        .get(hyper::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|cc| cc.starts_with("public"));
+    if shared {
+        resp.headers_mut().insert("cache-tag", hyper::header::HeaderValue::from_static("reel"));
+    }
     // Time to headers: a streamed /play body is still being written when this runs.
     let elapsed = start.elapsed();
     // `total` only where a handler named its phases, so it is never the whole of the header.

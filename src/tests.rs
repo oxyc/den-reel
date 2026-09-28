@@ -1411,12 +1411,13 @@ async fn get_meta_caches_success_not_empty() {
     let client = reqwest::Client::new();
 
     let ok = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
-    assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("max-age=86400"));
+    assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("s-maxage=86400"));
 
     state.yt_cache.lock().unwrap().clear();
     fake.set_tmdb(&[]); // no trailer → empty links → no-store (client re-checks, doesn't cache a miss)
     let empty = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
     assert_eq!(empty.headers().get("cache-control").unwrap(), "no-store");
+    assert!(empty.headers().get("cache-tag").is_none(), "only what a shared cache keeps is tagged");
     let body: Value = empty.json().await.unwrap();
     assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
 }
@@ -3882,7 +3883,7 @@ async fn meta_shortens_max_age_for_a_stand_in_answer() {
     let cc = |r: &reqwest::Response| r.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
 
     let fresh = reqwest::get(format!("{base}/meta/movie/tt0111161.json")).await.unwrap();
-    assert!(cc(&fresh).contains("max-age=86400"), "a fresh answer lost its long cache: {}", cc(&fresh));
+    assert!(cc(&fresh).contains("s-maxage=86400"), "a fresh answer lost its long cache: {}", cc(&fresh));
 
     // Age it out and make the next lookup fail, so the answer becomes a stand-in.
     clock.advance(crate::YT_TTL_MS + 1);
@@ -5853,9 +5854,11 @@ async fn meta_keeps_its_week_when_the_demotion_changed_nothing() {
 
     assert_eq!(
         resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
-        Some("public, max-age=86400, stale-while-revalidate=518400, stale-if-error=604800"),
+        Some("public, max-age=300, s-maxage=86400, stale-while-revalidate=518400, stale-if-error=604800"),
         "a response the demotion never touched lost its day of freshness"
     );
+    // Tagged, so a reel release can drop Cloudflare's copy.
+    assert_eq!(resp.headers().get("cache-tag").and_then(|v| v.to_str().ok()), Some("reel"));
     let body: serde_json::Value = resp.json().await.unwrap();
     let links = body["meta"]["links"].as_array().unwrap();
     assert!(links[0]["trailers"].as_str().unwrap().ends_with("/play/liveFirst01.mp4"));
