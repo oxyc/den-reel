@@ -335,12 +335,23 @@ pub async fn handle_master(
     playable: Option<crate::client::Playable>,
 ) -> Response<Body> {
     let (answer, spent) = crate::direct::answer(&state, &vid, None).await;
+    let dur_ms = spent.map(|d| d.as_millis()).unwrap_or(0);
     let direct = match answer {
         Ok(d) => d,
-        Err(e) => return crate::play::play_error(&state, &vid, &e),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::direct::transport_line(&state.cfg, "hls", "refused", &e.reason, dur_ms, &vid)
+            );
+            return crate::play::play_error(&state, &vid, &e);
+        }
     };
     let Some(master) = direct.hls else {
         // A trailer with no HLS is not a failure to report as one: the page still has `/play`.
+        eprintln!(
+            "{}",
+            crate::direct::transport_line(&state.cfg, "hls", "fallback", "no_hls_master", dur_ms, &vid)
+        );
         return httputil::error(
             StatusCode::NOT_FOUND,
             "no_hls",
@@ -351,7 +362,21 @@ pub async fn handle_master(
         Some(d) => httputil::timing("resolve", d),
         None => "cache;desc=hit".to_string(),
     };
-    httputil::timed(through(&state, &master, &HeaderMap::new(), true, uris, playable).await, &timing)
+    let resp = through(&state, &master, &HeaderMap::new(), true, uris, playable).await;
+    // A DRM-protected master is served as a 404 with `x-den-degraded` set (`respond_playlist`); read
+    // it back rather than threading the reason up through `through`/`playlist` separately.
+    match resp.headers().get("x-den-degraded").and_then(|v| v.to_str().ok()) {
+        Some(reason) => {
+            eprintln!(
+                "{}",
+                crate::direct::transport_line(&state.cfg, "hls", "fallback", reason, dur_ms, &vid)
+            )
+        }
+        None => {
+            eprintln!("{}", crate::direct::transport_line(&state.cfg, "hls", "served", "ok", dur_ms, &vid))
+        }
+    }
+    httputil::timed(resp, &timing)
 }
 
 /// `/hls/seg?u=…&s=…`: one upstream URL, checked and fetched. A playlist comes back rewritten like the

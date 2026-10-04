@@ -156,6 +156,67 @@ fn watch_url(vid: &str) -> String {
     format!("https://www.youtube.com/watch?v={vid}")
 }
 
+/// yt-dlp's chosen format for one resolve or download: enough to say *why* a trailer looks the way
+/// it does (silent, soft, cropped to the wrong rung) without re-running yt-dlp to find out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Format {
+    pub format_id: String,
+    pub height: Option<u32>,
+    pub vcodec: String,
+    pub acodec: String,
+}
+
+impl Format {
+    /// `acodec` reads `"none"` for a video-only format — the common case now that YouTube answers
+    /// adaptively — and empty when yt-dlp printed nothing at all.
+    pub(crate) fn has_audio(&self) -> bool {
+        !self.acodec.is_empty() && self.acodec != "none"
+    }
+}
+
+/// Parse the `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line. Best-effort and never
+/// fatal to the download it describes: an unparsable or missing line just means the decision log
+/// carries no format for this one.
+pub(crate) fn parse_format(line: &str) -> Option<Format> {
+    let mut parts = line.trim().splitn(4, '|');
+    let format_id = parts.next()?.to_string();
+    let height = parts.next().and_then(|h| h.parse().ok());
+    let vcodec = parts.next()?.to_string();
+    let acodec = parts.next()?.to_string();
+    (!format_id.is_empty()).then_some(Format { format_id, height, vcodec, acodec })
+}
+
+/// One decision-log line for a yt-dlp cache fill (`/direct`'s resolve cache) or download (`/play`'s
+/// on-disk trailer cache): a cache hit costs nothing further, a miss ran yt-dlp and — on success —
+/// chose `format`. `vid` and `format` are identity fields (`LOG_IDENTITY`, on by default); the rest
+/// of the line — event, outcome, reason, duration — is written either way.
+pub(crate) fn cache_line(
+    cfg: &Config,
+    event: &str,
+    outcome: &str,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+    format: Option<&Format>,
+) -> String {
+    let mut line =
+        format!("event={event} outcome={outcome} reason={reason} upstream=youtube dur_ms={dur_ms}");
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+        if let Some(f) = format {
+            line.push_str(&format!(
+                " format_id={} height={} vcodec={} acodec={} has_audio={}",
+                f.format_id,
+                f.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
+                f.vcodec,
+                f.acodec,
+                f.has_audio()
+            ));
+        }
+    }
+    line
+}
+
 /// Append the configured YouTube `--extractor-args` (the player-client override) to a yt-dlp command
 /// when one is set. Applied to every command that actually extracts a video (probe + download) so the
 /// probe validates exactly what playback fetches. yt-dlp accepts options after the URL, so this can be
@@ -328,10 +389,10 @@ pub fn parse_landscape(s: &str) -> bool {
     }
 }
 
-/// Run yt-dlp+ffmpeg to produce a faststart MP4 at `tmp`. Returns `Ok` iff the process exited 0 and
-/// wrote a non-empty file; otherwise a classified [`PlayError`]. Caller owns `tmp`'s lifecycle
-/// (rename on success, unlink on failure).
-pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), PlayError> {
+/// Run yt-dlp+ffmpeg to produce a faststart MP4 at `tmp`. Returns the format yt-dlp chose iff the
+/// process exited 0 and wrote a non-empty file; otherwise a classified [`PlayError`]. Caller owns
+/// `tmp`'s lifecycle (rename on success, unlink on failure).
+pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, PlayError> {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
     // Shared so the guard below can reap the group even when the future is dropped mid-flight.
@@ -357,12 +418,16 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
             // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
             "--postprocessor-args",
             "Merger+ffmpeg:-movflags +faststart",
+            // What the ladder actually picked — for the decision log, never for playback. Printed
+            // once per video, well before the download itself writes anything to stdout.
+            "--print",
+            "%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s",
             "-o",
             &tmp_s,
             &watch_url(vid),
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Its own process group, so a timeout can reap the whole tree. yt-dlp forks ffmpeg to do
         // the merge, and kill_on_drop signals only the direct child — the ffmpeg survived, kept
@@ -375,14 +440,20 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         group_for_work.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         register_group(pgid);
 
-        // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
-        // read_to_end, not read_to_string: read_to_string discards the WHOLE buffer on one non-UTF-8
-        // byte, so a single accented character in an upstream error message left the log blank and
-        // the failure misclassified as a generic extraction error.
+        // Drain stderr AND stdout concurrently with wait() so a chatty yt-dlp can't deadlock on a
+        // full pipe. read_to_end, not read_to_string: read_to_string discards the WHOLE buffer on
+        // one non-UTF-8 byte, so a single accented character in an upstream error message left the
+        // log blank and the failure misclassified as a generic extraction error.
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
         let mut drain = tokio::spawn(async move {
             let mut buf = Vec::new();
             let _ = stderr_pipe.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+        let mut drain_stdout = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf).await;
             String::from_utf8_lossy(&buf).into_owned()
         });
         let status = child.wait().await.map_err(PlayError::spawn)?;
@@ -404,6 +475,16 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
                 drain.await.unwrap_or_default()
             }
         };
+        // Same pipe, same inheritance quirk; the kill above (if it fired) already closed this one
+        // too, so no second warning line and no second kill.
+        let stdout = match tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain_stdout).await {
+            Ok(r) => r.unwrap_or_default(),
+            Err(_) => {
+                kill_group(pgid);
+                drain_stdout.await.unwrap_or_default()
+            }
+        };
+        let format = stdout.lines().map(str::trim).find(|l| !l.is_empty()).and_then(parse_format);
 
         let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
         if !status.success() {
@@ -421,7 +502,7 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         if !wrote {
             return Err(PlayError::incomplete("yt-dlp exited 0 with no output file".into()));
         }
-        Ok(())
+        Ok(format.unwrap_or_default())
     };
     // Dropping the future kills yt-dlp; `guard` kills whatever it forked.
     let guard = GroupGuard(group.clone());
