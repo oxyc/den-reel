@@ -218,6 +218,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         direct_media_idle: std::time::Duration::from_secs(30),
         direct_media_lifetime: std::time::Duration::from_secs(15 * 60),
         log_requests: false,
+        log_identity: true,
         public_base_url: None,
         ytdlp_format: "fmt".into(),
         ytdlp_extractor_args: Some("youtube:player_client=visionos".into()),
@@ -1103,6 +1104,127 @@ fn log_requests_is_off_only_when_unset_empty_or_zero() {
     for v in ["1", "true", "yes", " 0", "00"] {
         assert!(on(Some(v)), "{v:?} should turn the request log on");
     }
+}
+
+/// On by default — the opposite default from `LOG_REQUESTS` — and off only for one of the usual
+/// false-y tokens, case-insensitively.
+#[test]
+fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
+    use crate::config::log_identity_on as on;
+    assert!(on(None));
+    assert!(on(Some("")));
+    assert!(on(Some("1")));
+    assert!(on(Some("anything")));
+    for v in ["0", "false", "off", "no", "FALSE", " Off "] {
+        assert!(!on(Some(v)), "{v:?} should turn identity logging off");
+    }
+}
+
+/// yt-dlp's `%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s` print line, parsed for the decision
+/// log — and never fatal to the download it describes when it doesn't parse.
+#[test]
+fn ytdlp_format_info_is_parsed_from_the_print_line() {
+    use crate::ytdlp::parse_format;
+    let f = parse_format("303+140|1080|avc1.640028|mp4a.40.2").expect("a well-formed line");
+    assert_eq!(f.format_id, "303+140");
+    assert_eq!(f.height, Some(1080));
+    assert_eq!(f.vcodec, "avc1.640028");
+    assert_eq!(f.acodec, "mp4a.40.2");
+
+    let muxed = parse_format("18|360|avc1.42001E|mp4a.40.2").expect("itag 18");
+    assert_eq!(muxed.height, Some(360));
+
+    assert!(parse_format("").is_none(), "an empty line has no format to report");
+    assert!(parse_format("|||").is_none(), "an empty format_id has no format to report");
+    assert!(parse_format("not enough fields").is_none());
+}
+
+/// `has_audio` reads yt-dlp's own `"none"` for a video-only format — the common case now that
+/// YouTube answers adaptively — rather than guessing from the ladder.
+#[test]
+fn format_has_audio_reads_acodec_none_as_silent() {
+    use crate::ytdlp::parse_format;
+    assert!(!parse_format("303|1080|avc1.640028|none").unwrap().has_audio());
+    assert!(parse_format("18|360|avc1.42001E|mp4a.40.2").unwrap().has_audio());
+}
+
+/// The decision-log line for a yt-dlp download or cache fill: identity fields (the video id and the
+/// chosen format) appear only with `LOG_IDENTITY` on; everything else is written either way.
+#[test]
+fn ytdlp_cache_line_gates_identity_fields_on_log_identity() {
+    use crate::ytdlp::{cache_line, parse_format};
+    let mut cfg = test_cfg(temp_dir());
+    let format = parse_format("303+140|1080|avc1.640028|mp4a.40.2").unwrap();
+
+    cfg.log_identity = true;
+    let on = cache_line(&cfg, "ytdlp_download", "served", "cache_miss", 1234, "dQw4w9WgXcQ", Some(&format));
+    assert_eq!(
+        on,
+        "event=ytdlp_download outcome=served reason=cache_miss upstream=youtube dur_ms=1234 \
+         vid=dQw4w9WgXcQ format_id=303+140 height=1080 vcodec=avc1.640028 acodec=mp4a.40.2 has_audio=true"
+    );
+
+    cfg.log_identity = false;
+    let off = cache_line(&cfg, "ytdlp_download", "served", "cache_miss", 1234, "dQw4w9WgXcQ", Some(&format));
+    assert_eq!(off, "event=ytdlp_download outcome=served reason=cache_miss upstream=youtube dur_ms=1234");
+    assert!(!off.contains("dQw4w9WgXcQ"), "the video id must not survive LOG_IDENTITY=0");
+    assert!(!off.contains("avc1"), "the chosen format must not survive LOG_IDENTITY=0 either");
+
+    // A cache hit carries no format — nothing was decided — but the video id is still identity.
+    let hit = cache_line(&cfg, "ytdlp_download", "served", "cache_hit", 0, "dQw4w9WgXcQ", None);
+    assert_eq!(hit, "event=ytdlp_download outcome=served reason=cache_hit upstream=youtube dur_ms=0");
+}
+
+/// `/direct`'s resolve-cache decision line, same gating: the video id and the resolved
+/// height/has-audio are identity, the hit/miss verdict and the duration are not.
+#[test]
+fn direct_resolve_cache_line_gates_identity_fields_on_log_identity() {
+    use crate::direct::{resolve_cache_line, Direct};
+    let mut cfg = test_cfg(temp_dir());
+    let resolved = Direct {
+        video: "https://r1.googlevideo.com/v".into(),
+        audio: Some("https://r1.googlevideo.com/a".into()),
+        width: Some(1920),
+        height: Some(1080),
+        hls: None,
+        expires: 0,
+    };
+
+    cfg.log_identity = true;
+    let on = resolve_cache_line(&cfg, "served", "cache_miss", 820, "dQw4w9WgXcQ", Some(&resolved));
+    assert_eq!(
+        on,
+        "event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=820 \
+         vid=dQw4w9WgXcQ height=1080 has_audio=true"
+    );
+
+    cfg.log_identity = false;
+    let off = resolve_cache_line(&cfg, "served", "cache_miss", 820, "dQw4w9WgXcQ", Some(&resolved));
+    assert_eq!(off, "event=ytdlp_resolve outcome=served reason=cache_miss upstream=youtube dur_ms=820");
+}
+
+/// The transport decision line (`/direct`, `/hls`): same gating, and a fallback carries its reason
+/// either way, since "hls_drm" is a decision outcome, not a title.
+#[test]
+fn transport_line_gates_only_the_video_id_on_log_identity() {
+    use crate::direct::transport_line;
+    let mut cfg = test_cfg(temp_dir());
+
+    cfg.log_identity = true;
+    let on = transport_line(&cfg, "hls", "fallback", "hls_drm", 42, "dQw4w9WgXcQ");
+    assert_eq!(
+        on,
+        "event=transport transport=hls outcome=fallback reason=hls_drm upstream=youtube dur_ms=42 \
+         vid=dQw4w9WgXcQ"
+    );
+
+    cfg.log_identity = false;
+    let off = transport_line(&cfg, "hls", "fallback", "hls_drm", 42, "dQw4w9WgXcQ");
+    assert_eq!(
+        off,
+        "event=transport transport=hls outcome=fallback reason=hls_drm upstream=youtube dur_ms=42"
+    );
+    assert!(off.contains("reason=hls_drm"), "the fallback reason is not an identity field");
 }
 
 /// /health's verdict is logged when it changes — into degraded with its reason, and back to ok —

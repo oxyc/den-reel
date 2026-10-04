@@ -565,6 +565,10 @@ async fn fetch_trailer_inner(
                 // on the handle it already holds; this path is what `/crop` and prewarm come
                 // through, and they read the file too.
                 touch_atime(fp.clone());
+                eprintln!(
+                    "{}",
+                    ytdlp::cache_line(&state.cfg, "ytdlp_download", "served", "cache_hit", 0, &vid, None)
+                );
                 return Ok(Fetched::cached(fp));
             }
         }
@@ -677,33 +681,60 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
 
     // After the permit: time spent queued for it is not the download's, and shows in `total`.
     let started = Instant::now();
-    if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
-        remove_temp_set(&state.cfg, &tmp).await;
-        // Re-probe the volume on the next request. Deliberately on ANY failure, not just the ones
-        // classified local: a cache dir that has gone away makes yt-dlp fail on its own `-o` path
-        // with a message `classify` does not recognise, so the very case this exists to catch
-        // arrives wearing `extraction_failed`. Getting it wrong the other way costs one pair of
-        // idempotent create_dir_all calls after a failed download, which is nothing.
-        invalidate_cache_availability(&state.cfg);
-        // /health signal (moved here from the old resolve-time probe): a SYSTEMIC extraction failure
-        // (YouTube BotGuard / a broken nsig-JS runtime) bumps the counter; a per-video geo-block/removal
-        // does not. A successful download below clears it. `extractor_unavailable` trips past the threshold.
-        if e.reason == "extraction_failed" {
-            state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let format = match ytdlp::download_to(&state.cfg, &vid, &tmp).await {
+        Ok(format) => format,
+        Err(e) => {
+            remove_temp_set(&state.cfg, &tmp).await;
+            // Re-probe the volume on the next request. Deliberately on ANY failure, not just the ones
+            // classified local: a cache dir that has gone away makes yt-dlp fail on its own `-o` path
+            // with a message `classify` does not recognise, so the very case this exists to catch
+            // arrives wearing `extraction_failed`. Getting it wrong the other way costs one pair of
+            // idempotent create_dir_all calls after a failed download, which is nothing.
+            invalidate_cache_availability(&state.cfg);
+            // /health signal (moved here from the old resolve-time probe): a SYSTEMIC extraction failure
+            // (YouTube BotGuard / a broken nsig-JS runtime) bumps the counter; a per-video geo-block/removal
+            // does not. A successful download below clears it. `extractor_unavailable` trips past the threshold.
+            if e.reason == "extraction_failed" {
+                state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Also systemic, but not the extractor's fault: a throttle pauses every new extraction
+            // instead of moving the counter whose advice is to bump yt-dlp.
+            if e.reason == "throttled" {
+                state.youtube.trip((state.clock)(), None, "YouTube is throttling extractions");
+            }
+            // A local failure is not the extractor's fault, but it is still a total outage from the
+            // viewer's side, and it used to move nothing at all.
+            if e.reason == "incomplete_download" {
+                state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            eprintln!(
+                "{}",
+                ytdlp::cache_line(
+                    &state.cfg,
+                    "ytdlp_download",
+                    "refused",
+                    &e.reason,
+                    started.elapsed().as_millis(),
+                    &vid,
+                    None
+                )
+            );
+            return Err(e);
         }
-        // Also systemic, but not the extractor's fault: a throttle pauses every new extraction
-        // instead of moving the counter whose advice is to bump yt-dlp.
-        if e.reason == "throttled" {
-            state.youtube.trip((state.clock)(), None, "YouTube is throttling extractions");
-        }
-        // A local failure is not the extractor's fault, but it is still a total outage from the
-        // viewer's side, and it used to move nothing at all.
-        if e.reason == "incomplete_download" {
-            state.local_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        return Err(e);
-    }
+    };
     let download = started.elapsed();
+    eprintln!(
+        "{}",
+        ytdlp::cache_line(
+            &state.cfg,
+            "ytdlp_download",
+            "served",
+            "cache_miss",
+            download.as_millis(),
+            &vid,
+            Some(&format)
+        )
+    );
     state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed); // extraction worked → clear the signal
     state.youtube.clear(); // ...and YouTube is answering again
 

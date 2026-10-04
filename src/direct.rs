@@ -269,6 +269,53 @@ fn cached(state: &AppState, key: &str, now: u64) -> Option<Result<Direct, PlayEr
     peek_key(state, key, now)
 }
 
+/// One decision-log line for a trailer request's chosen transport: which one was served, or why
+/// not, and how long it took. `vid` is an identity field (`LOG_IDENTITY`, on by default); the rest
+/// of the line — event, outcome, reason, duration — is written either way.
+pub(crate) fn transport_line(
+    cfg: &Config,
+    transport: &str,
+    outcome: &str,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+) -> String {
+    let mut line =
+        format!("event=transport transport={transport} outcome={outcome} reason={reason} upstream=youtube dur_ms={dur_ms}");
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+    }
+    line
+}
+
+/// One decision-log line for `/direct`'s resolve cache: a hit costs nothing further, a miss ran
+/// yt-dlp (or the resident worker) to fill it. `vid` and the resolved answer's height/audio are
+/// identity fields (`LOG_IDENTITY`); the rest of the line is written either way. The actual
+/// itag/vcodec/acodec choice is logged by `/play`'s download path (`ytdlp::cache_line`) — this
+/// endpoint never downloads, so there is no format to report beyond what the URLs carry.
+pub(crate) fn resolve_cache_line(
+    cfg: &Config,
+    outcome: &str,
+    reason: &str,
+    dur_ms: u128,
+    vid: &str,
+    resolved: Option<&Direct>,
+) -> String {
+    let mut line =
+        format!("event=ytdlp_resolve outcome={outcome} reason={reason} upstream=youtube dur_ms={dur_ms}");
+    if cfg.log_identity {
+        line.push_str(&format!(" vid={vid}"));
+        if let Some(d) = resolved {
+            line.push_str(&format!(
+                " height={} has_audio={}",
+                d.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into()),
+                d.audio.is_some()
+            ));
+        }
+    }
+    line
+}
+
 /// The answer standing for `vid` at `cap`, if there is one, without resolving anything.
 pub(crate) fn peek(state: &AppState, vid: &str, cap: Option<u32>) -> Option<Result<Direct, PlayError>> {
     peek_key(state, &key(vid, cap), (state.clock)())
@@ -313,6 +360,7 @@ pub(crate) async fn answer(
 ) -> (Result<Direct, PlayError>, Option<std::time::Duration>) {
     let key = key(vid, cap);
     if let Some(answer) = cached(state, &key, (state.clock)()) {
+        eprintln!("{}", resolve_cache_line(&state.cfg, "served", "cache_hit", 0, vid, answer.as_ref().ok()));
         return (answer, None);
     }
     let started = std::time::Instant::now();
@@ -335,6 +383,9 @@ pub(crate) async fn answer(
                 // While YouTube is throttling this box nothing is asked — the same gate a download
                 // meets, since a resolve is an extraction too.
                 let answer = if st.youtube.remaining_ms((st.clock)()).is_some() {
+                    // Logged here rather than falling through to the generic error branch below:
+                    // this attempt never ran yt-dlp at all, so there is no resolve duration to report.
+                    eprintln!("{}", resolve_cache_line(&st.cfg, "refused", "throttled", 0, &v, None));
                     Err(PlayError::throttled())
                 } else {
                     // The permit is taken INSIDE the shared future, so waiters queue on the resolve
@@ -355,6 +406,16 @@ pub(crate) async fn answer(
                         None => resolve(&st.cfg, &v, &format, (st.clock)()).await,
                     };
                     st.resolves.record(started.elapsed());
+                    // Once per resolve that actually ran, however many requests join it — the cache
+                    // fill itself, not a line per joiner.
+                    let dur_ms = started.elapsed().as_millis();
+                    eprintln!(
+                        "{}",
+                        match &answer {
+                            Ok(d) => resolve_cache_line(&st.cfg, "served", "cache_miss", dur_ms, &v, Some(d)),
+                            Err(e) => resolve_cache_line(&st.cfg, "refused", &e.reason, dur_ms, &v, None),
+                        }
+                    );
                     answer
                 };
                 let now = (st.clock)();
@@ -424,6 +485,14 @@ pub fn warm(state: Arc<AppState>, vid: String, cap: Option<u32>, progressive: Op
 pub async fn handle_direct(state: Arc<AppState>, vid: String, cap: Option<u32>) -> Response<Body> {
     let (answer, spent) = answer(&state, &vid, cap).await;
     let now = (state.clock)();
+    let dur_ms = spent.map(|d| d.as_millis()).unwrap_or(0);
+    eprintln!(
+        "{}",
+        match &answer {
+            Ok(_) => transport_line(&state.cfg, "direct", "served", "ok", dur_ms, &vid),
+            Err(e) => transport_line(&state.cfg, "direct", "refused", &e.reason, dur_ms, &vid),
+        }
+    );
     let timing = match spent {
         Some(d) => httputil::timing("resolve", d),
         None => "cache;desc=hit".to_string(),

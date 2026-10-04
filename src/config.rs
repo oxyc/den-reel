@@ -5,7 +5,9 @@
 //!      REVOKED_INSTALLS / CONFIG_EPOCH (refuse one install, or every link stamped before an epoch);
 //!      PLAY_SECRET / PLAY_SECRETS_PREV (optional signing of the /play + /crop URLs);
 //!      PLAY_SIGNING_GRACE_UNTIL (still serve unsigned URLs until then, while turning signing on);
-//!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response).
+//!      METRICS_TOKEN (turns on /metrics); LOG_REQUESTS (one stderr line per response);
+//!      LOG_IDENTITY (title ids, the YouTube video id and yt-dlp's chosen format in the transport
+//!      and download/cache-fill decision lines; on by default, 0/false/off/no disables).
 //!      DIRECT_MEDIA_CONCURRENCY / DIRECT_MEDIA_IDLE_SECS / DIRECT_MEDIA_LIFETIME_SECS bound direct streaming.
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
@@ -90,6 +92,12 @@ pub struct Config {
     /// `LOG_REQUESTS` — one stderr line per response when set (anything but empty or `0`). Off by
     /// default: a request log is an event stream, and the rest of the log is state changes.
     pub log_requests: bool,
+    /// `LOG_IDENTITY` — on by default. Controls whether the transport-choice and yt-dlp
+    /// download/cache-fill decision lines carry title ids, the YouTube video id and yt-dlp's chosen
+    /// format (itag/resolution/codec). Everything else in those lines — event, outcome, reason,
+    /// durations — is written either way; this only trims the fields that name a specific title.
+    /// `0`/`false`/`off`/`no` (case-insensitive) turns it off; anything else, including unset, is on.
+    pub log_identity: bool,
     pub public_base_url: Option<String>,
     /// The yt-dlp format string we serve — H.264(avc1) + AAC(mp4a), ≤max_height (avc1's ceiling on
     /// YouTube), faststart-muxable. Forced so trailers play on AVPlayer's HARDWARE decode path
@@ -152,6 +160,14 @@ fn env_opt(key: &str) -> Option<String> {
 /// and `yes` all turn it on. Every Den addon reads it by this rule, and nothing is trimmed.
 pub(crate) fn log_requests_on(v: Option<&str>) -> bool {
     v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `LOG_IDENTITY`: on by default — unset, empty or any value other than one of the usual off-tokens.
+/// The opposite default from `LOG_REQUESTS`, because this gates fields WITHIN a line that is written
+/// either way, not the line itself: an operator who sets nothing gets the identifying fields, and has
+/// to opt out rather than in.
+pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
+    !matches!(v.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
 /// The end of the unsigned-URL grace window: epoch ms, to compare against `AppState::clock`, and the
@@ -373,6 +389,7 @@ impl Config {
             direct_media_idle: seconds("DIRECT_MEDIA_IDLE_SECS", 30, 300),
             direct_media_lifetime: seconds("DIRECT_MEDIA_LIFETIME_SECS", 15 * 60, 2 * 60 * 60),
             log_requests: log_requests_on(env::var("LOG_REQUESTS").ok().as_deref()),
+            log_identity: log_identity_on(env::var("LOG_IDENTITY").ok().as_deref()),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
             ytdlp_extractor_args,
