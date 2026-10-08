@@ -643,29 +643,27 @@ pub(crate) async fn prepare_sources(
                     frame,
                 )
             }
-            Form::Hls { native } => {
-                (
-                    "hls",
-                    Delivery::Reel {
-                        capability: seal(
-                            signer.as_ref(),
-                            &Media {
-                                v: vid.clone(),
-                                f: "h".into(),
-                                h: None,
-                                a: false,
-                                n: native,
-                                p: report.clone(),
-                                i: iid.clone(),
-                                e: ep,
-                                x: expires,
-                            },
-                        ),
-                    },
-                    true,
-                    (None, None),
-                )
-            }
+            Form::Hls { native } => (
+                "hls",
+                Delivery::Reel {
+                    capability: seal(
+                        signer.as_ref(),
+                        &Media {
+                            v: vid.clone(),
+                            f: "h".into(),
+                            h: None,
+                            a: false,
+                            n: native,
+                            p: report.clone(),
+                            i: iid.clone(),
+                            e: ep,
+                            x: expires,
+                        },
+                    ),
+                },
+                true,
+                (None, None),
+            ),
         };
         // Never the same URL twice: a step to the URL already playing starts no load and fires no error.
         let identity = match &delivery {
@@ -681,17 +679,20 @@ pub(crate) async fn prepare_sources(
     // protected by the same short-lived media capability as every other Reel-delivered source. V1 keeps
     // its deployed contract, whose clients append `/play` themselves.
     if contract == Contract::V2 {
-        let capability = seal(signer.as_ref(), &Media {
-            v: vid.clone(),
-            f: "d".into(),
-            h: None,
-            a: true,
-            n: false,
-            p: None,
-            i: iid,
-            e: ep,
-            x: expires,
-        });
+        let capability = seal(
+            signer.as_ref(),
+            &Media {
+                v: vid.clone(),
+                f: "d".into(),
+                h: None,
+                a: true,
+                n: false,
+                p: None,
+                i: iid,
+                e: ep,
+                x: expires,
+            },
+        );
         sources.push(LogicalSource {
             kind: "mp4",
             audio: true,
@@ -939,14 +940,7 @@ mod tests {
 
     #[test]
     fn a_download_capability_has_one_exact_shape() {
-        let downloaded = Media {
-            f: "d".into(),
-            h: None,
-            a: true,
-            n: false,
-            p: None,
-            ..media()
-        };
+        let downloaded = Media { f: "d".into(), h: None, a: true, n: false, p: None, ..media() };
         assert!(is_downloaded(&downloaded));
         assert!(!is_downloaded(&Media { a: false, ..downloaded }));
 

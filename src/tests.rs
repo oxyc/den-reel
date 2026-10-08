@@ -4162,17 +4162,9 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
     };
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", "reel.example".parse().unwrap());
-    let query =
-        "v=2&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D";
-    let response = crate::prepare::handle_prepare(
-        &state,
-        &headers,
-        Some(&install),
-        "movie",
-        "tt0111161",
-        query,
-    )
-    .await;
+    let query = "v=2&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D";
+    let response =
+        crate::prepare::handle_prepare(&state, &headers, Some(&install), "movie", "tt0111161", query).await;
     assert_eq!(response.status(), 200);
     let body = direct_body(response).await;
     assert_eq!(body["v"], 2);
@@ -4191,9 +4183,7 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
         assert!(plan_url.contains("?s="), "the signed source base was lost: {plan_url}");
         assert!(plan_url.contains("&i=AAAAAAAAAAAAAAAAAAAAAA&e=7&v=2"), "{plan_url}");
         assert!(
-            plan_url.ends_with(
-                "&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D"
-            ),
+            plan_url.ends_with("&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D"),
             "{plan_url}"
         );
     }
@@ -4201,22 +4191,13 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
 
     let plan_url = body["primary"]["planUrl"].as_str().unwrap();
     let plan_query = plan_url.split_once('?').unwrap().1;
-    let source_response = crate::sources::handle_sources(
-        state.clone(),
-        &headers,
-        "dQw4w9WgXcQ".into(),
-        plan_query,
-    )
-    .await;
+    let source_response =
+        crate::sources::handle_sources(state.clone(), &headers, "dQw4w9WgXcQ".into(), plan_query).await;
     assert_eq!(source_response.status(), 200);
     assert_eq!(direct_body(source_response).await, body["primaryPlan"]);
 
-    let empty = build_state(
-        temp_dir(),
-        Box::new(FakeUpstream::new(&[], None)),
-        always_playable(),
-        noop_prewarm(),
-    );
+    let empty =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
     let empty = direct_body(
         crate::prepare::handle_prepare(
             &empty,
