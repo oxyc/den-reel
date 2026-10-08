@@ -426,6 +426,75 @@ pub(crate) fn prewarm_choice(asked: Option<&str>) -> (bool, bool, bool) {
     }
 }
 
+/// Discovery before it is put in either the legacy `/meta` envelope or the combined `/prepare`
+/// envelope. Keeping this typed avoids making one public handler call another over HTTP and, more
+/// importantly, guarantees both routes apply the same id pairing and dead-candidate ordering.
+pub(crate) struct PreparedDiscovery {
+    pub id: String,
+    pub base: String,
+    pub yt_ids: Vec<String>,
+    pub valid: bool,
+    pub stale: bool,
+    pub reordered: bool,
+    pub head_dead: bool,
+    pub degraded: Option<&'static str>,
+    pub timing: String,
+}
+
+pub(crate) async fn prepare_discovery(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    cfg: Option<&crate::userconfig::UserConfig>,
+    ty: &str,
+    raw_id: &str,
+    query: &str,
+) -> PreparedDiscovery {
+    // Series may arrive as `tt…:S:E` — trailers are show-level, so only the title's own id is kept. A
+    // `tmdb:<id>` carries a colon of its own, so the episode suffix comes off the number and not the prefix.
+    let id = match raw_id.strip_prefix("tmdb:") {
+        Some(rest) => format!("tmdb:{}", rest.split(':').next().unwrap_or("")),
+        None => raw_id.split(':').next().unwrap_or("").to_string(),
+    };
+    let base = self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
+    if !is_supported_id(&id) {
+        return PreparedDiscovery {
+            id,
+            base,
+            yt_ids: Vec::new(),
+            valid: false,
+            stale: false,
+            reordered: false,
+            head_dead: false,
+            degraded: None,
+            timing: String::new(),
+        };
+    }
+    let companion = query_param(query, "imdb")
+        .filter(|v| is_imdb(v))
+        .or_else(|| query_param(query, "tmdb").map(|n| format!("tmdb:{n}")).filter(|v| is_tmdb(v)));
+    if let Some(other) = companion.filter(|o| *o != id) {
+        remember_pair(state, &id, &other);
+    }
+    let tmdb_key = cfg.map(|c| c.tmdb_key.as_str()).or(state.cfg.tmdb_key.as_deref()).unwrap_or("");
+    let kinocheck_key = cfg.and_then(|c| c.kinocheck_key.as_deref()).or(state.cfg.kinocheck_key.as_deref());
+    let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
+    let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
+    let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, &id, ty, &lang).await;
+    let mut yt_ids = resolved.ids;
+    let demotion = crate::play::demote_known_dead(state, &mut yt_ids);
+    PreparedDiscovery {
+        id,
+        base,
+        yt_ids,
+        valid: true,
+        stale: resolved.stale,
+        reordered: demotion.reordered,
+        head_dead: demotion.head_dead,
+        degraded: resolved.degraded,
+        timing: resolved.timing,
+    }
+}
+
 pub async fn handle_meta(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -434,57 +503,27 @@ pub async fn handle_meta(
     raw_id: &str,
     query: &str,
 ) -> Response<Body> {
-    // Series may arrive as `tt…:S:E` — trailers are show-level, so only the title's own id is kept. A
-    // `tmdb:<id>` carries a colon of its own, so the episode suffix comes off the number and not the prefix.
-    let id = match raw_id.strip_prefix("tmdb:") {
-        Some(rest) => format!("tmdb:{}", rest.split(':').next().unwrap_or("")),
-        None => raw_id.split(':').next().unwrap_or("").to_string(),
-    };
-    let base = self_base(state.cfg.public_base_url.as_deref(), headers, state.cfg.port);
+    let prepared = prepare_discovery(state, headers, cfg, ty, raw_id, query).await;
     let binding = match cfg {
         Some(c) => crate::sign::Binding::Install { iid: c.iid.as_deref(), ep: c.ep },
         None => crate::sign::Binding::Unbound,
     };
     // Only an imdb or a tmdb id reaches the upstreams (and our URLs) — reject anything else so a
     // crafted id can't be interpolated into a TMDB/KinoCheck request.
-    if !is_supported_id(&id) {
+    if !prepared.valid {
         return httputil::json(
             StatusCode::OK,
-            &build_meta(ty, &id, &base, &[], state.cfg.play_secret.as_deref(), binding),
+            &build_meta(ty, &prepared.id, &prepared.base, &[], state.cfg.play_secret.as_deref(), binding),
             &[("cache-control", "no-store")],
         );
     }
-    // A client browsing from TMDB usually holds the imdb id too (and the other way about), so it can say
-    // so here: `?imdb=tt…` beside a tmdb id, `?tmdb=…` beside an imdb one. Then whichever id it asked
-    // with can reach every source without a lookup to convert it, and both forms share one resolve entry.
-    // Validated exactly as the path id is — a companion reaches the same upstream URLs.
-    let companion = query_param(query, "imdb")
-        .filter(|v| is_imdb(v))
-        .or_else(|| query_param(query, "tmdb").map(|n| format!("tmdb:{n}")).filter(|v| is_tmdb(v)));
-    if let Some(other) = companion.filter(|o| *o != id) {
-        remember_pair(state, &id, &other);
-    }
-    // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
-    // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).
-    let tmdb_key = cfg.map(|c| c.tmdb_key.as_str()).or(state.cfg.tmdb_key.as_deref()).unwrap_or("");
-    let kinocheck_key = cfg.and_then(|c| c.kinocheck_key.as_deref()).or(state.cfg.kinocheck_key.as_deref());
-    let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
-    // Lowercased, not just accepted: the cache key and KinoCheck's language pick are both
-    // case-sensitive, so "DE" got its own cache entry AND silently fell through to English.
-    let lang = if valid_lang(&raw_lang) { raw_lang.to_ascii_lowercase() } else { "en".to_string() };
-    let resolved = resolve_youtube_ids(state, tmdb_key, kinocheck_key, &id, ty, &lang).await;
-    let mut yt_ids = resolved.ids;
-    // What /play learned, applied to what /meta hands out. Discovery does not probe, so without this
-    // a candidate that is geo-blocked or removed keeps its upstream rank forever and every client
-    // rediscovers it — one download permit and one yt-dlp process at a time.
-    let demotion = crate::play::demote_known_dead(state, &mut yt_ids);
     // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
     // the alternates are downloaded on demand only if that first one fails. After the demotion above,
     // a primary that is STILL known dead means every candidate is — so there is nothing worth
     // speculatively fetching, and the permit is better left for a /play someone is waiting on.
-    if let Some(primary) = yt_ids.first() {
+    if let Some(primary) = prepared.yt_ids.first() {
         let (download, direct, progressive) = prewarm_choice(query_param(query, "prewarm").as_deref());
-        if !demotion.head_dead {
+        if !prepared.head_dead {
             if download {
                 (state.prewarm)(state.clone(), primary.clone());
             }
@@ -502,14 +541,21 @@ pub async fn handle_meta(
             }
         }
     }
-    let payload = build_meta(ty, &id, &base, &yt_ids, state.cfg.play_secret.as_deref(), binding);
+    let payload = build_meta(
+        ty,
+        &prepared.id,
+        &prepared.base,
+        &prepared.yt_ids,
+        state.cfg.play_secret.as_deref(),
+        binding,
+    );
     // A SUCCESSFUL resolution (a real trailer) is cacheable; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
     // A configured install's path carries its sealed key and its links name its install, so nothing
     // but that client's own cache may keep one. The config-less answer is the same for everyone.
     let scope = if cfg.is_some() { "private" } else { "public" };
-    let cache_control = if has_link && (resolved.stale || demotion.reordered) {
+    let cache_control = if has_link && (prepared.stale || prepared.reordered) {
         // Two ways to get here, one reason. A last-known-good answer standing in for a lookup we
         // could not make: the server stops trusting it after a day, so pinning it in every client
         // for a week outlives that by six.
@@ -542,9 +588,9 @@ pub async fn handle_meta(
     if has_link {
         extra.push(httputil::VARY_SELF_BASE);
     }
-    let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, &extra), &resolved.timing);
+    let mut resp = httputil::timed(httputil::json(StatusCode::OK, &payload, &extra), &prepared.timing);
     // Not for a demotion: that order is this server's best current knowledge, not a fallback.
-    if let Some(reason) = resolved.degraded {
+    if let Some(reason) = prepared.degraded {
         resp.headers_mut().insert("x-den-degraded", hyper::header::HeaderValue::from_static(reason));
     }
     resp

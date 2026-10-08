@@ -1091,6 +1091,14 @@ fn the_request_log_says_what_a_sources_ask_was_for() {
         "GET /sources/dQw4w9WgXcQ.json 200 0ms surface=? player=?",
         "an unknown value is not written"
     );
+    assert_eq!(
+        line("/prepare/movie/tt0111161.json?surface=audible&player=hls.js&intent=warm"),
+        "GET /prepare/movie/tt0111161.json 200 0ms prepare surface=audible player=hls.js intent=warm"
+    );
+    assert_eq!(
+        line("/sealed/prepare/movie/tt0111161.json?surface=audible&player=native&intent=play"),
+        "GET /<config>/prepare/movie/tt0111161.json 200 0ms prepare surface=audible player=native"
+    );
     assert_eq!(line("/play/dQw4w9WgXcQ.mp4?surface=silent"), "GET /play/dQw4w9WgXcQ.mp4 200 0ms");
 }
 
@@ -4070,6 +4078,307 @@ async fn direct_body(resp: hyper::Response<crate::httputil::Body>) -> Value {
     use http_body_util::BodyExt;
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn prepare_returns_a_signed_primary_ladder_with_its_exact_resolution_base() {
+    let dir = temp_dir();
+    let mut cfg = test_cfg(dir);
+    cfg.play_secret = Some("s3cret".into());
+    let mut state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).unwrap().direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let install = crate::userconfig::UserConfig {
+        tmdb_key: "byok".into(),
+        kinocheck_key: None,
+        iid: Some("AAAAAAAAAAAAAAAAAAAAAA".into()),
+        ep: 7,
+    };
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", "reel.example".parse().unwrap());
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &headers,
+        Some(&install),
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["primary"]["id"], "dQw4w9WgXcQ");
+    let base = body["primary"]["sourcesBase"].as_str().unwrap();
+    assert!(base.starts_with("http://reel.example/sources/dQw4w9WgXcQ.json?s="), "{base}");
+    assert!(base.ends_with("&i=AAAAAAAAAAAAAAAAAAAAAA&e=7"), "{base}");
+
+    let relative = body["sources"][0]["url"].as_str().unwrap();
+    let media_url = relative.strip_prefix("../m/n/").expect("relative to the supplied /sources base");
+    let (blob, query) = media_url.split_once('?').unwrap();
+    let signature = crate::httputil::query_param(query, "s").unwrap();
+    let media = crate::sources::unseal(Some("s3cret"), &[], blob, Some(&signature)).unwrap();
+    assert_eq!(media.i.as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAA"));
+    assert_eq!(media.e, Some(7));
+    assert_eq!(
+        warmed.lock().unwrap().as_slice(),
+        &[(Some(720), None)],
+        "warm prepare starts the direct resolve but no progressive index"
+    );
+}
+
+#[tokio::test]
+async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() {
+    let dir = temp_dir();
+    let mut state = build_state(
+        dir,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<(Option<u32>, Option<bool>)>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut state).unwrap().direct_warm =
+        Box::new(move |_state, _id, cap, index| seen.lock().unwrap().push((cap, index)));
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=hls.js&intent=play",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["sources"][0]["kind"], "hls");
+    assert_eq!(warmed.lock().unwrap().as_slice(), &[(Some(720), Some(true))]);
+
+    let empty =
+        build_state(temp_dir(), Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    let response = crate::prepare::handle_prepare(
+        &empty,
+        &hyper::HeaderMap::new(),
+        None,
+        "series",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = direct_body(response).await;
+    assert!(body["primary"].is_null());
+    assert_eq!(body["sources"], json!([]));
+}
+
+#[tokio::test]
+async fn prepare_is_routed_for_legacy_and_configured_installs() {
+    use base64::Engine as _;
+
+    let mut cfg = test_cfg(temp_dir());
+    cfg.play_secret = Some("s3cret".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let query = "surface=audible&player=native&intent=warm";
+    let request = hyper::Request::builder()
+        .uri(format!("/prepare/movie/tt0111161.json?{query}"))
+        .header("host", "reel.example")
+        .body(())
+        .unwrap();
+    let legacy = direct_body(crate::handle_request(state.clone(), request).await).await;
+    assert_eq!(legacy["primary"]["id"], "dQw4w9WgXcQ");
+
+    let segment = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(r#"{"tmdbKey":"byok","iid":"AAAAAAAAAAAAAAAAAAAAAA","ep":9}"#);
+    let request = hyper::Request::builder()
+        .uri(format!("/{segment}/prepare/movie/tt0111161.json?{query}"))
+        .header("host", "reel.example")
+        .body(())
+        .unwrap();
+    let configured = direct_body(crate::handle_request(state, request).await).await;
+    let source_base = configured["primary"]["sourcesBase"].as_str().unwrap();
+    assert!(source_base.ends_with("&i=AAAAAAAAAAAAAAAAAAAAAA&e=9"), "{source_base}");
+}
+
+#[tokio::test]
+async fn prepare_rejects_the_ask_before_discovery() {
+    let fake = FakeUpstream::new(&["dQw4w9WgXcQ"], None);
+    let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
+    for query in [
+        "surface=wrong&player=native&intent=warm",
+        "surface=audible&player=wrong&intent=warm",
+        "surface=audible&player=native&intent=wrong",
+    ] {
+        let response = crate::prepare::handle_prepare(
+            &state,
+            &hyper::HeaderMap::new(),
+            None,
+            "movie",
+            "tt0111161",
+            query,
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+    }
+    assert_eq!(fake.calls(), 0, "an invalid source ask still spent upstream discovery");
+}
+
+#[tokio::test]
+async fn a_resolved_silent_native_warm_neither_builds_nor_advertises_an_unready_index() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("dQw4w9WgXcQ", Some(720)),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000".into(),
+                audio: None,
+                width: Some(1280),
+                height: Some(720),
+                hls: None,
+                expires: now + 3_600_000,
+            }),
+            now + 3_600_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=silent&player=native&intent=warm",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["prepared"]["intent"], "warm");
+    assert_eq!(body["prepared"]["playReady"], true);
+    assert_eq!(body["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(body["sources"][0]["kind"], "hls", "an unindexed progressive URL was advertised first");
+    assert!(state.progressive.lock().unwrap().is_empty(), "warm built a progressive index");
+    assert!(state.crop_inflight.lock().unwrap().is_empty(), "warm started crop measurement");
+}
+
+#[tokio::test]
+async fn prepare_keeps_alternates_when_the_primary_source_prep_fails() {
+    let state = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["deadPrimary", "liveSecond1"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("deadPrimary", None),
+        (
+            Err(crate::ytdlp::PlayError {
+                status: 503,
+                reason: "throttled".into(),
+                message: "try later".into(),
+                detail: "test".into(),
+            }),
+            now + 60_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=play",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-den-degraded"], "primary_unavailable");
+    let retry_after = response.headers()["retry-after"].to_str().unwrap().to_owned();
+    let timing = response.headers()["server-timing"].to_str().unwrap();
+    assert!(timing.contains("tmdb;dur="), "discovery timing was dropped: {timing}");
+    assert!(timing.contains("cache;desc=hit"), "source failure timing was dropped: {timing}");
+    let body = direct_body(response).await;
+    assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 2, "the alternate disappeared");
+    assert!(body["prepared"].is_null());
+    assert_eq!(
+        body["degraded"],
+        json!({ "reason": "primary_unavailable", "status": 503, "retryAfter": retry_after })
+    );
+    assert_eq!(body["sources"], json!([]));
+}
+
+#[tokio::test]
+async fn prepare_caps_demoted_answers_and_does_not_warm_an_all_dead_list() {
+    let fake = FakeUpstream::new(&["deadFirst01", "liveSecond1"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let gone = crate::ytdlp::PlayError {
+        status: 404,
+        reason: "unavailable".into(),
+        message: "gone".into(),
+        detail: "test".into(),
+    };
+    crate::play::record_failure(&state, "deadFirst01", &gone);
+    let now = (state.clock)();
+    state.direct_cache.lock().unwrap().insert(
+        crate::direct::key("liveSecond1", None),
+        (
+            Ok(crate::direct::Direct {
+                video: "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000".into(),
+                audio: None,
+                width: Some(1280),
+                height: Some(720),
+                hls: None,
+                expires: now + 86_400_000,
+            }),
+            now + 86_400_000,
+        ),
+    );
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.headers()["cache-control"], "private, max-age=3600");
+
+    let mut all_dead = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&["deadOnly001"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let warmed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = warmed.clone();
+    Arc::get_mut(&mut all_dead).unwrap().direct_warm =
+        Box::new(move |_state, id, _cap, _index| seen.lock().unwrap().push(id));
+    crate::play::record_failure(&all_dead, "deadOnly001", &gone);
+    let response = crate::prepare::handle_prepare(
+        &all_dead,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "surface=audible&player=native&intent=warm",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(warmed.lock().unwrap().is_empty(), "an all-dead list started a direct resolve");
 }
 
 /// A fake yt-dlp standing in for `--print "%(width)s %(height)s" --print urls`, counting its runs.

@@ -102,9 +102,13 @@ GET /<config>/manifest.json               →  addon manifest for a sealed insta
                                              with "denInstallId": the install's id, when it has one;
                                              400 bad_config if undecodable or revoked
 GET /<config>/meta/<type>/<imdbId>.json    →  as below, resolved with that install's own key
+GET /<config>/prepare/<type>/<id>.json     →  as below, with install-bound source capabilities
 GET /manifest.json                       →  manifest with no config (uses the TMDB_KEY fallback)
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url>,
                                                                  sources: <sources url> } ] } }
+GET /prepare/<movie|series>/<id>.json     →  discovery + the primary trailer's source ladder;
+                                             ?surface=silent|audible&player=native|hls.js
+                                             &intent=warm|play, plus imdb/tmdb/lang/playable as usual
 GET /sources/<youtube_id>.json            →  the forms of that trailer a page should try, in order:
                                              ?surface=silent|audible&player=native|hls.js
 GET /m/<n|s>/<blob>                       →  one form /sources minted: n a native master (only its
@@ -135,6 +139,23 @@ anything else                             →  404 {"error":"not_found"}
 ```
 
 Every response carries `Access-Control-Allow-Origin: *`.
+
+### Combined `/prepare` contract
+
+`/prepare` removes the client-side `/meta` → `/sources` dependency round trip. Its response contains
+the ordinary `meta`, `primary: { id, sourcesBase }`, `prepared: { intent, playReady, provisional }`,
+and the primary trailer's `sources`, `crop` and `expires`. Source URLs such as `../m/s/<blob>` remain
+relative to `/sources`, so resolve them against `primary.sourcesBase`, not the `/prepare` request URL.
+That base preserves the reached host or relay mount and the install-bound signature.
+
+`intent=warm` starts the primary direct resolve in the background, but does not wait, build a
+progressive index, measure crop, or activate a listener. Its provisional ladder contains only sources
+that can play immediately: HLS, an already-resolved Google URL, or an already-indexed progressive file.
+It is therefore safe to reuse, while a later `intent=play` can return a faster ladder after warming.
+`intent=play` uses the current `/sources` ordering and readiness behavior. Listener activation remains
+Den Edge's responsibility. A title with no trailer returns 200 with `primary: null`; if preparation of
+the primary fails, the response still returns every `meta.links` alternate, `prepared: null`, an empty
+`sources` array, and `degraded: { reason: "primary_unavailable", status }`, with `Cache-Control: no-store`.
 
 ### Choosing a route for a browser: mind the index
 

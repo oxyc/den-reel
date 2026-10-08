@@ -318,42 +318,51 @@ pub fn validate_direct_capability(state: &AppState, blob: &str, query: &str) -> 
 }
 
 /// `/sources/<vid>.json?surface=silent|audible&player=native|hls.js`: the forms to try, in order.
+pub(crate) fn parse_ask(query: &str) -> Result<(Surface, Player), &'static str> {
+    let surface = match query_param(query, "surface").as_deref() {
+        Some("silent") => Surface::Silent,
+        Some("audible") => Surface::Audible,
+        _ => return Err("Expected surface=silent or audible."),
+    };
+    let player = match query_param(query, "player").as_deref() {
+        Some("native") => Player::Native,
+        Some("hls.js") => Player::HlsJs,
+        _ => return Err("Expected player=native or hls.js."),
+    };
+    Ok((surface, player))
+}
+
 pub async fn handle_sources(
     state: Arc<AppState>,
     headers: &HeaderMap,
     vid: String,
     query: &str,
 ) -> Response<Body> {
-    let surface = match query_param(query, "surface").as_deref() {
-        Some("silent") => Surface::Silent,
-        Some("audible") => Surface::Audible,
-        _ => {
-            return httputil::error(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "Expected surface=silent or audible.",
-            )
-        }
-    };
-    let player = match query_param(query, "player").as_deref() {
-        Some("native") => Player::Native,
-        Some("hls.js") => Player::HlsJs,
-        _ => {
-            return httputil::error(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "Expected player=native or hls.js.",
-            )
-        }
-    };
+    match prepare_sources(state, headers, vid, query, None, false, true).await {
+        Ok(prepared) => prepared.response(),
+        Err(error) => *error,
+    }
+}
+
+/// The typed half of [`handle_sources`], also used by `/prepare` so discovery and the source ladder
+/// are produced in one request without making an internal HTTP request. `binding` overrides the
+/// query-carried install identity for that trusted path; ordinary `/sources` keeps reading `i`/`e`
+/// from its already signed URL.
+pub(crate) async fn prepare_sources(
+    state: Arc<AppState>,
+    headers: &HeaderMap,
+    vid: String,
+    query: &str,
+    binding: Option<crate::sign::Binding<'_>>,
+    cheap_warm: bool,
+    start_warm_resolve: bool,
+) -> Result<PreparedSources, Box<Response<Body>>> {
+    let (surface, player) = parse_ask(query)
+        .map_err(|detail| Box::new(httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)))?;
     // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it.
-    // The same question with the same answer, so the warm-up and the play cannot drift apart — only less in
-    // front of the caller: it never waits, never leads with a file, and measures no letterbox.
-    //
-    // It DOES build the index the hero will need. That index costs Google about 45 range requests, and this ask
-    // is a press on a title — a finger already on it, not a title glanced at. Measured 2026-09-16, a first hero
-    // open with the resolve warm and this index missing costs 122 ms of waiting; built here, it costs nothing.
-    // The wasted case is a press that never becomes a view, and that is the trade being made deliberately.
+    // The legacy `/sources` contract still builds the progressive index a subsequent open needs. Combined
+    // `/prepare` passes `cheap_warm`: it starts only the primary direct resolve, never waits for it, builds no
+    // progressive index and measures no letterbox. That is the right trade for an earlier strong-intent hint.
     let speculative = query_param(query, "intent").as_deref() == Some("warm");
     let mut forms = plan(surface, player, crate::direct::height_cap(&state.cfg, Some(SILENT_HEIGHT)));
     // The rung this surface's progressive-with-sound entry plays from: what an audible surface warms behind its
@@ -421,22 +430,54 @@ pub async fn handle_sources(
     } else if surface == Surface::Audible {
         match crate::direct::peek(&state, &vid, first.cap()) {
             Some(Err(e)) => {
-                return httputil::timed(crate::play::play_error(&state, &vid, &e), "cache;desc=hit")
+                return Err(Box::new(httputil::timed(
+                    crate::play::play_error(&state, &vid, &e),
+                    "cache;desc=hit",
+                )))
             }
             Some(Ok(d)) => {
-                if let Some(cap) = fallback {
-                    (state.direct_warm)(state.clone(), vid.clone(), cap, Some(true));
+                if !cheap_warm {
+                    if let Some(cap) = fallback {
+                        (state.direct_warm)(state.clone(), vid.clone(), cap, Some(true));
+                    }
                 }
                 (Some(d), "cache;desc=hit".to_string())
             }
             None => {
-                (state.direct_warm)(
-                    state.clone(),
-                    vid.clone(),
-                    fallback.unwrap_or(first.cap()),
-                    fallback.map(|_| true),
-                );
+                if cheap_warm {
+                    if start_warm_resolve {
+                        (state.direct_warm)(
+                            state.clone(),
+                            vid.clone(),
+                            fallback.unwrap_or(first.cap()),
+                            None,
+                        );
+                    }
+                } else {
+                    (state.direct_warm)(
+                        state.clone(),
+                        vid.clone(),
+                        fallback.unwrap_or(first.cap()),
+                        fallback.map(|_| true),
+                    );
+                }
                 (None, "resolve;desc=background".to_string())
+            }
+        }
+    } else if cheap_warm {
+        match crate::direct::peek(&state, &vid, first.cap()) {
+            Some(Err(e)) => {
+                return Err(Box::new(httputil::timed(
+                    crate::play::play_error(&state, &vid, &e),
+                    "cache;desc=hit",
+                )))
+            }
+            Some(Ok(d)) => (Some(d), "cache;desc=hit".to_string()),
+            None => {
+                if start_warm_resolve {
+                    (state.direct_warm)(state.clone(), vid.clone(), first.cap(), None);
+                }
+                (None, "resolve;desc=deferred".to_string())
             }
         }
     } else {
@@ -447,26 +488,50 @@ pub async fn handle_sources(
         };
         match answer {
             Ok(d) => (Some(d), timing),
-            Err(e) => return httputil::timed(crate::play::play_error(&state, &vid, &e), &timing),
+            Err(e) => {
+                return Err(Box::new(httputil::timed(crate::play::play_error(&state, &vid, &e), &timing)))
+            }
         }
     };
-    if let (Form::Progressive { cap, audio }, Some(direct)) = (first, &direct) {
-        let started = std::time::Instant::now();
-        let built = crate::progressive::prepare(&state, &vid, cap, direct, audio).await;
-        timing.push_str(", ");
-        timing.push_str(&httputil::timing("index", started.elapsed()));
-        // A file that cannot be indexed is left off rather than offered to fail. A fetch that failed stays:
-        // it may work when the page asks.
-        if let Some(e) = built.err().filter(|e| !e.retry) {
-            crate::log_limited("sources unindexable", || format!("[{vid}] progressive left off ({})", e.why));
-            forms.remove(0);
+    if !cheap_warm {
+        if let (Form::Progressive { cap, audio }, Some(direct)) = (first, &direct) {
+            let started = std::time::Instant::now();
+            let built = crate::progressive::prepare(&state, &vid, cap, direct, audio).await;
+            timing.push_str(", ");
+            timing.push_str(&httputil::timing("index", started.elapsed()));
+            // A file that cannot be indexed is left off rather than offered to fail. A fetch that failed stays:
+            // it may work when the page asks.
+            if let Some(e) = built.err().filter(|e| !e.retry) {
+                crate::log_limited("sources unindexable", || {
+                    format!("[{vid}] progressive left off ({})", e.why)
+                });
+                forms.remove(0);
+            }
         }
+    }
+
+    // A warm response can be reused before `intent=play` arrives, so it must never lead with a progressive
+    // URL whose index is still being built. Keep only sources that can start now; HLS is always safe, Google's
+    // direct URL is safe once resolved, and progressive is safe only when its exact index is already resident.
+    if cheap_warm {
+        forms.retain(|form| match (*form, &direct) {
+            (Form::Google { .. }, Some(_)) => true,
+            (Form::Google { .. }, None) => false,
+            (Form::Progressive { cap, audio }, Some(direct)) => {
+                crate::progressive::ready(&state, &vid, cap, direct, audio)
+            }
+            (Form::Progressive { .. }, None) => false,
+            (Form::Hls { .. }, _) => true,
+        });
     }
 
     let now = (state.clock)();
     let signer = state.cfg.play_secret.as_deref().map(crate::sign::Signer::new);
-    let iid = query_param(query, "i");
-    let ep = query_param(query, "e").and_then(|e| e.parse().ok());
+    let (iid, ep) = match binding {
+        Some(crate::sign::Binding::Unbound) => (None, None),
+        Some(crate::sign::Binding::Install { iid, ep }) => (iid.map(str::to_owned), Some(ep)),
+        None => (query_param(query, "i"), query_param(query, "e").and_then(|e| e.parse().ok())),
+    };
     let report = crate::client::raw_report(headers, query);
     let expires = now / 1000 + MEDIA_TTL_SECS;
     let media_url = |f: &str, h: Option<u32>, a: bool, n: bool, p: Option<String>| {
@@ -525,7 +590,7 @@ pub async fn handle_sources(
     // keyframes in the background, and the next answer carries it.
     let crop =
         state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&vid).and_then(|r| r.fractions());
-    if crop.is_none() && !speculative {
+    if crop.is_none() && !speculative && !cheap_warm {
         // From the index this surface is building anyway: the one with sound for an audible surface. Measuring
         // from `first.cap()` instead would build a SECOND index, at a rung nothing in this list plays, for a
         // letterbox the fallback's own index could have given.
@@ -545,10 +610,27 @@ pub async fn handle_sources(
         None => UNRESOLVED_MAX_AGE_SECS,
     };
     let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
-    let cache = format!("private, max-age={max_age}");
-    let resp =
-        httputil::json(StatusCode::OK, &body, &[("cache-control", &cache), ("vary", crate::client::HEADER)]);
-    httputil::timed(resp, &timing)
+    Ok(PreparedSources { body, timing, max_age })
+}
+
+/// A source ladder before its HTTP envelope. Keeping the cache lifetime and timing beside the body
+/// lets `/sources` retain its wire contract while `/prepare` embeds the same answer verbatim.
+pub(crate) struct PreparedSources {
+    pub body: serde_json::Value,
+    pub timing: String,
+    pub max_age: u64,
+}
+
+impl PreparedSources {
+    fn response(self) -> Response<Body> {
+        let cache = format!("private, max-age={}", self.max_age);
+        let resp = httputil::json(
+            StatusCode::OK,
+            &self.body,
+            &[("cache-control", &cache), ("vary", crate::client::HEADER)],
+        );
+        httputil::timed(resp, &self.timing)
+    }
 }
 
 /// `/m/<segment>/<blob>`: a form `/sources` minted, served by the handler that plays it — and only under the
