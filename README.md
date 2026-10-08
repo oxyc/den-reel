@@ -108,9 +108,9 @@ GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <p
                                                                  sources: <sources url> } ] } }
 GET /prepare/<movie|series>/<id>.json     →  discovery + the primary trailer's source ladder;
                                              ?surface=silent|audible&player=native|hls.js
-                                             &intent=warm|play, plus imdb/tmdb/lang/playable as usual
+                                             &intent=warm|play&v=1|2, plus imdb/tmdb/lang/playable as usual
 GET /sources/<youtube_id>.json            →  the forms of that trailer a page should try, in order:
-                                             ?surface=silent|audible&player=native|hls.js
+                                             ?surface=silent|audible&player=native|hls.js&v=1|2
 GET /m/<n|s>/<blob>                       →  one form /sources minted: n a native master (only its
                                              playlist crosses the box), s anything carried here;
                                              /m/s/seg serves a proxied master's URIs
@@ -156,6 +156,40 @@ It is therefore safe to reuse, while a later `intent=play` can return a faster l
 Den Edge's responsibility. A title with no trailer returns 200 with `primary: null`; if preparation of
 the primary fails, the response still returns every `meta.links` alternate, `prepared: null`, an empty
 `sources` array, and `degraded: { reason: "primary_unavailable", status }`, with `Cache-Control: no-store`.
+
+#### Logical playback plan (`v=2`)
+
+The versionless and explicit `v=1` forms above remain the compatibility contract. `v=2` makes the
+delivery decision explicit instead of asking a client to classify or rewrite a URL. Both
+`/sources?...&v=2` and `/prepare?...&v=2` use this one `SourcePlan` shape (the latter nests it as
+`primaryPlan`):
+
+```json
+{
+  "v": 2,
+  "expires": 1789521638,
+  "crop": { "letterboxed": true, "aspect": 2.4, "rect": [0.0, 0.1296, 1.0, 0.7407] },
+  "sources": [
+    { "kind": "mp4", "audio": false, "width": 1280, "height": 720,
+      "delivery": { "type": "external", "url": "https://rr7.googlevideo.com/…" } },
+    { "kind": "mp4", "audio": true, "width": null, "height": null,
+      "delivery": { "type": "reel", "capability": "m/s/<blob>?s=…" } }
+  ]
+}
+```
+
+`crop` is either `null` or the established fractional crop shape shown above. `delivery` is a tagged
+union: an `external` URL can be fetched as named; a `reel` capability is opaque and must be handed to
+the Reel transport, which redeems it at the current Reel origin or mount. It is not a URL for the
+client to resolve or inspect. Reel's downloaded MP4 is represented by the same logical source shape
+and is the final fallback. Its sealed media form is `d`; the internal capability validator reports
+`X-Den-Media-Form: download`.
+
+The v2 prepare envelope keeps only descriptive discovery fields (`name`, `category`, `provider`) in
+`meta.links` and adds a complete `planUrl` to every candidate. `primary` is `{ id, planUrl }`; alternates
+can therefore be fetched lazily without deriving a route. The embedded `primaryPlan` is `null` when
+there is no valid primary or its preparation failed, so no downloaded capability is emitted for an
+invalid candidate.
 
 ### Choosing a route for a browser: mind the index
 

@@ -4133,6 +4133,107 @@ async fn prepare_returns_a_signed_primary_ladder_with_its_exact_resolution_base(
     );
 }
 
+/// Prepare embeds the very same v2 SourcePlan `/sources` serves. Candidate links keep discovery
+/// labels, but every playback transport is replaced by a complete, signed planUrl.
+#[tokio::test]
+async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-prepare-v2",
+        "printf '1280 720\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\n'",
+    );
+    let mut cfg = test_cfg(dir);
+    cfg.ytdlp = yt;
+    cfg.play_secret = Some("s3cret".into());
+    let state = build_state_cfg(
+        cfg,
+        Box::new(FakeUpstream::new(&["dQw4w9WgXcQ", "alternate01"], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let install = crate::userconfig::UserConfig {
+        tmdb_key: "byok".into(),
+        kinocheck_key: None,
+        iid: Some("AAAAAAAAAAAAAAAAAAAAAA".into()),
+        ep: 7,
+    };
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", "reel.example".parse().unwrap());
+    let query =
+        "v=2&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D";
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &headers,
+        Some(&install),
+        "movie",
+        "tt0111161",
+        query,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert!(body.get("sources").is_none() && body.get("crop").is_none() && body.get("expires").is_none());
+    assert_eq!(body["primary"]["id"], "dQw4w9WgXcQ");
+
+    let links = body["meta"]["links"].as_array().unwrap();
+    assert_eq!(links.len(), 2);
+    for link in links {
+        assert_eq!(link["name"], "Trailer");
+        assert_eq!(link["category"], "Trailer");
+        assert_eq!(link["provider"], "Den Reel");
+        assert!(link.get("trailers").is_none());
+        assert!(link.get("sources").is_none());
+        let plan_url = link["planUrl"].as_str().unwrap();
+        assert!(plan_url.contains("?s="), "the signed source base was lost: {plan_url}");
+        assert!(plan_url.contains("&i=AAAAAAAAAAAAAAAAAAAAAA&e=7&v=2"), "{plan_url}");
+        assert!(
+            plan_url.ends_with(
+                "&surface=silent&player=hls.js&intent=play&playable=%7B%22h264%22%3A51%7D"
+            ),
+            "{plan_url}"
+        );
+    }
+    assert_eq!(body["primary"]["planUrl"], links[0]["planUrl"]);
+
+    let plan_url = body["primary"]["planUrl"].as_str().unwrap();
+    let plan_query = plan_url.split_once('?').unwrap().1;
+    let source_response = crate::sources::handle_sources(
+        state.clone(),
+        &headers,
+        "dQw4w9WgXcQ".into(),
+        plan_query,
+    )
+    .await;
+    assert_eq!(source_response.status(), 200);
+    assert_eq!(direct_body(source_response).await, body["primaryPlan"]);
+
+    let empty = build_state(
+        temp_dir(),
+        Box::new(FakeUpstream::new(&[], None)),
+        always_playable(),
+        noop_prewarm(),
+    );
+    let empty = direct_body(
+        crate::prepare::handle_prepare(
+            &empty,
+            &hyper::HeaderMap::new(),
+            None,
+            "movie",
+            "tt0111161",
+            "v=2&surface=audible&player=native&intent=play",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(empty["v"], 2);
+    assert!(empty["primary"].is_null() && empty["primaryPlan"].is_null());
+    assert!(empty.get("sources").is_none(), "an invalid primary emitted fallback capabilities");
+}
+
 #[tokio::test]
 async fn prepare_play_keeps_sources_semantics_and_an_empty_result_is_complete() {
     let dir = temp_dir();
@@ -4217,6 +4318,7 @@ async fn prepare_rejects_the_ask_before_discovery() {
         "surface=wrong&player=native&intent=warm",
         "surface=audible&player=wrong&intent=warm",
         "surface=audible&player=native&intent=wrong",
+        "v=7&surface=audible&player=native&intent=warm",
     ] {
         let response = crate::prepare::handle_prepare(
             &state,
@@ -4318,6 +4420,20 @@ async fn prepare_keeps_alternates_when_the_primary_source_prep_fails() {
         json!({ "reason": "primary_unavailable", "status": 503, "retryAfter": retry_after })
     );
     assert_eq!(body["sources"], json!([]));
+
+    let response = crate::prepare::handle_prepare(
+        &state,
+        &hyper::HeaderMap::new(),
+        None,
+        "movie",
+        "tt0111161",
+        "v=2&surface=audible&player=native&intent=play",
+    )
+    .await;
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert!(body["primaryPlan"].is_null());
+    assert!(body.get("sources").is_none(), "a failed primary emitted fallback capabilities");
 }
 
 #[tokio::test]
@@ -4692,6 +4808,89 @@ async fn sources_list_the_forms_a_surface_should_try_in_order() {
         crate::sign::Binding::Unbound,
     );
     assert_eq!(meta["meta"]["links"][0]["sources"], "https://t.example/sources/dQw4w9WgXcQ.json");
+}
+
+/// v2 is a logical plan: delivery is an explicit tagged union, Reel capabilities are opaque, and
+/// the slow downloaded file is a normal final fallback rather than a client-derived URL.
+#[tokio::test]
+async fn sources_v2_is_explicit_and_ends_with_a_download_capability() {
+    let dir = temp_dir();
+    let (yt, _runs) = fake_resolver(
+        &dir,
+        "yt-sources-v2",
+        "printf '1280 720\n\
+         https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000\n\
+         https://rr7.googlevideo.com/videoplayback?itag=140&expire=4000000000\n'",
+    );
+    let state = direct_state(&dir, yt);
+    let response = crate::sources::handle_sources(
+        state.clone(),
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=2&surface=silent&player=hls.js",
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body = direct_body(response).await;
+    assert_eq!(body["v"], 2);
+    assert_eq!(
+        body.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+        ["crop", "expires", "sources", "v"].into_iter().collect()
+    );
+
+    let sources = body["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 4, "external, progressive, HLS, then downloaded fallback");
+    for source in sources {
+        assert_eq!(
+            source.as_object().unwrap().keys().map(String::as_str).collect::<std::collections::BTreeSet<_>>(),
+            ["audio", "delivery", "height", "kind", "width"].into_iter().collect()
+        );
+    }
+    assert_eq!(
+        sources[0]["delivery"],
+        json!({
+            "type": "external",
+            "url": "https://rr7.googlevideo.com/videoplayback?itag=136&expire=4000000000",
+        })
+    );
+    assert!(sources[0].get("url").is_none(), "delivery must not be inferred from a legacy source URL");
+    for source in &sources[1..] {
+        assert_eq!(source["delivery"]["type"], "reel");
+        assert!(source.get("url").is_none());
+        assert!(source["delivery"]["capability"].as_str().unwrap().starts_with("m/"));
+    }
+
+    let last = sources.last().unwrap();
+    assert_eq!((last["kind"].as_str(), last["audio"].as_bool()), (Some("mp4"), Some(true)));
+    let capability = last["delivery"]["capability"].as_str().unwrap();
+    let rest = capability.strip_prefix("m/s/").unwrap();
+    let (blob, tag) = rest.split_once('?').unwrap_or((rest, ""));
+    let signature = crate::httputil::query_param(tag, "s");
+    let media = crate::sources::unseal(None, &[], blob, signature.as_deref()).unwrap();
+    assert_eq!(media.f, "d");
+    assert!(media.a && media.h.is_none() && !media.n && media.p.is_none());
+
+    let legacy = crate::sources::handle_sources(
+        state.clone(),
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=1&surface=silent&player=hls.js",
+    )
+    .await;
+    let legacy = direct_body(legacy).await;
+    assert_eq!(legacy["id"], "dQw4w9WgXcQ");
+    assert_eq!(legacy["sources"].as_array().unwrap().len(), 3);
+    assert!(legacy["sources"][0].get("url").is_some());
+    assert!(legacy["sources"][0].get("delivery").is_none());
+
+    let invalid = crate::sources::handle_sources(
+        state,
+        &hyper::HeaderMap::new(),
+        "dQw4w9WgXcQ".into(),
+        "v=7&surface=silent&player=hls.js",
+    )
+    .await;
+    assert_eq!(invalid.status(), 400, "unknown contract versions must not silently become v1");
 }
 
 /// A built index survives a redeploy, so the first open after one does not pay to build it again.
@@ -5102,6 +5301,31 @@ fn direct_media_validation_is_signed_expiring_and_revocable() {
     let good = make(&state, hls, Some(&signer));
     assert_eq!(good.status(), 204);
     assert_eq!(good.headers()["x-den-media-form"], "hls-proxy");
+
+    let downloaded = crate::sources::Media {
+        f: "d".into(),
+        h: None,
+        a: true,
+        n: false,
+        p: None,
+        ..progressive(4_000_000_000)
+    };
+    let good = make(&state, downloaded, Some(&signer));
+    assert_eq!(good.status(), 204);
+    assert_eq!(good.headers()["x-den-media-form"], "download");
+    for malformed in [
+        crate::sources::Media { f: "d".into(), a: false, ..progressive(4_000_000_000) },
+        crate::sources::Media { f: "d".into(), a: true, h: Some(720), ..progressive(4_000_000_000) },
+        crate::sources::Media { f: "d".into(), a: true, n: true, ..progressive(4_000_000_000) },
+        crate::sources::Media {
+            f: "d".into(),
+            a: true,
+            p: Some("report".into()),
+            ..progressive(4_000_000_000)
+        },
+    ] {
+        assert_eq!(make(&state, malformed, Some(&signer)).status(), 403);
+    }
     assert_eq!(make(&state, progressive(1), Some(&signer)).status(), 410, "expired");
     assert_eq!(make(&state, progressive(4_000_000_000), None).status(), 403, "unsigned");
     let forged = crate::sign::Signer::new("not-the-secret");
