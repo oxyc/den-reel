@@ -27,6 +27,7 @@ mod hls;
 mod httputil;
 mod media_gate;
 mod play;
+mod prepare;
 mod progressive;
 mod seal;
 mod sign;
@@ -582,7 +583,8 @@ fn request_line(
 /// detail page opening and a press on a title link, and only these tell the two apart. Each is written only as one of
 /// its known values, so nothing a caller wrote reaches the log — and `s`, `i` and `e` never do.
 fn sources_ask(uri: &hyper::Uri) -> Option<String> {
-    if !uri.path().starts_with("/sources/") {
+    let prepare = uri.path().starts_with("/prepare/") || uri.path().contains("/prepare/");
+    if !uri.path().starts_with("/sources/") && !prepare {
         return None;
     }
     let query = uri.query().unwrap_or("");
@@ -590,7 +592,8 @@ fn sources_ask(uri: &hyper::Uri) -> Option<String> {
         query_param(query, key).and_then(|v| values.into_iter().find(|known| *known == v)).unwrap_or("?")
     };
     let mut ask = format!(
-        "surface={} player={}",
+        "{}surface={} player={}",
+        if prepare { "prepare " } else { "" },
         known("surface", ["silent", "audible"]),
         known("player", ["native", "hls.js"])
     );
@@ -623,7 +626,7 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
     if path.starts_with("/_internal/validate/m/s/") {
         return "/_internal/validate/m/s/<cap>".into();
     }
-    const ROUTES: [&str; 15] = [
+    const ROUTES: [&str; 16] = [
         "",
         "health",
         "metrics",
@@ -631,6 +634,7 @@ fn redact_path(path: &str) -> std::borrow::Cow<'_, str> {
         "configure",
         "config-key",
         "meta",
+        "prepare",
         "crop",
         "play",
         "direct",
@@ -740,12 +744,19 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
             return resp;
         }
     }
+    // Combined discovery + source ladder for latency-sensitive web clients. This mints capabilities
+    // but does not activate any listener; the edge that observed the client owns that decision.
+    if let Some(rest) = path.strip_prefix("/prepare/") {
+        if let Some(resp) = prepare_from_rest(&state, &parts.headers, None, rest, query).await {
+            return resp;
+        }
+    }
 
     // Config-scoped discovery: /<config>/manifest.json and /<config>/meta/(movie|series)/(.+).json,
     // where <config> carries a BYOK TMDB key (sealed or legacy plaintext). The app pastes the manifest
     // URL; Stremio then derives the /meta calls from the same base. Fail CLOSED on a bad config.
     if let Some((cfg_seg, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) {
-        if rest == "manifest.json" || rest.starts_with("meta/") {
+        if rest == "manifest.json" || rest.starts_with("meta/") || rest.starts_with("prepare/") {
             let cfg = match userconfig::decode_checked(
                 state.config_keyring.as_ref(),
                 &state.cfg.revocation,
@@ -778,6 +789,14 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
                     &addon::manifest(cfg.iid.as_deref()),
                     &[("cache-control", "private, max-age=3600, stale-while-revalidate=600")],
                 );
+            }
+            if let Some(prepare_rest) = rest.strip_prefix("prepare/") {
+                if let Some(resp) =
+                    prepare_from_rest(&state, &parts.headers, Some(&cfg), prepare_rest, query).await
+                {
+                    return resp;
+                }
+                return httputil::not_found();
             }
             let meta_rest = &rest["meta/".len()..];
             if let Some(resp) = meta_from_rest(&state, &parts.headers, Some(&cfg), meta_rest, query).await {
@@ -1049,6 +1068,24 @@ async fn meta_from_rest(
     if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
         let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
         return Some(addon::handle_meta(state, headers, cfg, seg, &raw, query).await);
+    }
+    None
+}
+
+/// Parse `<movie|series>/<id>.json` (the part after `prepare/`) and dispatch to the combined
+/// preparation handler. Kept beside `meta_from_rest` so both legacy and config-scoped routes accept
+/// exactly the same title path shape.
+async fn prepare_from_rest(
+    state: &Arc<AppState>,
+    headers: &hyper::HeaderMap,
+    cfg: Option<&userconfig::UserConfig>,
+    rest: &str,
+    query: &str,
+) -> Option<Response<Body>> {
+    let (seg, tail) = rest.split_once('/')?;
+    if (seg == "movie" || seg == "series") && tail.ends_with(".json") && tail.len() > 5 {
+        let raw = httputil::percent_decode(&tail[..tail.len() - 5]);
+        return Some(prepare::handle_prepare(state, headers, cfg, seg, &raw, query).await);
     }
     None
 }
