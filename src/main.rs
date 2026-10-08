@@ -874,7 +874,8 @@ async fn route(state: Arc<AppState>, parts: &hyper::http::request::Parts) -> Res
     }
 
     // media: /m/<n|s>/<blob> → a form /sources minted. The blob carries its own tag, expiry and install;
-    // the segment says whether it is a native master, whose segments this box never carries.
+    // the segment says whether it is a native master, whose segments this box never carries. V2 also
+    // carries the final downloaded-file fallback here as form d, so a client never derives /play.
     if let Some((filed, blob)) = path.strip_prefix("/m/").and_then(|r| r.split_once('/')) {
         if matches!(filed, "n" | "s") {
             return sources::handle_media(state, &parts.headers, filed, blob, query).await;

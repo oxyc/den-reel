@@ -28,7 +28,7 @@ use base64::Engine;
 use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::httputil::{self, query_param, Body};
 use crate::state::AppState;
@@ -56,6 +56,51 @@ const SILENT_HEIGHT: &str = "720";
 /// task of its own, so the index still finishes and the next ask leads with it. Set against what the wait buys
 /// — a master measured in production at 1136–2704 ms, and 2850–4101 ms on iOS — a quarter second is cheap.
 const INDEX_LEAD_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The source-list wire contract. Absence (and explicit `v=1`) preserves the deployed response;
+/// `v=2` opts into a logical plan whose delivery mode is data, never inferred from a URL.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Contract {
+    V1,
+    V2,
+}
+
+pub(crate) fn contract(query: &str) -> Result<Contract, &'static str> {
+    match query_param(query, "v").as_deref() {
+        None | Some("1") => Ok(Contract::V1),
+        Some("2") => Ok(Contract::V2),
+        Some(_) => Err("Expected v=1 or 2."),
+    }
+}
+
+/// How a logical source is delivered. A Reel capability is deliberately not a URL: callers hand
+/// the opaque value to their Reel transport, which is responsible for redeeming it at `/m/...`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum Delivery {
+    External { url: String },
+    Reel { capability: String },
+}
+
+/// One ordered source in the v2 plan.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct LogicalSource {
+    pub kind: &'static str,
+    pub audio: bool,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub delivery: Delivery,
+}
+
+/// The complete, versioned playback decision. Both `/sources?v=2` and
+/// `/prepare?v=2` serialize this exact type.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct SourcePlan {
+    pub v: u8,
+    pub expires: u64,
+    pub crop: Option<Value>,
+    pub sources: Vec<LogicalSource>,
+}
 
 /// What a surface needs of its trailer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,6 +239,10 @@ pub(crate) fn segment(media: &Media) -> &'static str {
     }
 }
 
+fn is_downloaded(media: &Media) -> bool {
+    media.f == "d" && media.h.is_none() && media.a && !media.n && media.p.is_none()
+}
+
 /// The path and query of the media URL for `media`, tagged when there is a signer.
 pub(crate) fn seal(signer: Option<&crate::sign::Signer>, media: &Media) -> String {
     let json = serde_json::to_vec(media).unwrap_or_default();
@@ -306,6 +355,7 @@ pub fn validate_direct_capability(state: &AppState, blob: &str, query: &str) -> 
     let form = match media.f.as_str() {
         "p" if !media.n && media.p.is_none() => "progressive",
         "h" if !media.n && media.h.is_none() && !media.a => "hls-proxy",
+        "d" if is_downloaded(&media) => "download",
         _ => return refused(),
     };
     Response::builder()
@@ -338,8 +388,12 @@ pub async fn handle_sources(
     vid: String,
     query: &str,
 ) -> Response<Body> {
+    let contract = match contract(query) {
+        Ok(contract) => contract,
+        Err(detail) => return httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail),
+    };
     match prepare_sources(state, headers, vid, query, None, false, true).await {
-        Ok(prepared) => prepared.response(),
+        Ok(prepared) => prepared.response(contract),
         Err(error) => *error,
     }
 }
@@ -357,6 +411,8 @@ pub(crate) async fn prepare_sources(
     cheap_warm: bool,
     start_warm_resolve: bool,
 ) -> Result<PreparedSources, Box<Response<Body>>> {
+    let contract = contract(query)
+        .map_err(|detail| Box::new(httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)))?;
     let (surface, player) = parse_ask(query)
         .map_err(|detail| Box::new(httputil::error(StatusCode::BAD_REQUEST, "bad_request", detail)))?;
     // `intent=warm`: asked because a viewer might open the trailer, not because a surface is about to play it.
@@ -534,14 +590,6 @@ pub(crate) async fn prepare_sources(
     };
     let report = crate::client::raw_report(headers, query);
     let expires = now / 1000 + MEDIA_TTL_SECS;
-    let media_url = |f: &str, h: Option<u32>, a: bool, n: bool, p: Option<String>| {
-        let media = Media { v: vid.clone(), f: f.into(), h, a, n, p, i: iid.clone(), e: ep, x: expires };
-        // Relative to this answer's own URL, `/sources/<id>.json`, for the reason a proxied playlist's URIs are: this
-        // server is reached at several addresses and under a relay's prefix, and knows neither. A page resolves it
-        // against the URL it asked, which is by definition one it can reach.
-        format!("../{}", seal(signer.as_ref(), &media))
-    };
-
     // The rung whose index this answer is building, for the letterbox below: the progressive form's, which is
     // NOT `first.cap()` on an audible surface — there the first form is the master and names no rung. Read
     // before the loop, which consumes `forms`.
@@ -559,12 +607,12 @@ pub(crate) async fn prepare_sources(
     for form in forms {
         // The frame the resolve picked. Both are null until the resolve is in — which for an audible surface is
         // after this answer — and they describe the rendition, not the letterbox inside it, which is `crop`.
-        let (kind, url, audio, (width, height)) = match form {
+        let (kind, delivery, audio, (width, height)) = match form {
             Form::Google { .. } => {
                 // Only a silent surface lists it, and that always has its resolve.
                 let Some(d) = &direct else { continue };
                 soonest = soonest.min(d.expires);
-                ("mp4", d.video.clone(), false, (d.width, d.height))
+                ("mp4", Delivery::External { url: d.video.clone() }, false, (d.width, d.height))
             }
             Form::Progressive { cap, audio } => {
                 // Only when this form plays from the resolve in hand. An audible surface's fallback asks for
@@ -573,17 +621,85 @@ pub(crate) async fn prepare_sources(
                 // that needs them has `requestVideoFrameCallback`.
                 let frame = direct.as_ref().filter(|_| cap == first.cap());
                 let frame = (frame.and_then(|d| d.width), frame.and_then(|d| d.height));
-                ("mp4", media_url("p", cap, audio, false, None), audio, frame)
+                (
+                    "mp4",
+                    Delivery::Reel {
+                        capability: seal(
+                            signer.as_ref(),
+                            &Media {
+                                v: vid.clone(),
+                                f: "p".into(),
+                                h: cap,
+                                a: audio,
+                                n: false,
+                                p: None,
+                                i: iid.clone(),
+                                e: ep,
+                                x: expires,
+                            },
+                        ),
+                    },
+                    audio,
+                    frame,
+                )
             }
-            Form::Hls { native } => {
-                ("hls", media_url("h", None, false, native, report.clone()), true, (None, None))
-            }
+            Form::Hls { native } => (
+                "hls",
+                Delivery::Reel {
+                    capability: seal(
+                        signer.as_ref(),
+                        &Media {
+                            v: vid.clone(),
+                            f: "h".into(),
+                            h: None,
+                            a: false,
+                            n: native,
+                            p: report.clone(),
+                            i: iid.clone(),
+                            e: ep,
+                            x: expires,
+                        },
+                    ),
+                },
+                true,
+                (None, None),
+            ),
         };
         // Never the same URL twice: a step to the URL already playing starts no load and fires no error.
-        if seen.insert(url.clone()) {
-            sources
-                .push(json!({ "kind": kind, "url": url, "audio": audio, "width": width, "height": height }));
+        let identity = match &delivery {
+            Delivery::External { url } => url,
+            Delivery::Reel { capability } => capability,
+        };
+        if seen.insert(identity.clone()) {
+            sources.push(LogicalSource { kind, delivery, audio, width, height });
         }
+    }
+
+    // v2 owns the complete fallback order. The downloaded file is therefore an ordinary final source,
+    // protected by the same short-lived media capability as every other Reel-delivered source. V1 keeps
+    // its deployed contract, whose clients append `/play` themselves.
+    if contract == Contract::V2 {
+        let capability = seal(
+            signer.as_ref(),
+            &Media {
+                v: vid.clone(),
+                f: "d".into(),
+                h: None,
+                a: true,
+                n: false,
+                p: None,
+                i: iid,
+                e: ep,
+                x: expires,
+            },
+        );
+        sources.push(LogicalSource {
+            kind: "mp4",
+            audio: true,
+            width: None,
+            height: None,
+            delivery: Delivery::Reel { capability },
+        });
     }
 
     // The letterbox, when it is known. Nothing here waits for it: an unmeasured trailer is measured from its
@@ -609,24 +725,57 @@ pub(crate) async fn prepare_sources(
         // likely to be known minutes later.
         None => UNRESOLVED_MAX_AGE_SECS,
     };
-    let body = json!({ "id": vid, "sources": sources, "crop": crop, "expires": soonest / 1000 });
-    Ok(PreparedSources { body, timing, max_age })
+    let plan = SourcePlan { v: 2, sources, crop, expires: soonest / 1000 };
+    Ok(PreparedSources { id: vid, plan, timing, max_age })
 }
 
 /// A source ladder before its HTTP envelope. Keeping the cache lifetime and timing beside the body
 /// lets `/sources` retain its wire contract while `/prepare` embeds the same answer verbatim.
 pub(crate) struct PreparedSources {
-    pub body: serde_json::Value,
+    id: String,
+    pub plan: SourcePlan,
     pub timing: String,
     pub max_age: u64,
 }
 
 impl PreparedSources {
-    fn response(self) -> Response<Body> {
+    pub fn body(&self, contract: Contract) -> Value {
+        match contract {
+            Contract::V2 => serde_json::to_value(&self.plan).unwrap_or_else(|_| json!({})),
+            Contract::V1 => {
+                let sources: Vec<Value> = self
+                    .plan
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        let url = match &source.delivery {
+                            Delivery::External { url } => url.clone(),
+                            Delivery::Reel { capability } => format!("../{capability}"),
+                        };
+                        json!({
+                            "kind": source.kind,
+                            "url": url,
+                            "audio": source.audio,
+                            "width": source.width,
+                            "height": source.height,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "id": self.id,
+                    "sources": sources,
+                    "crop": self.plan.crop,
+                    "expires": self.plan.expires,
+                })
+            }
+        }
+    }
+
+    fn response(self, contract: Contract) -> Response<Body> {
         let cache = format!("private, max-age={}", self.max_age);
         let resp = httputil::json(
             StatusCode::OK,
-            &self.body,
+            &self.body(contract),
             &[("cache-control", &cache), ("vary", crate::client::HEADER)],
         );
         httputil::timed(resp, &self.timing)
@@ -665,6 +814,7 @@ pub async fn handle_media(
             let playable = media.p.as_deref().and_then(crate::client::parse);
             crate::hls::handle_master(state, media.v, uris, playable).await
         }
+        "d" if is_downloaded(&media) => crate::play::handle_play(state, headers, media.v).await,
         _ => httputil::not_found(),
     };
     match lease {
@@ -786,5 +936,19 @@ mod tests {
             Some(media()),
             "unsigned where no secret is set"
         );
+    }
+
+    #[test]
+    fn a_download_capability_has_one_exact_shape() {
+        let downloaded = Media { f: "d".into(), h: None, a: true, n: false, p: None, ..media() };
+        assert!(is_downloaded(&downloaded));
+        assert!(!is_downloaded(&Media { a: false, ..downloaded }));
+
+        let downloaded = Media { f: "d".into(), h: None, a: true, n: false, p: None, ..media() };
+        assert!(!is_downloaded(&Media { h: Some(720), ..downloaded }));
+        let downloaded = Media { f: "d".into(), h: None, a: true, n: false, p: None, ..media() };
+        assert!(!is_downloaded(&Media { n: true, ..downloaded }));
+        let downloaded = Media { f: "d".into(), h: None, a: true, n: false, p: None, ..media() };
+        assert!(!is_downloaded(&Media { p: Some("report".into()), ..downloaded }));
     }
 }
