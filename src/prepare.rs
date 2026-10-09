@@ -196,9 +196,7 @@ fn add_plan_urls(meta: &mut Value, query: &str) {
     let player = query_param(query, "player").unwrap_or_default();
     let plan_params = query
         .split('&')
-        .filter(|part| {
-            part.split_once('=').is_some_and(|(key, _)| key == "height" || key == "playable")
-        })
+        .filter(|part| part.split_once('=').is_some_and(|(key, _)| key == "height" || key == "playable"))
         .fold(String::new(), |mut params, value| {
             params.push('&');
             params.push_str(value);

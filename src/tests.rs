@@ -4162,8 +4162,7 @@ async fn prepare_v2_embeds_the_source_plan_and_names_every_alternate_plan() {
     };
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", "reel.example".parse().unwrap());
-    let query =
-        "v=2&surface=silent&player=hls.js&intent=play&height=540&playable=%7B%22h264%22%3A51%7D";
+    let query = "v=2&surface=silent&player=hls.js&intent=play&height=540&playable=%7B%22h264%22%3A51%7D";
     let response =
         crate::prepare::handle_prepare(&state, &headers, Some(&install), "movie", "tt0111161", query).await;
     assert_eq!(response.status(), 200);
