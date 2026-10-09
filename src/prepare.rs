@@ -194,8 +194,16 @@ pub async fn handle_prepare(
 fn add_plan_urls(meta: &mut Value, query: &str) {
     let surface = query_param(query, "surface").unwrap_or_default();
     let player = query_param(query, "player").unwrap_or_default();
-    let playable =
-        query.split('&').find(|part| part.split_once('=').is_some_and(|(key, _)| key == "playable"));
+    let plan_params = query
+        .split('&')
+        .filter(|part| {
+            part.split_once('=').is_some_and(|(key, _)| key == "height" || key == "playable")
+        })
+        .fold(String::new(), |mut params, value| {
+            params.push('&');
+            params.push_str(value);
+            params
+        });
     let Some(links) = meta["meta"]["links"].as_array_mut() else {
         return;
     };
@@ -207,9 +215,8 @@ fn add_plan_urls(meta: &mut Value, query: &str) {
             continue;
         };
         let separator = if base.contains('?') { '&' } else { '?' };
-        let playable = playable.map(|value| format!("&{value}")).unwrap_or_default();
         let plan_url =
-            format!("{base}{separator}v=2&surface={surface}&player={player}&intent=play{playable}");
+            format!("{base}{separator}v=2&surface={surface}&player={player}&intent=play{plan_params}");
         link.remove("trailers");
         link.remove("sources");
         link.insert("planUrl".into(), Value::String(plan_url));
