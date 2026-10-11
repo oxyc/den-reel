@@ -890,8 +890,9 @@ pub(crate) static RANGES_RETRIED: std::sync::atomic::AtomicU64 = std::sync::atom
 ///
 /// A 401, 429 or 5xx is asked again after `REFUSED_BACKOFF`: googlevideo refuses a burst of ranges for a moment
 /// — 17 of 29 in one build measured on 2026-09-15 — and answers the same URL shortly after, and one refused
-/// range would otherwise throw away a build every other range of which worked. A 403 is not: that is a URL
-/// that has expired, which asking again does not change. A `Retry-After` is kept to when it asks for no longer
+/// range would otherwise throw away a build every other range of which worked. A 403 is not: asking the same
+/// URL again does not change it (measured 2026-10-11 on a URL capped at ~60 s of media, see
+/// `direct::refuses_its_end`). A `Retry-After` is kept to when it asks for no longer
 /// than the longest wait here, and given up on when it asks for more: a viewer is waiting on the build.
 async fn fetch(http: &reqwest::Client, url: &str, from: u64, to: u64) -> Result<Bytes, Unbuilt> {
     let fault = |why: String| Unbuilt { why, retry: true };
@@ -956,7 +957,7 @@ async fn read_source(http: &reqwest::Client, url: String) -> Result<IndexedSourc
 /// One unescaped decimal query value, rejecting duplicates. These three fields are emitted by
 /// googlevideo for adaptive files. Being deliberately strict makes an unfamiliar URL shape miss
 /// this optimisation rather than weakening the identity check.
-fn media_param(url: &str, wanted: &str) -> Option<String> {
+pub(crate) fn media_param(url: &str, wanted: &str) -> Option<String> {
     let query = url.split_once('?')?.1.split('#').next()?;
     let mut found = None;
     for pair in query.split('&') {

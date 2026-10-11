@@ -240,6 +240,50 @@ pub async fn resolve(cfg: &Config, vid: &str, format: &str, now: u64) -> Result<
     })
 }
 
+/// Does googlevideo refuse the last byte of this URL's file?
+///
+/// Measured on the box on 2026-10-11 (yt-dlp 2026.08.19, `visionos`, no PO token): 3 of 13 extractions
+/// answered with URLs that serve only the start of the file. On one, every range up to byte 14.50 MB
+/// served and every range from 14.60 MB on was a 403 — about 60 s of media at that file's average
+/// bitrate — and the same ranges were still refused ten minutes later, while a fresh extraction of
+/// the same video served to the end (2 of 2 videos re-extracted). Both streams of a capped extraction
+/// were capped (2 of 2 checked), so the video is enough to ask about. Every capped extraction's URLs also carried `52227522` in `fexp` and no
+/// uncapped one did; what that flag means is not known, so this asks googlevideo instead of reading it.
+///
+/// Anything but a 403 — a URL with no `clen`, a network error — counts as not capped: this only ever
+/// spends one more extraction, it never refuses an answer.
+pub(crate) async fn refuses_its_end(http: &reqwest::Client, url: &str) -> bool {
+    let Some(last) = crate::progressive::media_param(url, "clen")
+        .and_then(|c| c.parse::<u64>().ok())
+        .and_then(|c| c.checked_sub(1))
+    else {
+        return false;
+    };
+    let asked = http
+        .get(url)
+        .header(hyper::header::RANGE.as_str(), format!("bytes={last}-{last}"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    matches!(asked, Ok(res) if res.status() == reqwest::StatusCode::FORBIDDEN)
+}
+
+/// One extraction: the resident worker first, and the binary whenever it cannot answer — which is
+/// every way it can fail, including not being configured at all.
+async fn extract(st: &AppState, vid: &str, format: &str) -> Result<Direct, PlayError> {
+    match st.worker.resolve(&st.cfg, vid, format).await {
+        Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
+            status: 502,
+            reason: "no_direct_url".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail: "the resident yt-dlp answered with no usable URL".into(),
+        }),
+        // Its own words about this video, classified exactly as the binary's stderr is.
+        Some(Err(said)) => Err(classify(None, &said)),
+        None => resolve(&st.cfg, vid, format, (st.clock)()).await,
+    }
+}
+
 /// The rung a request's `?height=` caps the answer at, or `None` for the full `MAX_HEIGHT` ladder.
 ///
 /// A muted preview behind text has no use for 1080p, and Safari will not say it can play through
@@ -392,19 +436,23 @@ pub(crate) async fn answer(
                     // rather than on the budget: one permit is spent per video, not per caller.
                     let _permit = st.probe_sem.acquire().await;
                     let started = std::time::Instant::now();
-                    // The resident worker first, and the binary whenever it cannot answer — which is
-                    // every way it can fail, including not being configured at all.
-                    let answer = match st.worker.resolve(&st.cfg, &v, &format).await {
-                        Some(Ok(spoken)) => from_worker(spoken, (st.clock)()).ok_or_else(|| PlayError {
-                            status: 502,
-                            reason: "no_direct_url".into(),
-                            message: "Could not fetch this trailer.".into(),
-                            detail: "the resident yt-dlp answered with no usable URL".into(),
-                        }),
-                        // Its own words about this video, classified exactly as the binary's stderr is.
-                        Some(Err(said)) => Err(classify(None, &said)),
-                        None => resolve(&st.cfg, &v, &format, (st.clock)()).await,
-                    };
+                    let mut answer = extract(&st, &v, &format).await;
+                    // A capped extraction stays capped for its URLs' whole six hours, and a fresh one
+                    // usually is not (`refuses_its_end`), so it is worth one more — once, so a video
+                    // that is capped every time still plays its first minute rather than nothing.
+                    if let Ok(d) = &answer {
+                        if refuses_its_end(&st.http, &d.video).await {
+                            let again = extract(&st, &v, &format).await;
+                            let still = match &again {
+                                Ok(d) => refuses_its_end(&st.http, &d.video).await.to_string(),
+                                Err(e) => e.reason.clone(),
+                            };
+                            eprintln!("[{v}] googlevideo refused the end of the resolved file; resolved again (still capped: {still})");
+                            if again.is_ok() {
+                                answer = again;
+                            }
+                        }
+                    }
                     st.resolves.record(started.elapsed());
                     // Once per resolve that actually ran, however many requests join it — the cache
                     // fill itself, not a line per joiner.

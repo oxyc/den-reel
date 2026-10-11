@@ -4596,6 +4596,89 @@ async fn direct_answers_the_urls_and_resolves_each_id_once() {
     assert_eq!(spawn_count(&runs), 1, "the same id was resolved twice inside its own expiry");
 }
 
+/// googlevideo on 127.0.0.1: a 403 for any path containing `capped`, as a capped extraction's URL
+/// answers for a range past its first minute, and one byte of 206 otherwise.
+async fn serve_capped_or_whole() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+                let answer: &[u8] = if line.contains("capped") {
+                    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 99-99/100\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx"
+                };
+                let _ = sock.write_all(answer).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    base
+}
+
+/// A resident worker (run by `sh`, standing in for the interpreter) answering its first `capped`
+/// extractions with a URL `serve_capped_or_whole` refuses the end of, and a whole one after. Counts
+/// its extractions. The worker, because the binary's printed answer only takes `https://` lines.
+fn capped_worker_state(dir: &std::path::Path, base: &str, capped: usize) -> (Arc<AppState>, PathBuf) {
+    let runs = dir.join("worker-runs");
+    let script = dir.join("worker.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "while read -r line; do\necho x >> {runs}\n\
+             if [ $(wc -l < {runs}) -le {capped} ]; then kind=capped; else kind=whole; fi\n\
+             echo \"{{\\\"ok\\\": true, \\\"width\\\": 1920, \\\"height\\\": 1080, \\\"urls\\\": \
+             [\\\"{base}/$kind?itag=137&clen=100&expire=4000000000\\\"], \\\"hls\\\": null}}\"\ndone\n",
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+    let mut cfg = test_cfg(dir.to_path_buf());
+    cfg.python = "sh".into();
+    cfg.ytdlp_worker = Some(script.to_string_lossy().into_owned());
+    let state =
+        build_state_cfg(cfg, Box::new(FakeUpstream::new(&[], None)), always_playable(), noop_prewarm());
+    (state, runs)
+}
+
+/// About one extraction in four answered with URLs googlevideo refuses past ~60 s of media, for the URLs'
+/// whole life, while the next extraction of the same video served to the end (measured 2026-10-11). Such
+/// an answer must not be the one cached and handed out for six hours: it is resolved once more.
+#[tokio::test]
+async fn a_resolve_whose_end_is_refused_is_resolved_once_more() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (state, runs) = capped_worker_state(&dir, &base, 1);
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    let video = answer.expect("the second extraction answered").video;
+    assert!(video.contains("/whole?"), "the capped URL was kept: {video}");
+    assert_eq!(spawn_count(&runs), 2);
+
+    // The standing answer is the whole one, so nothing is extracted again.
+    let (again, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(again.unwrap().video.contains("/whole?"));
+    assert_eq!(spawn_count(&runs), 2);
+}
+
+/// Capped every time is still a trailer's first minute, so the second answer is served — and there is
+/// no third extraction.
+#[tokio::test]
+async fn a_resolve_capped_twice_is_served_after_one_retry() {
+    let dir = temp_dir();
+    let base = serve_capped_or_whole().await;
+    let (state, runs) = capped_worker_state(&dir, &base, 5);
+
+    let (answer, _) = crate::direct::answer(&state, "dQw4w9WgXcQ", None).await;
+    assert!(answer.is_ok(), "a capped answer is still an answer: {answer:?}");
+    assert_eq!(spawn_count(&runs), 2, "retried more than once, or not at all");
+}
+
 /// `?height=` lands on a step of the ladder, so a caller cannot make one video resolve once per
 /// number, and it never reaches past `MAX_HEIGHT`.
 #[test]
@@ -5692,6 +5775,56 @@ async fn a_non_utf8_byte_does_not_discard_the_whole_error() {
         .expect_err("the fake exits 1");
 
     assert_eq!(err.status, 451, "a geo-block was misclassified: {err:?}");
+}
+
+/// A fake yt-dlp that fails the way a capped extraction does — `HTTP Error 403` part-way — for its
+/// first `capped` runs, then writes the file. Counts its runs.
+fn fake_capped_download(dir: &std::path::Path, capped: usize) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let runs = dir.join("download-runs");
+    let fake = dir.join("ytdlp-capped");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho x >> {runs}\n\
+             if [ $(wc -l < {runs}) -le {capped} ]; then\n\
+             echo 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2\nexit 1\nfi\n\
+             out=\"\"; prev=\"\"\nfor a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; prev=\"$a\"; done\n\
+             head -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+            runs = runs.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (fake.to_string_lossy().into_owned(), runs)
+}
+
+/// 2 of 8 hand-run downloads on 2026-10-11 died part-way on a googlevideo 403, and the extraction behind
+/// such a 403 stays refused while the next one usually serves. Each yt-dlp run extracts afresh, so one
+/// more run is the retry.
+#[tokio::test]
+async fn a_download_refused_part_way_is_run_once_more() {
+    let dir = temp_dir();
+    let (fake, runs) = fake_capped_download(&dir, 1);
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake;
+    crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect("the second run wrote the file");
+    assert_eq!(spawn_count(&runs), 2);
+}
+
+#[tokio::test]
+async fn a_download_refused_twice_fails_without_a_third_run() {
+    let dir = temp_dir();
+    let (fake, runs) = fake_capped_download(&dir, 5);
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake;
+    let err = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("o.mp4"))
+        .await
+        .expect_err("capped every time");
+    assert_eq!(err.reason, "extraction_failed");
+    assert_eq!(spawn_count(&runs), 2);
 }
 
 /// An ERROR line written after yt-dlp exits — by something holding the inherited pipe — must still

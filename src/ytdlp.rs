@@ -392,7 +392,22 @@ pub fn parse_landscape(s: &str) -> bool {
 /// Run yt-dlp+ffmpeg to produce a faststart MP4 at `tmp`. Returns the format yt-dlp chose iff the
 /// process exited 0 and wrote a non-empty file; otherwise a classified [`PlayError`]. Caller owns
 /// `tmp`'s lifecycle (rename on success, unlink on failure).
+///
+/// A googlevideo 403 part-way through is run once more. Each run extracts afresh, and on 2026-10-11
+/// about one extraction in four (3 of 13) came back with URLs refused past ~60 s of media, refused
+/// again ten minutes later, while the next extraction of the same video served to the end — see
+/// `direct::refuses_its_end`. 2 of 8 hand-run downloads failed that way the same day.
 pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, PlayError> {
+    match download_once(cfg, vid, tmp).await {
+        Err(e) if e.reason == "extraction_failed" && e.detail.contains("HTTP Error 403") => {
+            eprintln!("[{vid}] googlevideo refused part of the download (403); downloading again");
+            download_once(cfg, vid, tmp).await
+        }
+        done => done,
+    }
+}
+
+async fn download_once(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, PlayError> {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
     // Shared so the guard below can reap the group even when the future is dropped mid-flight.
