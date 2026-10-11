@@ -90,8 +90,8 @@ YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the 
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
 yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
 degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
-+ `cargo test` on every push and PR; it publishes `ghcr.io/oxyc/den-reel` on a `v*` tag, and rebuilds
-the newest tag weekly for security fixes (see Deploy).
++ `cargo test` on every push and PR and builds a candidate image on main; a `v*` tag promotes that
+candidate to `ghcr.io/oxyc/den-reel`, and the newest tag is rebuilt weekly for security fixes (see Deploy).
 
 ## Routes
 
@@ -600,16 +600,24 @@ uid 65532 (the image's non-root user), and the cache bind-mounted from `/var/lib
 (owned by 65532). New images reach it through the health-gated `den-update` script. The env files,
 digest pinning and rollback are described once, in that repo's `deploy/README.md`.
 
-**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run
-rebuilds the newest `v*` tag (never `main`) with the base images re-pulled, no build cache and a fresh
-`apt-get upgrade`, and publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian
-security fix — ffmpeg parses every trailer downloaded here — reaches the box between releases, through
-`den-update`'s probe and rollback like any release. It rebuilds the tag's pinned yt-dlp and deno; a newer
-yt-dlp still ships only with a release. Trivy scans each image before `:latest` moves: a CRITICAL with a
-fix available fails the run (on the weekly rebuild only in OS packages, the part a rebuild can fix), and
-fixable HIGH and CRITICAL findings go to code scanning. A finding that does not apply goes in
-`.trivyignore` with a reason. Every image carries SLSA provenance and an SBOM and is signed keylessly with
-cosign; verify a digest with:
+**Release images.** Main CI builds an immutable `:candidate-<sha>` image for every main commit, starts it,
+checks that `/manifest.json` reports the `VERSION` file's release, and scans it with Trivy (a CRITICAL with a
+fix available fails the run; fixable HIGH and CRITICAL findings go to code scanning). Release with
+`scripts/release.sh X.Y.Z`: it commits `VERSION` (and only that — `Cargo.toml` keeps its number, so a release
+never invalidates the Docker dependency layer; the image carries the release as `DEN_VERSION`), waits for that
+commit's own main CI, then tags `vX.Y.Z`. The tag's `docker-publish` run finds that exact successful CI run,
+verifies the candidate digest, signs it, tags it `:X.Y.Z`, `:X.Y`, `:X` and `:sha-<7>` and moves `:latest` —
+it neither compiles nor tests again.
+
+`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) with the
+base images re-pulled, no build cache and a fresh `apt-get upgrade`, scans it (a CRITICAL with a fix
+available fails the run, here only in OS packages, the part a rebuild can fix), and publishes it as
+`:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian security fix — ffmpeg parses every trailer
+downloaded here — reaches the box between releases, through `den-update`'s probe and rollback like any
+release. It rebuilds the tag's pinned yt-dlp and deno; a newer yt-dlp still ships only with a release. If the
+newest tag predates this pipeline (no `VERSION`), the rebuild refuses until one release has been cut from
+current `main`. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries SLSA
+provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
 
 ```bash
 cosign verify \

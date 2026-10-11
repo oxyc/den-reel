@@ -54,7 +54,23 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::httputil::{query_param, Body};
 use crate::state::AppState;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// The release the image carries, from `DEN_VERSION` (set by the Dockerfile from the repo's `VERSION` file).
+/// Keeping it out of Cargo.toml means a release does not change the manifest the dependency layer is keyed on,
+/// so a version bump recompiles nothing. A developer build or a test has no image metadata and falls back to
+/// the package version.
+pub(crate) fn release_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
 
 pub const MAX_PROBE: usize = 6; // cap how many trailer candidates we validate per movie
 pub const SEARCH_MAX: usize = 4; // YouTube-search fallback: how many results to consider (then probe)
@@ -282,7 +298,7 @@ fn metrics_body(state: &AppState) -> String {
     gauge(
         "reel_build_info",
         "The running build.",
-        &[(concat!("version=\"", env!("CARGO_PKG_VERSION"), "\""), 1)],
+        &[(format!("version=\"{}\"", release_version()).as_str(), 1)],
     );
     // The cache figures come from the last eviction pass, not from this request. 0 means no pass has
     // run yet, which on a fresh process lasts until the first download or the first hourly tick.
@@ -1201,7 +1217,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     eprintln!(
         "den-reel {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
          require_iid={} play_signing={} direct_media_max={} env_tmdb_key={} cache={cache_disp} max_height={max_h}",
-        env!("CARGO_PKG_VERSION"),
+        release_version(),
         on(state.cfg.metrics_token.is_some()),
         on(state.cfg.log_requests),
         on(state.config_keyring.is_some()),

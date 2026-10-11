@@ -856,7 +856,7 @@ async fn metrics_reports_the_measured_cache_rather_than_walking_it() {
     assert_eq!(r.headers()["content-type"], "text/plain; version=0.0.4; charset=utf-8");
     let body = r.text().await.unwrap();
     let has = |body: &str, line: &str| body.lines().any(|l| l == line);
-    assert!(has(&body, &format!("reel_build_info{{version=\"{}\"}} 1", env!("CARGO_PKG_VERSION"))));
+    assert!(has(&body, &format!("reel_build_info{{version=\"{}\"}} 1", crate::release_version())));
     // Nothing has measured the volume yet — and /metrics must not be the thing that does, even
     // though there is a trailer sitting right there.
     assert!(has(&body, "reel_cache_measured_at_seconds 0"), "/metrics walked the cache directory itself");

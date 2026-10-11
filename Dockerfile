@@ -11,9 +11,9 @@
 FROM rust:1-trixie AS build
 WORKDIR /src
 # Cache deps: build against the manifests + a dummy main first, so a code-only change re-runs only the
-# final (LTO'd) link of our crate, not the whole dependency compile. In Actions it is rebuilt every
-# release anyway — this stage never took from the GHA build cache, even for its WORKDIR (measured
-# 2026-09-15) — but it holds for a local rebuild, and nothing found makes it hit there.
+# final (LTO'd) link of our crate, not the whole dependency compile. This layer is keyed on Cargo.toml and
+# Cargo.lock alone, which is why neither carries a release number that moves: the version arrives as
+# DEN_VERSION in the runtime stage below, so a release that changes no dependency reuses this layer.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 COPY src ./src
@@ -86,13 +86,23 @@ RUN set -eux; \
       -o /usr/local/lib/yt-dlp.zip; \
     echo "${YTDLP_SHA256_ZIPAPP}  /usr/local/lib/yt-dlp.zip" | sha256sum -c -
 
+# ---- release metadata -----------------------------------------------------
+# The runtime stage copies this marker, so a missing or malformed version fails the build before an image
+# can be pushed. The version only reaches the final image configuration; it invalidates no compile layer.
+FROM debian:trixie-slim AS release-metadata
+ARG DEN_VERSION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
+    printf '%s' "$DEN_VERSION" > /den-version
+
 # ---- runtime --------------------------------------------------------------
 FROM debian:trixie-slim
 
 # ffmpeg (mux/faststart + cropdetect) + ca-certificates (TLS roots). curl/unzip were build-only, so
 # they're gone; MP4Box comes from the build stage below, not apt. `upgrade` first: the slim base is
-# refreshed only every few weeks, and ffmpeg parses untrusted media, so every build (the weekly patch
-# rebuild included) takes the current Debian security fixes rather than the base's.
+# refreshed only every few weeks, and ffmpeg parses untrusted media, so a build takes the Debian security
+# fixes current when this layer was last built. Main CI reuses the layer while the base digest is unchanged;
+# the weekly patch rebuild runs without cache and so always takes the current ones.
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -108,6 +118,14 @@ COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
 COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
 RUN ldconfig
 COPY --from=build /src/target/release/den-reel /usr/local/bin/den-reel
+
+# The release, last: everything above is keyed on content, so this only changes the image configuration.
+ARG DEN_VERSION
+ARG GIT_REVISION
+ENV DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
+COPY --from=release-metadata /den-version /den-version
 
 # Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532), so the box chowns
 # one uid for every writable host dir. A real account rather than a bare number: deno keeps its cache

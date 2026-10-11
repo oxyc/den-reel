@@ -18,9 +18,8 @@ use crate::{MAX_PROBE, STALE_GRACE_MS, YT_CACHE_MAX, YT_FAIL_TTL_MS, YT_NEG_TTL_
 pub fn manifest(install_id: Option<&str>) -> Value {
     let mut manifest = json!({
         "id": "com.den.reel",
-        // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
-        // manifest can't drift from Cargo.toml, nor the tag from either.
-        "version": env!("CARGO_PKG_VERSION"),
+        // The release the image carries (the VERSION file, which docker-publish asserts == the v* tag).
+        "version": crate::release_version(),
         "name": "Den Reel",
         "description": "Direct-URL trailers (TMDB/KinoCheck → yt-dlp service) for inline playback.",
         "resources": ["meta"],

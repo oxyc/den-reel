@@ -1,5 +1,7 @@
 [package]
 name = "den-reel"
+# Not the release number: that is the VERSION file, which the image carries as DEN_VERSION. This stays put so a
+# release does not change the manifest the Docker dependency layer is keyed on. The fallback for dev builds.
 version = "0.56.0"
 edition = "2021"
 description = "Den trailers, one container: addon (imdb→ytId via TMDB) + yt-dlp/ffmpeg proxy (ytId→faststart MP4) for inline tvOS playback"

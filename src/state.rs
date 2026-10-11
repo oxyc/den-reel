@@ -193,7 +193,7 @@ impl AppState {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             // Named, so an upstream operator reading their logs can tell who is calling.
-            .user_agent(concat!("den-reel/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("den-reel/{}", crate::release_version()))
             .build()
             .expect("reqwest client");
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http.clone()));
