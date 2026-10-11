@@ -422,6 +422,9 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<Format, 
             // once per video, well before the download itself writes anything to stdout.
             "--print",
             "%(format_id)s|%(height)s|%(vcodec)s|%(acodec)s",
+            // `--print` implies `--simulate`. Without this the download exited 0 having written
+            // nothing — every fresh trailer, measured on the box with yt-dlp 2026.08.19.
+            "--no-simulate",
             "-o",
             &tmp_s,
             &watch_url(vid),

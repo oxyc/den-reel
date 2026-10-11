@@ -5639,6 +5639,36 @@ async fn a_lingering_descendant_does_not_pin_a_finished_download() {
     );
 }
 
+/// yt-dlp's `--print` implies `--simulate` unless `--no-simulate` is also given. The download gained
+/// a `--print` for the decision log and from then on every fresh download exited 0 having written
+/// nothing — measured on the box with yt-dlp 2026.08.19: 2428ms, exit 0, empty directory, and the
+/// same command plus `--no-simulate` wrote the full 32798907-byte file. This fake behaves the way
+/// yt-dlp did there.
+#[tokio::test]
+async fn the_download_print_does_not_turn_it_into_a_simulation() {
+    let dir = temp_dir();
+    let fake = dir.join("ytdlp-print-simulates");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nout=\"\"; prev=\"\"; print=0; nosim=0\n\
+         for a in \"$@\"; do [ \"$prev\" = \"-o\" ] && out=\"$a\"; [ \"$a\" = --print ] && print=1; \
+         [ \"$a\" = --no-simulate ] && nosim=1; prev=\"$a\"; done\n\
+         [ $print = 1 ] && echo '137+140|1080|avc1.640028|mp4a.40.2'\n\
+         [ $print = 1 ] && [ $nosim = 0 ] && exit 0\n\
+         head -c 1000 /dev/zero > \"$out\"\nexit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut cfg = test_cfg(dir.clone());
+    cfg.ytdlp = fake.to_string_lossy().into_owned();
+    let format = crate::ytdlp::download_to(&cfg, "abcdefghij1", &dir.join("out.mp4"))
+        .await
+        .expect("the download only simulated and wrote no file");
+    assert_eq!(format.format_id, "137+140", "the decision-log format was lost");
+}
+
 /// yt-dlp's stderr decides how a failure is classified, which drives /play's status, the /health
 /// extraction signal and autoPickRank. read_to_string discards the WHOLE buffer on one non-UTF-8
 /// byte, so a single accented character in an upstream message blanked the log and turned a
